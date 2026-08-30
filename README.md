@@ -24,6 +24,10 @@ lowest and the highest such altitude together with the throttle / thrust profile
 
 ## Extra knobs
 
+* `--motor long|short` (GUI: radio buttons) switches between the two motor lookup
+  tables — both burn the same 277 g of propellant:
+  * **long** – 120.4 N peak, 2.613 s burn, 221.8 Ns
+  * **short** – 269.4 N peak, 1.554 s burn, 258.8 Ns
 * `--thrust-mult` (GUI: *Thrust multiplier*) scales the whole motor lookup table by a
   float > 0 before the simulation starts; everything else (burn time, mass history)
   stays as it is.

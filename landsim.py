@@ -41,7 +41,7 @@ import numpy as np
 # which the curve rises through that level and the time at which it decays back
 # through it.
 #   fraction [%], level [N], rise-time [s], decay-time [s]
-MOTOR_TABLE = [
+MOTOR_TABLE_LONG = [
     (5,   6.02,   1.4500, 4.0633),
     (10,  12.04,  1.5000, 3.9964),
     (25,  30.10,  1.5643, 3.7841),
@@ -51,6 +51,24 @@ MOTOR_TABLE = [
     (95,  114.39, 1.9048, 2.9239),
     (100, 120.41, 2.7047, 2.7047),
 ]
+
+# Alternative motor: same propellant mass, shorter and much punchier burn.
+MOTOR_TABLE_SHORT = [
+    (5,   13.47,  1.7980, 3.3520),
+    (10,  26.94,  1.8247, 3.2804),
+    (25,  67.36,  1.8720, 3.1343),
+    (50,  134.72, 1.9345, 2.9153),
+    (75,  202.08, 2.0091, 2.7106),
+    (90,  242.50, 2.1147, 2.5615),
+    (95,  255.97, 2.1752, 2.4846),
+    (100, 269.44, 2.3040, 2.3150),
+]
+
+MOTOR_TABLES = {
+    "long": MOTOR_TABLE_LONG,     # 120 N peak, 2.61 s burn
+    "short": MOTOR_TABLE_SHORT,   # 269 N peak, 1.55 s burn
+}
+MOTOR_TABLE = MOTOR_TABLE_LONG    # backwards-compatible default
 
 PROPELLANT_MASS = 0.277        # kg, consumed propellant
 GROSS_MASS = 3.2               # kg, lift-off / total mass incl. propellant
@@ -66,9 +84,15 @@ class Motor:
     """Thrust curve reconstructed from the fraction-of-peak table."""
 
     def __init__(self, table=MOTOR_TABLE, propellant_mass=PROPELLANT_MASS,
-                 thrust_multiplier=1.0):
+                 thrust_multiplier=1.0, name=None):
         if thrust_multiplier <= 0.0:
             raise ValueError("thrust multiplier must be > 0")
+        if isinstance(table, str):
+            if table not in MOTOR_TABLES:
+                raise ValueError(f"unknown motor '{table}', "
+                                 f"choose from {sorted(MOTOR_TABLES)}")
+            name, table = table, MOTOR_TABLES[table]
+        self.name = name or "custom"
         rise = [(t, f) for _, f, t, _ in table]
         decay = [(t, f) for _, f, _, t in table]
         # ascending branch, then descending branch (reversed -> increasing time)
@@ -496,6 +520,9 @@ def main():
                     help="minimum thrust fraction (flaps at 90 %% blocking)")
     ap.add_argument("--phase", type=float, default=0.1, help="throttle phase length [s]")
     ap.add_argument("--dt", type=float, default=0.002, help="integration step [s]")
+    ap.add_argument("--motor", choices=sorted(MOTOR_TABLES), default="long",
+                    help="which motor lookup table to use "
+                         "(long = 120 N / 2.6 s, short = 269 N / 1.55 s)")
     ap.add_argument("--thrust-mult", type=float, default=1.0,
                     help="multiplier applied to the whole motor lookup table")
     ap.add_argument("--search-min", type=float, default=1.0,
@@ -512,7 +539,7 @@ def main():
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
-    cfg = Config(motor=Motor(propellant_mass=args.propellant,
+    cfg = Config(motor=Motor(args.motor, propellant_mass=args.propellant,
                              thrust_multiplier=args.thrust_mult),
                  drop_altitude=args.drop_alt, gross_mass=args.mass,
                  diameter=args.diameter, cd=args.cd, rho=args.rho,
@@ -529,6 +556,7 @@ def main():
     print(f"  diameter / area   : {cfg.diameter * 1000:.0f} mm / {cfg.area * 1e4:.1f} cm2")
     print(f"  Cd                : {cfg.cd}")
     print(f"  drop altitude     : {cfg.drop_altitude:.1f} m")
+    print(f"  motor             : {m.name}")
     print(f"  thrust multiplier : {m.thrust_multiplier:g} x table")
     print(f"  motor burn time   : {m.burn_time:.3f} s, peak {m.peak_thrust:.1f} N")
     print(f"  total impulse     : {m.total_impulse:.1f} Ns  "

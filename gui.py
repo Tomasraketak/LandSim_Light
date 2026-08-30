@@ -18,7 +18,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 import landsim
-from landsim import Config, Motor, Cancelled, find_window, G
+from landsim import Config, Motor, MOTOR_TABLES, Cancelled, find_window, G
 
 # label, attribute key, default, unit, tooltip-ish hint
 FIELDS = [
@@ -73,6 +73,20 @@ class App:
         inp = ttk.LabelFrame(main, text="Inputs", padding=8)
         inp.pack(fill="x")
 
+        # motor selector
+        motor_row = ttk.Frame(inp)
+        motor_row.grid(row=99, column=0, columnspan=8, sticky="w", pady=(6, 2))
+        ttk.Label(motor_row, text="Motor:").pack(side="left", padx=(6, 6))
+        self.motor_var = tk.StringVar(value="long")
+        for key, text in (("long", "long  (120 N peak, 2.61 s burn)"),
+                          ("short", "short  (269 N peak, 1.55 s burn)")):
+            ttk.Radiobutton(motor_row, text=text, value=key,
+                            variable=self.motor_var,
+                            command=self.show_motor).pack(side="left", padx=(0, 14))
+        self.motor_info = tk.StringVar(value="")
+        ttk.Label(motor_row, textvariable=self.motor_info,
+                  foreground="#666").pack(side="left")
+
         self.vars: dict[str, tk.StringVar] = {}
         for i, (label, key, default, unit, hint) in enumerate(FIELDS):
             col, row = (i % 2) * 4, i // 2
@@ -80,8 +94,10 @@ class App:
                                                   padx=(6, 4), pady=2)
             var = tk.StringVar(value=default)
             self.vars[key] = var
-            ttk.Entry(inp, textvariable=var, width=9).grid(row=row, column=col + 1,
-                                                           sticky="w", pady=2)
+            entry = ttk.Entry(inp, textvariable=var, width=9)
+            entry.grid(row=row, column=col + 1, sticky="w", pady=2)
+            if key == "thrust_mult":
+                var.trace_add("write", lambda *_: self.show_motor())
             ttk.Label(inp, text=unit, foreground="#666", width=6).grid(
                 row=row, column=col + 2, sticky="w")
             ttk.Label(inp, text=hint, foreground="#999").grid(
@@ -133,12 +149,25 @@ class App:
         sb.pack(side="right", fill="y")
         self.log.pack(fill="both", expand=True)
 
+        self.show_motor()
         self.root.after(100, self.poll)
+
+    def show_motor(self):
+        try:
+            m = Motor(self.motor_var.get(),
+                      thrust_multiplier=self.num("thrust_mult", 1.0))
+        except (ValueError, KeyError):
+            self.motor_info.set("")
+            return
+        self.motor_info.set(f"burn {m.burn_time:.3f} s, peak {m.peak_thrust:.1f} N, "
+                            f"impulse {m.total_impulse:.1f} Ns")
 
     # ------------------------------------------------------------------ #
     def reset(self):
         for _, key, default, _, _ in FIELDS:
             self.vars[key].set(default)
+        self.motor_var.set("long")
+        self.show_motor()
 
     def num(self, key, default=None):
         txt = self.vars[key].get().strip().replace(",", ".")
@@ -160,7 +189,8 @@ class App:
             throttle_min=self.num("throttle_min"),
             phase_length=self.num("phase"),
             dt=self.num("dt"),
-            motor=Motor(propellant_mass=self.num("propellant"),
+            motor=Motor(self.motor_var.get(),
+                        propellant_mass=self.num("propellant"),
                         thrust_multiplier=self.num("thrust_mult", 1.0)),
         )
         area_cm2 = self.vars["area"].get().strip()
@@ -190,7 +220,7 @@ class App:
         self.timing.set("")
         self.summary.set("computing ...")
         m = cfg.motor
-        self.put("log", f"thrust multiplier {m.thrust_multiplier:g}x\n"
+        self.put("log", f"motor '{m.name}', thrust multiplier {m.thrust_multiplier:g}x\n"
                         f"burn {m.burn_time:.3f} s, peak {m.peak_thrust:.1f} N, "
                         f"total impulse {m.total_impulse:.1f} Ns, "
                         f"peak T/W {m.peak_thrust / (cfg.gross_mass * G):.2f}, "
