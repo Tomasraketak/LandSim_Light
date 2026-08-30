@@ -1,0 +1,478 @@
+"""
+LandSim Light - 1D (vertical axis) propulsive landing simulation.
+
+Scenario
+--------
+A rocket falls from a given altitude (default 150 m) in free fall (with drag).
+At some altitude the solid motor is ignited. The motor cannot be shut down or
+regulated internally - the vehicle only has flaps ("thrust spoilers") that can
+block up to 90 % of the thrust. The effective thrust is therefore
+
+        F_eff(t) = throttle(t) * F_motor(t),   throttle in <0.1 , 1.0>
+
+The blocked thrust is simply wasted: the propellant is consumed according to the
+nominal (un-throttled) thrust curve regardless of the flap position, so the mass
+history does not depend on the throttle profile and the burn time is fixed.
+
+The throttle profile is discretised into 100 ms phases; every phase gets its own
+throttle value, which the optimiser is free to choose.
+
+The script answers: in what range of ignition altitudes can the rocket land with
+a touchdown speed below 3 m/s, and what throttle profile achieves it?
+
+Usage
+-----
+    python3 landsim.py                       # default case
+    python3 landsim.py --drop-alt 200 --max-touchdown 3
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+from dataclasses import dataclass, field
+
+import numpy as np
+
+# --------------------------------------------------------------------------- #
+#  Motor
+# --------------------------------------------------------------------------- #
+# Table given by the user: for every fraction of the peak thrust the time at
+# which the curve rises through that level and the time at which it decays back
+# through it.
+#   fraction [%], level [N], rise-time [s], decay-time [s]
+MOTOR_TABLE = [
+    (5,   6.02,   1.4500, 4.0633),
+    (10,  12.04,  1.5000, 3.9964),
+    (25,  30.10,  1.5643, 3.7841),
+    (50,  60.20,  1.5914, 3.5436),
+    (75,  90.31,  1.7555, 3.2416),
+    (90,  108.37, 1.8732, 3.0369),
+    (95,  114.39, 1.9048, 2.9239),
+    (100, 120.41, 2.7047, 2.7047),
+]
+
+PROPELLANT_MASS = 0.277        # kg, consumed propellant
+GROSS_MASS = 3.2               # kg, lift-off / total mass incl. propellant
+DIAMETER = 0.105               # m
+CD = 0.35                      # [-]
+RHO = 1.225                    # kg/m3, sea-level air density
+G = 9.80665                    # m/s2
+
+AREA = math.pi * (DIAMETER / 2.0) ** 2
+
+
+class Motor:
+    """Thrust curve reconstructed from the fraction-of-peak table."""
+
+    def __init__(self, table=MOTOR_TABLE, propellant_mass=PROPELLANT_MASS):
+        rise = [(t, f) for _, f, t, _ in table]
+        decay = [(t, f) for _, f, _, t in table]
+        # ascending branch, then descending branch (reversed -> increasing time)
+        pts = sorted(rise) + sorted(decay, reverse=False)[::-1]
+        # remove the duplicated peak point
+        pts = sorted(rise) + [p for p in sorted(decay) if p[0] > sorted(rise)[-1][0]]
+
+        t0 = pts[0][0]
+        # zero thrust just before the first tabulated point and just after the last
+        times = [0.0] + [t - t0 for t, _ in pts] + [pts[-1][0] - t0 + 1e-6]
+        thrust = [0.0] + [f for _, f in pts] + [0.0]
+
+        self.t = np.asarray(times, dtype=float)
+        self.f = np.asarray(thrust, dtype=float)
+        self.burn_time = float(self.t[-1])
+        self.peak_thrust = float(self.f.max())
+
+        # total impulse and the cumulative impulse (used for the mass history)
+        dt_seg = np.diff(self.t)
+        seg_imp = 0.5 * (self.f[:-1] + self.f[1:]) * dt_seg
+        self.cum_impulse = np.concatenate(([0.0], np.cumsum(seg_imp)))
+        self.total_impulse = float(self.cum_impulse[-1])
+        self.propellant_mass = propellant_mass
+
+    def thrust(self, t):
+        """Nominal (un-throttled) thrust [N] at time t after ignition."""
+        return np.interp(t, self.t, self.f, left=0.0, right=0.0)
+
+    def burned_mass(self, t):
+        """Propellant burned [kg] at time t after ignition (throttle independent)."""
+        imp = np.interp(t, self.t, self.cum_impulse, left=0.0,
+                        right=self.total_impulse)
+        return self.propellant_mass * imp / self.total_impulse
+
+
+# --------------------------------------------------------------------------- #
+#  Vehicle / simulation configuration
+# --------------------------------------------------------------------------- #
+@dataclass
+class Config:
+    drop_altitude: float = 150.0     # m, altitude where the free fall starts
+    gross_mass: float = GROSS_MASS   # kg
+    diameter: float = DIAMETER       # m
+    cd: float = CD                   # [-]
+    rho: float = RHO                 # kg/m3
+    initial_velocity: float = 0.0    # m/s, positive = upwards
+    max_touchdown_speed: float = 3.0 # m/s
+    throttle_min: float = 0.1        # flaps block at most 90 % of the thrust
+    throttle_max: float = 1.0
+    phase_length: float = 0.1        # s, one throttle step
+    dt: float = 0.002                # s, integration step
+    max_time: float = 30.0           # s, simulation cut-off after ignition
+    motor: Motor = field(default_factory=Motor)
+
+    @property
+    def area(self) -> float:
+        return math.pi * (self.diameter / 2.0) ** 2
+
+    @property
+    def n_phases(self) -> int:
+        return int(math.ceil(self.motor.burn_time / self.phase_length))
+
+
+# --------------------------------------------------------------------------- #
+#  Free fall down to the ignition altitude
+# --------------------------------------------------------------------------- #
+def free_fall_to(cfg: Config, ignition_altitude: float):
+    """Integrate the drag free fall from drop_altitude to ignition_altitude.
+
+    Returns (velocity [m/s, negative = down], elapsed time [s]).
+    """
+    y = cfg.drop_altitude
+    v = cfg.initial_velocity
+    t = 0.0
+    m = cfg.gross_mass
+    k = 0.5 * cfg.rho * cfg.cd * cfg.area
+    dt = cfg.dt
+    while y > ignition_altitude and t < 120.0:
+        a = -G - k * v * abs(v) / m
+        v += a * dt
+        y += v * dt
+        t += dt
+    return v, t
+
+
+# --------------------------------------------------------------------------- #
+#  Powered phase - vectorised over a whole population of throttle profiles
+# --------------------------------------------------------------------------- #
+def simulate_population(cfg: Config, y0: float, v0: float, profiles: np.ndarray):
+    """Simulate the powered descent for many throttle profiles at once.
+
+    profiles : (N, n_phases) array of throttle values in <throttle_min, throttle_max>
+
+    Returns a dict with, per profile:
+        touchdown_speed : |v| at ground contact  (np.inf if it never lands)
+        landed          : bool
+        min_altitude    : lowest altitude reached
+        max_altitude    : highest altitude reached after ignition
+    """
+    profiles = np.atleast_2d(np.asarray(profiles, dtype=float))
+    n = profiles.shape[0]
+
+    y = np.full(n, float(y0))
+    v = np.full(n, float(v0))
+    alive = np.ones(n, dtype=bool)
+    touchdown = np.full(n, np.inf)
+    min_alt = np.full(n, float(y0))
+    max_alt = np.full(n, float(y0))
+
+    k = 0.5 * cfg.rho * cfg.cd * cfg.area
+    dt = cfg.dt
+    dry_mass = cfg.gross_mass - cfg.motor.propellant_mass
+    t = 0.0
+    steps = int(cfg.max_time / dt)
+
+    for _ in range(steps):
+        if not alive.any():
+            break
+        thrust_nom = float(cfg.motor.thrust(t))
+        mass = dry_mass + (cfg.motor.propellant_mass - float(cfg.motor.burned_mass(t)))
+
+        if thrust_nom > 0.0:
+            idx = min(int(t / cfg.phase_length), profiles.shape[1] - 1)
+            thrust = thrust_nom * profiles[:, idx]
+        else:
+            thrust = np.zeros(n)
+
+        drag = -k * v * np.abs(v)
+        a = (thrust + drag) / mass - G
+
+        v_new = np.where(alive, v + a * dt, v)
+        y_new = np.where(alive, y + 0.5 * (v + v_new) * dt, y)
+
+        # ground contact -> linear interpolation of the impact speed
+        hit = alive & (y_new <= 0.0)
+        if hit.any():
+            frac = np.where(y - y_new != 0.0, y / np.maximum(y - y_new, 1e-12), 0.0)
+            frac = np.clip(frac, 0.0, 1.0)
+            v_hit = v + (v_new - v) * frac
+            touchdown[hit] = np.abs(v_hit[hit])
+            alive[hit] = False
+
+        v, y = v_new, y_new
+        min_alt = np.minimum(min_alt, np.where(alive | hit, y, min_alt))
+        max_alt = np.maximum(max_alt, np.where(alive, y, max_alt))
+        t += dt
+
+    return {
+        "touchdown_speed": touchdown,
+        "landed": np.isfinite(touchdown),
+        "min_altitude": min_alt,
+        "max_altitude": max_alt,
+    }
+
+
+def simulate(cfg: Config, ignition_altitude: float, profile):
+    """Convenience wrapper: full flight for a single throttle profile."""
+    v0, t_fall = free_fall_to(cfg, ignition_altitude)
+    res = simulate_population(cfg, ignition_altitude, v0, np.asarray(profile)[None, :])
+    return {
+        "ignition_altitude": ignition_altitude,
+        "entry_speed": abs(v0),
+        "fall_time": t_fall,
+        "touchdown_speed": float(res["touchdown_speed"][0]),
+        "landed": bool(res["landed"][0]),
+        "max_altitude": float(res["max_altitude"][0]),
+    }
+
+
+def trajectory(cfg: Config, ignition_altitude: float, profile):
+    """Single-profile run returning the full time history (for plotting/inspection)."""
+    v, t_fall = free_fall_to(cfg, ignition_altitude)
+    y, t = ignition_altitude, 0.0
+    k = 0.5 * cfg.rho * cfg.cd * cfg.area
+    dry = cfg.gross_mass - cfg.motor.propellant_mass
+    hist = []
+    while y > 0.0 and t < cfg.max_time:
+        thrust_nom = float(cfg.motor.thrust(t))
+        mass = dry + (cfg.motor.propellant_mass - float(cfg.motor.burned_mass(t)))
+        idx = min(int(t / cfg.phase_length), len(profile) - 1)
+        thrust = thrust_nom * (profile[idx] if thrust_nom > 0.0 else 0.0)
+        a = (thrust - k * v * abs(v)) / mass - G
+        hist.append((t + t_fall, y, v, thrust, mass))
+        v_new = v + a * cfg.dt
+        y += 0.5 * (v + v_new) * cfg.dt
+        v = v_new
+        t += cfg.dt
+    return hist
+
+
+# --------------------------------------------------------------------------- #
+#  Throttle-profile optimiser (differential evolution, vectorised)
+# --------------------------------------------------------------------------- #
+def _cost(cfg: Config, res):
+    """Lower is better. Landing softly is the only goal."""
+    c = np.where(res["landed"], res["touchdown_speed"],
+                 1000.0 + res["min_altitude"])   # never reached the ground
+    return c
+
+
+def optimise_profile(cfg: Config, ignition_altitude: float, pop_size=64,
+                     generations=120, seed=0, x0=None):
+    """Find the throttle profile that minimises the touchdown speed."""
+    rng = np.random.default_rng(seed)
+    d = cfg.n_phases
+    lo, hi = cfg.throttle_min, cfg.throttle_max
+    v0, _ = free_fall_to(cfg, ignition_altitude)
+
+    pop = rng.uniform(lo, hi, size=(pop_size, d))
+    # a few structured seeds: constant throttles and simple ramps
+    seeds = [np.full(d, x) for x in (0.1, 0.25, 0.5, 0.75, 1.0)]
+    seeds += [np.linspace(lo, hi, d), np.linspace(hi, lo, d)]
+    if x0 is not None:
+        seeds.append(np.clip(np.asarray(x0, dtype=float), lo, hi))
+    for i, s in enumerate(seeds[:pop_size]):
+        pop[i] = s
+
+    cost = _cost(cfg, simulate_population(cfg, ignition_altitude, v0, pop))
+
+    for _ in range(generations):
+        # DE/rand/1/bin with a randomised F and CR
+        a, b, c = (pop[rng.permutation(pop_size)] for _ in range(3))
+        f = rng.uniform(0.4, 0.9)
+        mutant = np.clip(a + f * (b - c), lo, hi)
+        cr = rng.uniform(0.7, 0.95)
+        mask = rng.random((pop_size, d)) < cr
+        mask[np.arange(pop_size), rng.integers(0, d, pop_size)] = True
+        trial = np.where(mask, mutant, pop)
+
+        t_cost = _cost(cfg, simulate_population(cfg, ignition_altitude, v0, trial))
+        better = t_cost < cost
+        pop[better] = trial[better]
+        cost[better] = t_cost[better]
+
+    best = int(np.argmin(cost))
+    res = simulate_population(cfg, ignition_altitude, v0, pop[best][None, :])
+    return {
+        "profile": pop[best].copy(),
+        "touchdown_speed": float(res["touchdown_speed"][0]),
+        "landed": bool(res["landed"][0]),
+        "entry_speed": abs(v0),
+        "cost": float(cost[best]),
+    }
+
+
+# --------------------------------------------------------------------------- #
+#  Search for the feasible ignition-altitude window
+# --------------------------------------------------------------------------- #
+def find_window(cfg: Config, coarse_step=5.0, tol=0.25, verbose=True,
+                pop_size=64, generations=120):
+    """Return the lowest and the highest ignition altitude with a soft landing."""
+    limit = cfg.max_touchdown_speed
+    lo_bound = 1.0
+    hi_bound = cfg.drop_altitude
+
+    # --- coarse scan -------------------------------------------------------
+    grid = np.arange(lo_bound, hi_bound + 1e-9, coarse_step)
+    results, warm = {}, None
+    for h in grid:
+        r = optimise_profile(cfg, float(h), pop_size=pop_size,
+                             generations=generations, seed=int(h * 7) & 0xFFFF,
+                             x0=warm)
+        results[float(h)] = r
+        if r["touchdown_speed"] < limit:
+            warm = r["profile"]
+        if verbose:
+            flag = "OK " if r["touchdown_speed"] <= limit else "   "
+            print(f"  {flag}h = {h:6.1f} m   entry {r['entry_speed']:5.1f} m/s"
+                  f"   best touchdown {r['touchdown_speed']:7.2f} m/s")
+
+    feasible = [h for h, r in results.items() if r["touchdown_speed"] <= limit]
+    if not feasible:
+        return None
+
+    h_lo_ok, h_hi_ok = min(feasible), max(feasible)
+
+    def ok(h, warm_profile):
+        r = optimise_profile(cfg, h, pop_size=pop_size, generations=generations,
+                             seed=int(h * 131) & 0xFFFF, x0=warm_profile)
+        return r["touchdown_speed"] <= limit, r
+
+    # --- refine the lower edge --------------------------------------------
+    lo_fail = max([h for h in results if h < h_lo_ok], default=lo_bound - coarse_step)
+    lo_fail = max(lo_fail, 0.0)
+    best_lo = results[h_lo_ok]
+    a, b = lo_fail, h_lo_ok
+    while b - a > tol:
+        mid = 0.5 * (a + b)
+        good, r = ok(mid, best_lo["profile"])
+        if good:
+            b, best_lo = mid, r
+        else:
+            a = mid
+    low_alt, low_res = b, best_lo
+
+    # --- refine the upper edge --------------------------------------------
+    hi_fail = min([h for h in results if h > h_hi_ok], default=hi_bound + coarse_step)
+    hi_fail = min(hi_fail, cfg.drop_altitude)
+    best_hi = results[h_hi_ok]
+    a, b = h_hi_ok, hi_fail
+    while b - a > tol:
+        mid = 0.5 * (a + b)
+        good, r = ok(mid, best_hi["profile"])
+        if good:
+            a, best_hi = mid, r
+        else:
+            b = mid
+    high_alt, high_res = a, best_hi
+
+    return {"low": (low_alt, low_res), "high": (high_alt, high_res)}
+
+
+# --------------------------------------------------------------------------- #
+#  Reporting
+# --------------------------------------------------------------------------- #
+def print_profile(cfg: Config, res, label):
+    prof = res["profile"]
+    print(f"\n{label}")
+    print(f"  ignition altitude   : {res['altitude']:.2f} m")
+    print(f"  speed at ignition   : {res['entry_speed']:.2f} m/s (down)")
+    print(f"  touchdown speed     : {res['touchdown_speed']:.2f} m/s")
+    print("  throttle profile (100 ms phases, 1.00 = full thrust, "
+          "0.10 = flaps block 90 %):")
+    for i in range(0, len(prof), 10):
+        chunk = prof[i:i + 10]
+        t_start = i * cfg.phase_length
+        print(f"    t={t_start:5.2f}s : " + " ".join(f"{x:.2f}" for x in chunk))
+    print("  resulting thrust [N] per phase:")
+    for i in range(0, len(prof), 10):
+        chunk = prof[i:i + 10]
+        t_start = i * cfg.phase_length
+        vals = [cfg.motor.thrust((i + j + 0.5) * cfg.phase_length) * chunk[j]
+                for j in range(len(chunk))]
+        print(f"    t={t_start:5.2f}s : " + " ".join(f"{x:6.1f}" for x in vals))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--drop-alt", type=float, default=150.0,
+                    help="altitude where the free fall starts [m]")
+    ap.add_argument("--mass", type=float, default=GROSS_MASS, help="gross mass [kg]")
+    ap.add_argument("--diameter", type=float, default=DIAMETER, help="diameter [m]")
+    ap.add_argument("--cd", type=float, default=CD, help="drag coefficient")
+    ap.add_argument("--rho", type=float, default=RHO, help="air density [kg/m3]")
+    ap.add_argument("--max-touchdown", type=float, default=3.0,
+                    help="soft-landing limit [m/s]")
+    ap.add_argument("--throttle-min", type=float, default=0.1,
+                    help="minimum thrust fraction (flaps at 90 %% blocking)")
+    ap.add_argument("--phase", type=float, default=0.1, help="throttle phase length [s]")
+    ap.add_argument("--dt", type=float, default=0.002, help="integration step [s]")
+    ap.add_argument("--coarse-step", type=float, default=5.0,
+                    help="ignition-altitude scan step [m]")
+    ap.add_argument("--tol", type=float, default=0.25,
+                    help="bisection tolerance of the window edges [m]")
+    ap.add_argument("--pop", type=int, default=64, help="DE population size")
+    ap.add_argument("--gen", type=int, default=120, help="DE generations")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    cfg = Config(drop_altitude=args.drop_alt, gross_mass=args.mass,
+                 diameter=args.diameter, cd=args.cd, rho=args.rho,
+                 max_touchdown_speed=args.max_touchdown,
+                 throttle_min=args.throttle_min, phase_length=args.phase,
+                 dt=args.dt)
+    m = cfg.motor
+
+    print("=" * 72)
+    print("LandSim Light - 1D propulsive landing")
+    print("=" * 72)
+    print(f"  gross mass        : {cfg.gross_mass:.3f} kg "
+          f"(propellant {m.propellant_mass * 1000:.0f} g)")
+    print(f"  diameter / area   : {cfg.diameter * 1000:.0f} mm / {cfg.area * 1e4:.1f} cm2")
+    print(f"  Cd                : {cfg.cd}")
+    print(f"  drop altitude     : {cfg.drop_altitude:.1f} m")
+    print(f"  motor burn time   : {m.burn_time:.3f} s, peak {m.peak_thrust:.1f} N")
+    print(f"  total impulse     : {m.total_impulse:.1f} Ns  "
+          f"(avg {m.total_impulse / m.burn_time:.1f} N)")
+    print(f"  weight            : {cfg.gross_mass * G:.1f} N  ->  "
+          f"peak T/W = {m.peak_thrust / (cfg.gross_mass * G):.2f}")
+    print(f"  throttle          : {cfg.throttle_min:.2f} - {cfg.throttle_max:.2f} "
+          f"in {cfg.n_phases} phases of {cfg.phase_length * 1000:.0f} ms")
+    print(f"  terminal velocity : "
+          f"{math.sqrt(cfg.gross_mass * G / (0.5 * cfg.rho * cfg.cd * cfg.area)):.1f} m/s")
+    print(f"  soft-landing limit: {cfg.max_touchdown_speed:.1f} m/s\n")
+
+    print("Scanning ignition altitudes ...")
+    win = find_window(cfg, coarse_step=args.coarse_step, tol=args.tol,
+                      verbose=not args.quiet, pop_size=args.pop,
+                      generations=args.gen)
+
+    print("\n" + "=" * 72)
+    if win is None:
+        print("No ignition altitude produced a soft landing "
+              f"(<= {cfg.max_touchdown_speed} m/s).")
+        return
+
+    lo_alt, lo_res = win["low"]
+    hi_alt, hi_res = win["high"]
+    lo_res["altitude"], hi_res["altitude"] = lo_alt, hi_alt
+    print(f"RESULT: soft landing possible for ignition altitudes "
+          f"{lo_alt:.2f} m ... {hi_alt:.2f} m "
+          f"(window {hi_alt - lo_alt:.2f} m)")
+    print("=" * 72)
+    print_profile(cfg, lo_res, "LOWEST ignition altitude that still lands softly")
+    print_profile(cfg, hi_res, "HIGHEST ignition altitude that still lands softly")
+
+
+if __name__ == "__main__":
+    main()
