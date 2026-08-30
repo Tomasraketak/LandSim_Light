@@ -38,6 +38,23 @@ lowest and the highest such altitude together with the throttle / thrust profile
 * The report also gives the time from the release down to each of the two ignition
   altitudes and the resulting time window for the ignition command.
 
+## Klima D9 boosters (third mode)
+
+On top of the throttled main motor the rocket may carry up to N **Klima D9**
+boosters (curve from the manufacturer's RockSim file: 25 N peak, 2.242 s, 19.96 Ns,
+27.1 g each, 16.1 g of it propellant). A booster is a pure on/off device: the
+optimiser only chooses *whether* and *when* to light each one — once lit it burns
+its whole curve and cannot be throttled, stopped or relit, and it may just as well
+stay unused for the whole flight. The carried boosters' mass is added to the rocket
+(`--no-booster-mass` turns that off).
+
+* CLI: `--boosters 0..N`, `--booster-window` (how long after the main ignition a
+  booster may still be lit, default main burn + 4 s).
+* GUI: the *Klima D9 boosters* spinbox with its own ignition-window box.
+
+With the long motor and the default vehicle the window of usable ignition altitudes
+grows from 45.4–56.3 m (no booster) to 41.9–61.6 m (1) and 37.4–67.1 m (3).
+
 ## Side calculation: apogee from the ground
 
 `ascent(cfg, throttle)` simulates a vertical launch from rest at ground level with

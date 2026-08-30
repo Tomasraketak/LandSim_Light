@@ -18,8 +18,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 import landsim
-from landsim import (Config, Motor, MOTOR_TABLES, Cancelled, find_window,
-                      ascent, G)
+from landsim import (Config, Motor, Booster, MOTOR_TABLES, NEVER, Cancelled,
+                      find_window, ascent, G)
 
 # label, attribute key, default, unit, tooltip-ish hint
 FIELDS = [
@@ -87,6 +87,26 @@ class App:
         self.motor_info = tk.StringVar(value="")
         ttk.Label(motor_row, textvariable=self.motor_info,
                   foreground="#666").pack(side="left")
+
+        # D9 boosters - non-throttleable, single-shot, the optimiser decides
+        boost_row = ttk.Frame(inp)
+        boost_row.grid(row=100, column=0, columnspan=8, sticky="w", pady=(0, 4))
+        ttk.Label(boost_row, text="Klima D9 boosters:").pack(side="left", padx=(6, 6))
+        self.boosters = tk.StringVar(value="0")
+        ttk.Spinbox(boost_row, from_=0, to=3, width=3,
+                    textvariable=self.boosters).pack(side="left")
+        _b = Booster()
+        ttk.Label(boost_row,
+                  text=f"  ({_b.peak_thrust:.0f} N peak, {_b.burn_time:.2f} s, "
+                       f"{_b.total_impulse:.1f} Ns, {_b.total_mass * 1000:.1f} g each) "
+                       f"- cannot be throttled, stopped or relit; the optimiser "
+                       f"decides if and when to light each one",
+                  foreground="#666").pack(side="left")
+        ttk.Label(boost_row, text="ignition window:").pack(side="left", padx=(10, 2))
+        self.booster_window = tk.StringVar(value="")
+        ttk.Entry(boost_row, textvariable=self.booster_window, width=6).pack(side="left")
+        ttk.Label(boost_row, text="s (empty = burn + 4 s)",
+                  foreground="#666").pack(side="left", padx=(3, 0))
 
         self.vars: dict[str, tk.StringVar] = {}
         for i, (label, key, default, unit, hint) in enumerate(FIELDS):
@@ -174,6 +194,8 @@ class App:
         for _, key, default, _, _ in FIELDS:
             self.vars[key].set(default)
         self.motor_var.set("long")
+        self.boosters.set("0")
+        self.booster_window.set("")
         self.show_motor()
 
     def num(self, key, default=None):
@@ -196,6 +218,9 @@ class App:
             throttle_min=self.num("throttle_min"),
             phase_length=self.num("phase"),
             dt=self.num("dt"),
+            n_boosters=max(0, int(float(self.boosters.get() or 0))),
+            booster_window=(float(self.booster_window.get().replace(",", "."))
+                            if self.booster_window.get().strip() else None),
             motor=Motor(self.motor_var.get(),
                         propellant_mass=self.num("propellant"),
                         thrust_multiplier=self.num("thrust_mult", 1.0)),
@@ -227,7 +252,8 @@ class App:
         self.timing.set("")
         self.summary.set("computing ...")
         m = cfg.motor
-        self.put("log", f"motor '{m.name}', thrust multiplier {m.thrust_multiplier:g}x\n"
+        self.put("log", f"motor '{m.name}', thrust multiplier {m.thrust_multiplier:g}x, "
+                        f"{cfg.n_boosters} D9 booster(s) available\n"
                         f"burn {m.burn_time:.3f} s, peak {m.peak_thrust:.1f} N, "
                         f"total impulse {m.total_impulse:.1f} Ns, "
                         f"peak T/W {m.peak_thrust / (cfg.gross_mass * G):.2f}, "
@@ -254,7 +280,8 @@ class App:
             return
         a = ascent(cfg, throttle=thr)
         self.log.insert("end", f"\n--- vertical launch from the ground, motor "
-                               f"'{cfg.motor.name}', throttle {thr:g} ---\n")
+                               f"'{cfg.motor.name}', throttle {thr:g}, "
+                               f"{cfg.n_boosters} D9 lit at lift-off ---\n")
         if a["liftoff_time"] is None:
             self.summary.set("The rocket never lifts off "
                              "(thrust stays below the weight).")
@@ -342,17 +369,25 @@ class App:
 
         for name, alt, res in (("LOWEST", lo_alt, lo), ("HIGHEST", hi_alt, hi)):
             self.log.insert("end", f"\n{name} ignition altitude {alt:.2f} m -> "
-                                   f"touchdown {res['touchdown_speed']:.2f} m/s\n"
-                                   f"  throttle per {cfg.phase_length * 1000:.0f} ms phase:\n")
+                                   f"touchdown {res['touchdown_speed']:.2f} m/s\n")
+            ign = res.get("booster_ignitions")
+            if ign is not None and len(ign):
+                used = [f"{x:.2f} s" for x in ign if x < NEVER]
+                self.log.insert("end", "  D9 booster ignitions: "
+                                       + (", ".join(used) if used else "none used")
+                                       + f"  (of {len(ign)} carried)\n")
+            self.log.insert("end",
+                            f"  throttle per {cfg.phase_length * 1000:.0f} ms phase:\n")
             prof = res["profile"]
             for i in range(0, len(prof), 10):
                 chunk = prof[i:i + 10]
                 self.log.insert("end", f"    t={i * cfg.phase_length:5.2f}s : "
                                        + " ".join(f"{x:.2f}" for x in chunk) + "\n")
-            self.log.insert("end", "  effective thrust [N]:\n")
+            self.log.insert("end", "  total thrust [N] (main + boosters):\n")
             for i in range(0, len(prof), 10):
                 chunk = prof[i:i + 10]
-                vals = [cfg.motor.thrust((i + j + 0.5) * cfg.phase_length) * chunk[j]
+                vals = [landsim.phase_thrust(cfg, (i + j + 0.5) * cfg.phase_length,
+                                             chunk[j], res.get("booster_ignitions"))
                         for j in range(len(chunk))]
                 self.log.insert("end", f"    t={i * cfg.phase_length:5.2f}s : "
                                        + " ".join(f"{x:6.1f}" for x in vals) + "\n")
