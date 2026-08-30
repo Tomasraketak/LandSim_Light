@@ -18,6 +18,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 import landsim
+import tvc_sim
 from landsim import (Config, Motor, Booster, MOTOR_TABLES, NEVER, Cancelled,
                       find_window, ascent, G)
 
@@ -45,6 +46,24 @@ FIELDS = [
 ]
 
 
+TVC_FIELDS = [
+    ("Flights per cell",  "runs",      "40",  "-"),
+    ("Release from",      "h_lo",      "140", "m"),
+    ("Release to",        "h_hi",      "180", "m"),
+    ("Release step",      "h_step",    "5",   "m"),
+    ("|vx| max",          "vx_max",    "7",   "m/s"),
+    ("vx step",           "vx_step",   "1",   "m/s"),
+    ("D9 boosters",       "boosters",  "1",   "-"),
+    ("Igniter delay",     "ign_delay", "0.3", "s, U(0,x)"),
+    ("Thrust scatter",    "scatter",   "0.15", "+/- frac"),
+    ("Scatter window",    "tau",       "0.7", "s"),
+    ("Roll rate max",     "roll",      "90",  "deg/s"),
+    ("Attitude bandwidth", "wn",       "9.0", "rad/s"),
+    ("Damping ratio",     "zeta",      "1.0", "-"),
+    ("Figure directory",  "figdir",    "figures", ""),
+]
+
+
 class CircularConfig(Config):
     """Config that allows the reference area to be overridden directly."""
 
@@ -67,8 +86,14 @@ class App:
         self.worker: threading.Thread | None = None
         self.stop_flag = threading.Event()
 
-        main = ttk.Frame(root, padding=10)
-        main.pack(fill="both", expand=True)
+        nb = ttk.Notebook(root)
+        nb.pack(fill="both", expand=True)
+        main = ttk.Frame(nb, padding=10)
+        nb.add(main, text="1-D ignition window")
+        tvc_tab = ttk.Frame(nb, padding=10)
+        nb.add(tvc_tab, text="3-D / TVC Monte Carlo")
+        root.title("LandSim Light")
+        root.minsize(1040, 700)
 
         # ---------------- inputs ----------------
         inp = ttk.LabelFrame(main, text="Inputs", padding=8)
@@ -176,8 +201,158 @@ class App:
         sb.pack(side="right", fill="y")
         self.log.pack(fill="both", expand=True)
 
+        self.build_tvc_tab(tvc_tab)
         self.show_motor()
         self.root.after(100, self.poll)
+
+    # ------------------------------------------------------------------ #
+    #  3-D / TVC tab
+    # ------------------------------------------------------------------ #
+    def build_tvc_tab(self, tab):
+        intro = ("Two translational axes plus a rolling airframe and two TVC "
+                 "channels.\nEvery cell of the entry grid is flown N times with a "
+                 "random igniter delay, thrust scatter and roll rate;\nthe on-board "
+                 "rule decides in flight whether to light the D9.")
+        ttk.Label(tab, text=intro, foreground="#555").pack(anchor="w")
+
+        inp = ttk.LabelFrame(tab, text="Campaign", padding=8)
+        inp.pack(fill="x", pady=(6, 0))
+        self.tvars: dict[str, tk.StringVar] = {}
+        for i, (label, key, default, unit) in enumerate(TVC_FIELDS):
+            col, row = (i % 3) * 3, i // 3
+            ttk.Label(inp, text=label + ":").grid(row=row, column=col, sticky="e",
+                                                  padx=(6, 4), pady=2)
+            var = tk.StringVar(value=default)
+            self.tvars[key] = var
+            ttk.Entry(inp, textvariable=var, width=8).grid(row=row, column=col + 1,
+                                                           sticky="w", pady=2)
+            ttk.Label(inp, text=unit, foreground="#888", width=10).grid(
+                row=row, column=col + 2, sticky="w")
+
+        bar = ttk.Frame(tab)
+        bar.pack(fill="x", pady=(8, 4))
+        self.tvc_btn = ttk.Button(bar, text="Run campaign", command=self.start_tvc)
+        self.tvc_btn.pack(side="left")
+        self.tvc_stop = ttk.Button(bar, text="Stop", command=self.stop,
+                                   state="disabled")
+        self.tvc_stop.pack(side="left", padx=6)
+        ttk.Button(bar, text="Single flight + figure",
+                   command=self.tvc_single).pack(side="left")
+        self.tvc_prog = ttk.Progressbar(bar, mode="indeterminate", length=180)
+        self.tvc_prog.pack(side="right")
+
+        res = ttk.LabelFrame(tab, text="Result", padding=8)
+        res.pack(fill="x")
+        self.tvc_summary = tk.StringVar(value="-")
+        ttk.Label(res, textvariable=self.tvc_summary,
+                  font=("TkDefaultFont", 11, "bold"),
+                  foreground="#0a5").pack(anchor="w")
+        self.tvc_gates = tk.StringVar(value="")
+        ttk.Label(res, textvariable=self.tvc_gates,
+                  font=("TkFixedFont", 9)).pack(anchor="w", pady=(4, 0))
+
+        logf = ttk.LabelFrame(tab, text="Progress / report", padding=6)
+        logf.pack(fill="both", expand=True, pady=(8, 0))
+        self.tvc_log = tk.Text(logf, height=16, wrap="none", font=("TkFixedFont", 9))
+        sb = ttk.Scrollbar(logf, command=self.tvc_log.yview)
+        self.tvc_log.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tvc_log.pack(fill="both", expand=True)
+
+    def tvc_config(self):
+        def num(key):
+            return float(self.tvars[key].get().strip().replace(",", "."))
+        return tvc_sim.TvcConfig(
+            motor=self.motor_var.get(),
+            gross_mass=self.num("mass"), propellant=self.num("propellant"),
+            cd=self.num("cd"), thrust_mult=self.num("thrust_mult", 1.0),
+            n_boosters=int(num("boosters")),
+            h_lo=num("h_lo"), h_hi=num("h_hi"), h_step=num("h_step"),
+            vx_max=num("vx_max"), vx_step=num("vx_step"), runs=int(num("runs")),
+            ign_delay_max=num("ign_delay"), delay_pad=num("ign_delay"),
+            thrust_scatter=num("scatter"), thrust_tau=num("tau"),
+            roll_max=num("roll"), wn=num("wn"), zeta=num("zeta"))
+
+    def start_tvc(self):
+        if self.worker and self.worker.is_alive():
+            return
+        try:
+            cfg = self.tvc_config()
+        except ValueError as exc:
+            messagebox.showerror("Invalid input", str(exc))
+            return
+        self.tvc_log.delete("1.0", "end")
+        self.tvc_summary.set("running ...")
+        self.tvc_gates.set("")
+        n = len(cfg.entry_grid()[0]) * len(cfg.entry_grid()[1]) * cfg.runs
+        self.put("tlog", f"{n} flights "
+                         f"({len(cfg.entry_grid()[0])} altitudes x "
+                         f"{len(cfg.entry_grid()[1])} entry speeds x {cfg.runs})")
+        self.stop_flag.clear()
+        self.tvc_btn.configure(state="disabled")
+        self.tvc_stop.configure(state="normal")
+        self.tvc_prog.start(12)
+        self.worker = threading.Thread(target=self.tvc_work, args=(cfg,),
+                                       daemon=True)
+        self.worker.start()
+
+    def tvc_work(self, cfg):
+        try:
+            camp = tvc_sim.run_campaign(cfg, on_progress=lambda s: self.put("tlog", s),
+                                        should_stop=self.stop_flag.is_set)
+            self.put("tlog", "writing figures ...")
+            paths = tvc_sim.make_figures(camp, self.tvars["figdir"].get().strip()
+                                         or "figures")
+            self.put("tdone", (camp, paths))
+        except Cancelled:
+            self.put("tcancelled", None)
+        except Exception as exc:                      # noqa: BLE001
+            self.put("terror", f"{type(exc).__name__}: {exc}")
+
+    def tvc_single(self):
+        """One flight with telemetry, straight to a figure - no campaign."""
+        try:
+            cfg = self.tvc_config()
+            h0 = 0.5 * (cfg.h_lo + cfg.h_hi)
+            out, tel = tvc_sim.fly_one(cfg, cfg.seed0, h0, cfg.vx_max, n_tel=4000)
+        except Exception as exc:                      # noqa: BLE001
+            messagebox.showerror("Single flight failed", str(exc))
+            return
+        self.tvc_log.insert("end",
+                            f"\nsingle flight from {h0:.0f} m, vx {cfg.vx_max:+.0f} m/s"
+                            f"  ->  {'LANDED' if out[0] > 0.5 else 'FAILED'}\n"
+                            f"  touchdown {out[1]:.2f} m/s down, {out[2]:.2f} m/s "
+                            f"across, tilt {out[3]:.1f} deg, rate {out[4]:.1f} deg/s\n"
+                            f"  ignition commanded {out[5]:.1f} m, lit {out[6]:.1f} m "
+                            f"after {out[7] * 1000:.0f} ms; "
+                            f"D9 {'lit at %.2f s' % out[9] if out[8] > 0.5 else 'unused'}\n")
+        self.tvc_log.see("end")
+        self.tvc_summary.set(f"single flight: "
+                             f"{'LANDED' if out[0] > 0.5 else 'FAILED'} at "
+                             f"{out[1]:.2f} m/s down / {out[2]:.2f} m/s across")
+
+    def tvc_finish(self, camp, paths):
+        s = tvc_sim.summarise(camp)
+        self.tvc_summary.set(f"Success {s['success']:.1f} %   "
+                             f"({camp['out'][:, :, :, 0].size} flights)")
+        self.tvc_gates.set(
+            f"|vz|<{tvc_sim.GATE_VZ} {s['gate_vz']:5.1f} %   "
+            f"|vh|<{tvc_sim.GATE_VH} {s['gate_vh']:5.1f} %   "
+            f"tilt<{tvc_sim.GATE_TILT} {s['gate_tilt']:5.1f} %   "
+            f"rate<{tvc_sim.GATE_OMEGA} {s['gate_om']:5.1f} %   "
+            f"D9 used {s['boost_rate']:.0f} %\n"
+            f"p95: vz {s['p95_vz']:.2f} m/s   vh {s['p95_vh']:.2f} m/s   "
+            f"tilt {s['p95_tilt']:.1f} deg   rate {s['p95_om']:.1f} deg/s")
+        self.tvc_log.insert("end", "\nsuccess [%] by release altitude:\n")
+        for h, v in zip(camp["h_grid"], s["by_h"]):
+            self.tvc_log.insert("end", f"  {h:6.1f} m : {v:5.1f}\n")
+        self.tvc_log.insert("end", "success [%] by horizontal entry speed:\n")
+        for vx, v in zip(camp["vx_grid"], s["by_vx"]):
+            self.tvc_log.insert("end", f"  {vx:+5.1f} m/s : {v:5.1f}\n")
+        self.tvc_log.insert("end", "\nfigures:\n")
+        for p in paths:
+            self.tvc_log.insert("end", f"  {p}\n")
+        self.tvc_log.see("end")
 
     def show_motor(self):
         try:
@@ -333,6 +508,19 @@ class App:
                 elif kind == "cancelled":
                     self.summary.set("cancelled")
                     self.idle()
+                elif kind == "tlog":
+                    self.tvc_log.insert("end", payload + "\n")
+                    self.tvc_log.see("end")
+                elif kind == "tdone":
+                    self.tvc_finish(*payload)
+                    self.tvc_idle()
+                elif kind == "tcancelled":
+                    self.tvc_summary.set("cancelled")
+                    self.tvc_idle()
+                elif kind == "terror":
+                    self.tvc_summary.set("error")
+                    messagebox.showerror("Campaign failed", payload)
+                    self.tvc_idle()
                 elif kind == "error":
                     self.summary.set("error")
                     messagebox.showerror("Simulation failed", payload)
@@ -340,6 +528,11 @@ class App:
         except queue.Empty:
             pass
         self.root.after(100, self.poll)
+
+    def tvc_idle(self):
+        self.tvc_prog.stop()
+        self.tvc_btn.configure(state="normal")
+        self.tvc_stop.configure(state="disabled")
 
     def idle(self):
         self.progress.stop()

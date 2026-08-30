@@ -69,6 +69,113 @@ landing search.
 With the default vehicle: **long** motor -> apogee ≈ 171 m (burnout 70.7 m, 45.8 m/s),
 **short** motor -> apogee ≈ 264 m (burnout 61.7 m, 67.3 m/s, 7.8 g).
 
+---
+
+# 3-D / TVC mode (`tvc_sim.py`)
+
+The 1-D modes ask *whether a soft landing is possible at all*. This one asks whether a
+real controller flies it. Structure, gains and several of the hard-won details follow
+[Landing-Rocket-Sim](https://github.com/Tomasraketak/Landing-Rocket-Sim); the vehicle,
+the motor, the throttle clamp and the D9 booster are this project's.
+
+## What is modelled
+
+* **Two translational axes** (vertical z, horizontal x) and the **full attitude problem
+  in 3-D**: the airframe rolls at U(0, 90) deg/s in either direction with no actuator
+  able to stop it. Attitude is carried as two body-fixed unit vectors - the thrust axis
+  `b` and a transverse reference `g` that marks the roll orientation - never as Euler
+  angles, because the two servos are bolted to the airframe and their axes roll with it.
+* **Two TVC channels**: +/-10 deg servo through a 2:1 linkage -> +/-5 deg of nozzle,
+  500 deg/s, 2000 deg/s^2, 0.15 deg quantisation, on a 0.70 m arm.
+* **Aerodynamics**: axial force plus a slender-body normal force with the CP 0.35 m aft
+  of the CG, so the airframe weathercocks nose-first - that is the disturbance the TVC
+  fights - plus transverse (never roll) aero damping.
+* **The throttle clamp** of the 1-D modes (10-100 %, diverted impulse wasted, burn
+  duration fixed) and **one Klima D9** lit by an on-board rule.
+* **Dispersions**: igniter delay U(0, 300 ms), instantaneous thrust scatter up to
+  +/-15 % correlated over a 700 ms window, roll rate U(0, 90) deg/s, and the entry grid
+  (release 140-180 m in 5 m steps, vx 0 to +/-7 m/s in 1 m/s steps). Avionics sensor
+  noise is deliberately **not** modelled - the controller sees the true state.
+
+Touchdown must pass all five gates: |vz| < 3 m/s, |vh| < 0.75 m/s, tilt < 10 deg,
+transverse rate < 60 deg/s, and actually be on the ground. The rate gate reads the
+**transverse** rate only: roll is uncontrollable by design and does not tip the vehicle.
+
+## Guidance
+
+* ZEV-style commanded thrust **direction** with drag credit and an altitude-dependent
+  tilt cone (capped at 20 deg - much tighter than the reference's 45 deg, because this
+  vehicle's vertical margin cannot pay for a wide one).
+* Cascade attitude loop on the error rotation vector `e = asin|b x u| * unit(b x u)`,
+  inner rate loop on the gyro, gyroscopic decoupling of the roll-induced cross-axis
+  torque, and **dynamic inversion** `s = (b x tau)/(L*T)` so one gain set stays valid
+  across a 100:1 thrust range. omega_n = 9 rad/s, zeta = 1.
+* **A receding-horizon clamp level, re-solved at 10 Hz**: "the constant clamp that,
+  applied from now on, puts me on the pad at 0.5 m/s", held for 0.3 s with full clamp
+  assumed afterwards. The reference's four-segment coast-then-slam ladder is the wrong
+  family here - the grain cannot be saved, so what has to be shaped is the tail.
+* **The D9 rule**: the booster is lit only when the plan says the main motor cannot
+  close the landing even at full clamp. It cannot then be throttled, stopped or relit.
+
+## Results (5400 flights, 135 entry states x 40)
+
+![Landing success across the entry envelope](figures/fig1_success_envelope.png)
+
+| | |
+|---|---|
+| success, all five gates | **42.9 %** |
+| \|vz\| < 3 m/s | 45.2 % (p95 12.5 m/s) |
+| \|vh\| < 0.75 m/s | 81.1 % (p95 1.32 m/s) |
+| tilt < 10 deg | 97.7 % (p95 8.1 deg) |
+| rate < 60 deg/s | 95.7 % (p95 58.0 deg/s) |
+| D9 lit | 100 % of flights |
+
+**The vertical channel is the whole story** - success equals the vz gate almost exactly,
+and attitude control is never the limit. Where the loss comes from, measured by turning
+one dispersion off at a time (12 flights x 25 cells each):
+
+| configuration | success | \|vz\| gate |
+|---|---|---|
+| baseline | 45.3 % | 45.3 % |
+| **no thrust scatter** | **83.0 %** | 87.0 % |
+| no roll | 51.0 % | 51.3 % |
+| igniter spread removed *and the pad with it* | 24.3 % | 26.7 % |
+
+The +/-15 % thrust scatter is the dominant term: it is worth ~38 points on its own. The
+igniter row is the interesting one - removing the spread makes things *worse*, because
+the delay pad is also the vehicle's only ignition margin, and a command sized on a
+perfect igniter sits exactly on the floor.
+
+The band of usable ignition altitudes is about 14 m wide and the 300 ms igniter spread
+is about 13.5 m of it, so no command altitude covers every delay. Sweeping the commanded
+ignition altitude by hand at 150 m / vx = 0 (30 flights each) puts the optimum at
+**56-58 m at 56.7 %**, and the planner picks **56.2 m** by itself - the pre-flight logic
+is right, the vehicle is simply short of margin.
+
+![Where the vehicle arrives](figures/fig2_touchdown_dispersion.png)
+![A single flight](figures/fig3_single_flight.png)
+![Ignition and booster use](figures/fig4_ignition_and_booster.png)
+![Which gate binds](figures/fig5_gates.png)
+
+## Running it
+
+```
+python3 tvc_sim.py                       # the default campaign + figures
+python3 tvc_sim.py --runs 10 --h-step 20 --vx-step 3.5   # quick look
+python3 tvc_sim.py --boosters 0          # without the D9
+python3 tvc_sim.py --verify              # model invariants
+```
+
+`--verify` checks what an aggregate success rate cannot show: the gimbal basis stays
+orthonormal (7e-15), the dynamic inversion round-trips (1e-15), and the inherited roll
+survives the whole flight untouched, since nothing in the model makes a torque about
+the body axis.
+
+`numba` is optional but makes the campaign ~40x faster; `matplotlib` is needed for the
+figures. Both are in `requirements.txt`.
+
+---
+
 ## Usage
 
 ```

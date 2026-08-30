@@ -1,0 +1,79 @@
+     5/135  h=140.0 m  vx=-3 m/s   success  50.0 %
+    10/135  h=140.0 m  vx=+2 m/s   success  45.0 %
+    15/135  h=140.0 m  vx=+7 m/s   success  50.0 %
+    20/135  h=145.0 m  vx=-3 m/s   success  42.5 %
+    25/135  h=145.0 m  vx=+2 m/s   success  45.0 %
+    30/135  h=145.0 m  vx=+7 m/s   success  40.0 %
+    35/135  h=150.0 m  vx=-3 m/s   success  45.0 %
+    40/135  h=150.0 m  vx=+2 m/s   success  47.5 %
+    45/135  h=150.0 m  vx=+7 m/s   success  52.5 %
+    50/135  h=155.0 m  vx=-3 m/s   success  50.0 %
+    55/135  h=155.0 m  vx=+2 m/s   success  45.0 %
+    60/135  h=155.0 m  vx=+7 m/s   success  42.5 %
+    65/135  h=160.0 m  vx=-3 m/s   success  52.5 %
+    70/135  h=160.0 m  vx=+2 m/s   success  50.0 %
+    75/135  h=160.0 m  vx=+7 m/s   success  47.5 %
+    80/135  h=165.0 m  vx=-3 m/s   success  42.5 %
+    85/135  h=165.0 m  vx=+2 m/s   success  50.0 %
+    90/135  h=165.0 m  vx=+7 m/s   success  47.5 %
+    95/135  h=170.0 m  vx=-3 m/s   success  42.5 %
+   100/135  h=170.0 m  vx=+2 m/s   success  47.5 %
+   105/135  h=170.0 m  vx=+7 m/s   success  35.0 %
+   110/135  h=175.0 m  vx=-3 m/s   success  27.5 %
+   115/135  h=175.0 m  vx=+2 m/s   success  42.5 %
+   120/135  h=175.0 m  vx=+7 m/s   success  27.5 %
+   125/135  h=180.0 m  vx=-3 m/s   success  40.0 %
+   130/135  h=180.0 m  vx=+2 m/s   success  35.0 %
+   135/135  h=180.0 m  vx=+7 m/s   success  37.5 %
+==============================================================================
+LandSim Light - 3-D / TVC Monte Carlo
+==============================================================================
+  motor             : long, 120.4 N peak, 2.61 s, 221.8 Ns
+  boosters carried  : 1 x Klima D9 (20.0 Ns each), lit by the on-board rule
+  mass / Cd         : 3.200 kg + boosters / 0.35
+  entry grid        : 140-180 m step 5, vx 0 +/-7 m/s step 1
+  dispersions       : igniter U(0, 300) ms, thrust +/-15 % over 700 ms, roll U(0, 90) deg/s
+  flights           : 135 cells x 40 = 5400
+
+  SUCCESS (all five gates)   :  42.9 %
+    |v_z| < 3.0 m/s              :  45.2 %   p95  12.51 m/s
+    |v_h| < 0.75 m/s           :  81.1 %   p95   1.32 m/s
+    tilt  < 10.0 deg             :  97.7 %   p95   8.07 deg
+    rate  < 60.0 deg/s           :  95.7 %   p95  57.96 deg/s
+  D9 lit in                  : 100.0 % of flights
+  burnout before touchdown   :  26.0 %
+  mean commanded ignition    :  57.6 m, mean clamp 0.83
+
+  success [%] by release altitude:
+     140.0 m :  47.7
+     145.0 m :  44.3
+     150.0 m :  45.2
+     155.0 m :  45.8
+     160.0 m :  47.7
+     165.0 m :  44.8
+     170.0 m :  41.2
+     175.0 m :  33.7
+     180.0 m :  35.7
+  success [%] by horizontal entry speed:
+     -7.0 m/s :  40.6
+     -6.0 m/s :  41.1
+     -5.0 m/s :  41.9
+     -4.0 m/s :  41.7
+     -3.0 m/s :  43.6
+     -2.0 m/s :  43.1
+     -1.0 m/s :  46.1
+     +0.0 m/s :  48.3
+     +1.0 m/s :  45.6
+     +2.0 m/s :  45.3
+     +3.0 m/s :  41.9
+     +4.0 m/s :  39.2
+     +5.0 m/s :  41.4
+     +6.0 m/s :  41.4
+     +7.0 m/s :  42.2
+
+  figures written:
+    figures/fig1_success_envelope.png
+    figures/fig2_touchdown_dispersion.png
+    figures/fig3_single_flight.png
+    figures/fig4_ignition_and_booster.png
+    figures/fig5_gates.png
