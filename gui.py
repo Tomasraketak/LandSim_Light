@@ -18,7 +18,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 import landsim
-from landsim import Config, Motor, MOTOR_TABLES, Cancelled, find_window, G
+from landsim import (Config, Motor, MOTOR_TABLES, Cancelled, find_window,
+                      ascent, G)
 
 # label, attribute key, default, unit, tooltip-ish hint
 FIELDS = [
@@ -111,6 +112,12 @@ class App:
         self.stop_btn = ttk.Button(bar, text="Stop", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=6)
         ttk.Button(bar, text="Defaults", command=self.reset).pack(side="left")
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Button(bar, text="Apogee from ground",
+                   command=self.run_ascent).pack(side="left")
+        ttk.Label(bar, text="throttle:").pack(side="left", padx=(8, 2))
+        self.ascent_throttle = tk.StringVar(value="1.0")
+        ttk.Entry(bar, textvariable=self.ascent_throttle, width=5).pack(side="left")
         self.progress = ttk.Progressbar(bar, mode="indeterminate", length=180)
         self.progress.pack(side="right")
 
@@ -234,6 +241,39 @@ class App:
         self.progress.start(12)
         self.worker = threading.Thread(target=self.work, args=(cfg, params), daemon=True)
         self.worker.start()
+
+    def run_ascent(self):
+        """Side calculation: vertical launch from the ground, no optimisation."""
+        try:
+            cfg = self.build_config()
+            thr = float(self.ascent_throttle.get().strip().replace(",", ".") or 1.0)
+            if not 0.0 < thr <= 1.0:
+                raise ValueError("ascent throttle must be in (0, 1]")
+        except ValueError as exc:
+            messagebox.showerror("Invalid input", str(exc))
+            return
+        a = ascent(cfg, throttle=thr)
+        self.log.insert("end", f"\n--- vertical launch from the ground, motor "
+                               f"'{cfg.motor.name}', throttle {thr:g} ---\n")
+        if a["liftoff_time"] is None:
+            self.summary.set("The rocket never lifts off "
+                             "(thrust stays below the weight).")
+            self.log.insert("end", "  no lift-off\n")
+        else:
+            self.summary.set(f"Apogee from the ground: {a['apogee']:.1f} m "
+                             f"(burnout {a['burnout_altitude']:.1f} m, "
+                             f"max speed {a['max_speed']:.1f} m/s)")
+            self.log.insert("end",
+                            f"  burnout   : {a['burnout_time']:.2f} s at "
+                            f"{a['burnout_altitude']:.1f} m, "
+                            f"{a['burnout_speed']:.1f} m/s\n"
+                            f"  max speed : {a['max_speed']:.1f} m/s, "
+                            f"max accel {a['max_acceleration'] / G:.1f} g\n"
+                            f"  APOGEE    : {a['apogee']:.1f} m at "
+                            f"t = {a['time_to_apogee']:.2f} s "
+                            f"(coast {a['coast_height']:.1f} m)\n")
+        self.timing.set("")
+        self.log.see("end")
 
     def stop(self):
         self.stop_flag.set()

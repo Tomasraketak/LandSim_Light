@@ -291,6 +291,76 @@ def trajectory(cfg: Config, ignition_altitude: float, profile):
 
 
 # --------------------------------------------------------------------------- #
+#  Side simulation: how high would the rocket fly if launched from the ground?
+# --------------------------------------------------------------------------- #
+def ascent(cfg: Config, throttle=1.0, launch_altitude=0.0):
+    """Vertical ascent from rest at the ground - a side calculation, it has
+    nothing to do with the landing search.
+
+    throttle : constant throttle (1.0 = full thrust) or a sequence of per-phase
+               throttle values, same convention as in the landing simulation.
+
+    Returns a dict with the apogee, the burnout state and the peak velocity.
+    """
+    if np.isscalar(throttle):
+        prof = np.full(cfg.n_phases, float(throttle))
+    else:
+        prof = np.asarray(throttle, dtype=float)
+
+    k = 0.5 * cfg.rho * cfg.cd * cfg.area
+    dry = cfg.gross_mass - cfg.motor.propellant_mass
+    y, v, t = float(launch_altitude), 0.0, 0.0
+    burnout = None
+    v_max = 0.0
+    a_max = 0.0
+    liftoff_time = None
+
+    while t < cfg.max_time * 10:
+        thrust_nom = float(cfg.motor.thrust(t))
+        mass = dry + (cfg.motor.propellant_mass - float(cfg.motor.burned_mass(t)))
+        if thrust_nom > 0.0:
+            idx = min(int(t / cfg.phase_length), len(prof) - 1)
+            thrust = thrust_nom * prof[idx]
+        else:
+            thrust = 0.0
+            if burnout is None:
+                burnout = (t, y, v)
+        a = (thrust - k * v * abs(v)) / mass - G
+        if y <= launch_altitude and a <= 0.0:
+            # still sitting on the pad, thrust below the weight
+            y = float(launch_altitude)
+            v = 0.0
+            if burnout is not None:
+                break          # motor finished and it never left the pad
+            t += cfg.dt
+            continue
+        if liftoff_time is None:
+            liftoff_time = t
+        a_max = max(a_max, a)
+        v_new = v + a * cfg.dt
+        y += 0.5 * (v + v_new) * cfg.dt
+        v = v_new
+        v_max = max(v_max, v)
+        t += cfg.dt
+        if v <= 0.0 and burnout is not None:
+            break
+
+    if burnout is None:
+        burnout = (t, y, v)
+    return {
+        "apogee": y,
+        "time_to_apogee": t,
+        "burnout_time": burnout[0],
+        "burnout_altitude": burnout[1],
+        "burnout_speed": burnout[2],
+        "max_speed": v_max,
+        "max_acceleration": a_max,
+        "liftoff_time": liftoff_time,
+        "coast_height": y - burnout[1],
+    }
+
+
+# --------------------------------------------------------------------------- #
 #  Throttle-profile optimiser (differential evolution, vectorised)
 # --------------------------------------------------------------------------- #
 def _cost(cfg: Config, res):
@@ -536,6 +606,11 @@ def main():
                     help="bisection tolerance of the window edges [m]")
     ap.add_argument("--pop", type=int, default=64, help="DE population size")
     ap.add_argument("--gen", type=int, default=120, help="DE generations")
+    ap.add_argument("--ascent", action="store_true",
+                    help="only run the side calculation: how high the rocket "
+                         "would fly if launched vertically from the ground")
+    ap.add_argument("--ascent-throttle", type=float, default=1.0,
+                    help="constant throttle used for --ascent")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -570,6 +645,22 @@ def main():
     s_max = cfg.drop_altitude if args.search_max is None else args.search_max
     print(f"  soft-landing limit: {cfg.max_touchdown_speed:.1f} m/s")
     print(f"  searched altitudes: {args.search_min:.1f} - {s_max:.1f} m\n")
+
+    asc = ascent(cfg, throttle=args.ascent_throttle)
+    print(f"Side calculation - vertical launch from the ground "
+          f"(throttle {args.ascent_throttle:g}):")
+    if asc["liftoff_time"] is None:
+        print("  the rocket never lifts off (thrust stays below the weight)\n")
+    else:
+        print(f"  burnout           : {asc['burnout_time']:.2f} s at "
+              f"{asc['burnout_altitude']:.1f} m, {asc['burnout_speed']:.1f} m/s")
+        print(f"  max speed / accel : {asc['max_speed']:.1f} m/s / "
+              f"{asc['max_acceleration'] / G:.1f} g")
+        print(f"  APOGEE            : {asc['apogee']:.1f} m "
+              f"at t = {asc['time_to_apogee']:.2f} s "
+              f"(coast {asc['coast_height']:.1f} m)\n")
+    if args.ascent:
+        return
 
     print("Scanning ignition altitudes ...")
     win = find_window(cfg, coarse_step=args.coarse_step, tol=args.tol,

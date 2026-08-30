@@ -38,6 +38,20 @@ lowest and the highest such altitude together with the throttle / thrust profile
 * The report also gives the time from the release down to each of the two ignition
   altitudes and the resulting time window for the ignition command.
 
+## Side calculation: apogee from the ground
+
+`ascent(cfg, throttle)` simulates a vertical launch from rest at ground level with
+the same vehicle, motor and drag model and returns the apogee, the burnout state,
+the peak speed and the peak acceleration. It is completely separate from the
+landing search.
+
+* CLI: printed before every run; `--ascent` runs only this, `--ascent-throttle`
+  sets a constant throttle.
+* GUI: the **Apogee from ground** button with its own throttle box.
+
+With the default vehicle: **long** motor -> apogee ≈ 171 m (burnout 70.7 m, 45.8 m/s),
+**short** motor -> apogee ≈ 264 m (burnout 61.7 m, 67.3 m/s, 7.8 g).
+
 ## Usage
 
 ```
