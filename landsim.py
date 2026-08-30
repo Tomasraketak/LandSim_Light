@@ -65,7 +65,10 @@ AREA = math.pi * (DIAMETER / 2.0) ** 2
 class Motor:
     """Thrust curve reconstructed from the fraction-of-peak table."""
 
-    def __init__(self, table=MOTOR_TABLE, propellant_mass=PROPELLANT_MASS):
+    def __init__(self, table=MOTOR_TABLE, propellant_mass=PROPELLANT_MASS,
+                 thrust_multiplier=1.0):
+        if thrust_multiplier <= 0.0:
+            raise ValueError("thrust multiplier must be > 0")
         rise = [(t, f) for _, f, t, _ in table]
         decay = [(t, f) for _, f, _, t in table]
         # ascending branch, then descending branch (reversed -> increasing time)
@@ -79,7 +82,9 @@ class Motor:
         thrust = [0.0] + [f for _, f in pts] + [0.0]
 
         self.t = np.asarray(times, dtype=float)
-        self.f = np.asarray(thrust, dtype=float)
+        # the whole lookup table is scaled by the multiplier before anything else
+        self.thrust_multiplier = float(thrust_multiplier)
+        self.f = np.asarray(thrust, dtype=float) * self.thrust_multiplier
         self.burn_time = float(self.t[-1])
         self.peak_thrust = float(self.f.max())
 
@@ -277,7 +282,7 @@ def optimise_profile(cfg: Config, ignition_altitude: float, pop_size=64,
     rng = np.random.default_rng(seed)
     d = cfg.n_phases
     lo, hi = cfg.throttle_min, cfg.throttle_max
-    v0, _ = free_fall_to(cfg, ignition_altitude)
+    v0, t_fall = free_fall_to(cfg, ignition_altitude)
 
     pop = rng.uniform(lo, hi, size=(pop_size, d))
     # a few structured seeds: constant throttles and simple ramps
@@ -312,6 +317,7 @@ def optimise_profile(cfg: Config, ignition_altitude: float, pop_size=64,
         "touchdown_speed": float(res["touchdown_speed"][0]),
         "landed": bool(res["landed"][0]),
         "entry_speed": abs(v0),
+        "fall_time": t_fall,
         "cost": float(cost[best]),
     }
 
@@ -325,7 +331,7 @@ class Cancelled(Exception):
 
 def find_window(cfg: Config, coarse_step=5.0, tol=0.25, verbose=True,
                 pop_size=64, generations=120, on_progress=None,
-                should_stop=None):
+                should_stop=None, search_min=1.0, search_max=None):
     """Return the lowest and the highest ignition altitude with a soft landing.
 
     on_progress : optional callable(str) receiving human-readable progress lines
@@ -343,12 +349,17 @@ def find_window(cfg: Config, coarse_step=5.0, tol=0.25, verbose=True,
             raise Cancelled()
 
     limit = cfg.max_touchdown_speed
-    lo_bound = 1.0
-    hi_bound = cfg.drop_altitude
+    lo_bound = max(0.0, float(search_min))
+    hi_bound = cfg.drop_altitude if search_max is None else float(search_max)
+    hi_bound = min(hi_bound, cfg.drop_altitude)
+    if hi_bound <= lo_bound:
+        raise ValueError("the search range is empty "
+                         f"(<{lo_bound:.2f}, {hi_bound:.2f}> m)")
 
     # --- coarse scan -------------------------------------------------------
     grid = np.arange(lo_bound, hi_bound + 1e-9, coarse_step)
     results, warm = {}, None
+    seen_ok = False
     for h in grid:
         check_stop()
         r = optimise_profile(cfg, float(h), pop_size=pop_size,
@@ -361,6 +372,14 @@ def find_window(cfg: Config, coarse_step=5.0, tol=0.25, verbose=True,
         report(f"  {flag}h = {h:6.1f} m   entry {r['entry_speed']:5.1f} m/s"
                f"   best touchdown {r['touchdown_speed']:7.2f} m/s")
         check_stop()
+        # the feasible set is a single contiguous window: the first failure
+        # after a series of successes closes it, so the scan can stop there
+        if r["touchdown_speed"] <= limit:
+            seen_ok = True
+        elif seen_ok:
+            report("  first failure after the OK series - window closed, "
+                   "stopping the scan")
+            break
 
     # --- if the coarse grid missed the (possibly narrow) window, zoom in around
     #     the most promising altitude a few times before giving up ------------
@@ -442,6 +461,7 @@ def print_profile(cfg: Config, res, label):
     prof = res["profile"]
     print(f"\n{label}")
     print(f"  ignition altitude   : {res['altitude']:.2f} m")
+    print(f"  time from release   : {res['fall_time']:.3f} s")
     print(f"  speed at ignition   : {res['entry_speed']:.2f} m/s (down)")
     print(f"  touchdown speed     : {res['touchdown_speed']:.2f} m/s")
     print("  throttle profile (100 ms phases, 1.00 = full thrust, "
@@ -476,6 +496,13 @@ def main():
                     help="minimum thrust fraction (flaps at 90 %% blocking)")
     ap.add_argument("--phase", type=float, default=0.1, help="throttle phase length [s]")
     ap.add_argument("--dt", type=float, default=0.002, help="integration step [s]")
+    ap.add_argument("--thrust-mult", type=float, default=1.0,
+                    help="multiplier applied to the whole motor lookup table")
+    ap.add_argument("--search-min", type=float, default=1.0,
+                    help="lowest ignition altitude to search [m]")
+    ap.add_argument("--search-max", type=float, default=None,
+                    help="highest ignition altitude to search [m], "
+                         "default = drop altitude")
     ap.add_argument("--coarse-step", type=float, default=5.0,
                     help="ignition-altitude scan step [m]")
     ap.add_argument("--tol", type=float, default=0.25,
@@ -485,7 +512,9 @@ def main():
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
-    cfg = Config.with_propellant(args.propellant, drop_altitude=args.drop_alt, gross_mass=args.mass,
+    cfg = Config(motor=Motor(propellant_mass=args.propellant,
+                             thrust_multiplier=args.thrust_mult),
+                 drop_altitude=args.drop_alt, gross_mass=args.mass,
                  diameter=args.diameter, cd=args.cd, rho=args.rho,
                  max_touchdown_speed=args.max_touchdown,
                  throttle_min=args.throttle_min, phase_length=args.phase,
@@ -500,6 +529,7 @@ def main():
     print(f"  diameter / area   : {cfg.diameter * 1000:.0f} mm / {cfg.area * 1e4:.1f} cm2")
     print(f"  Cd                : {cfg.cd}")
     print(f"  drop altitude     : {cfg.drop_altitude:.1f} m")
+    print(f"  thrust multiplier : {m.thrust_multiplier:g} x table")
     print(f"  motor burn time   : {m.burn_time:.3f} s, peak {m.peak_thrust:.1f} N")
     print(f"  total impulse     : {m.total_impulse:.1f} Ns  "
           f"(avg {m.total_impulse / m.burn_time:.1f} N)")
@@ -509,12 +539,15 @@ def main():
           f"in {cfg.n_phases} phases of {cfg.phase_length * 1000:.0f} ms")
     print(f"  terminal velocity : "
           f"{math.sqrt(cfg.gross_mass * G / (0.5 * cfg.rho * cfg.cd * cfg.area)):.1f} m/s")
-    print(f"  soft-landing limit: {cfg.max_touchdown_speed:.1f} m/s\n")
+    s_max = cfg.drop_altitude if args.search_max is None else args.search_max
+    print(f"  soft-landing limit: {cfg.max_touchdown_speed:.1f} m/s")
+    print(f"  searched altitudes: {args.search_min:.1f} - {s_max:.1f} m\n")
 
     print("Scanning ignition altitudes ...")
     win = find_window(cfg, coarse_step=args.coarse_step, tol=args.tol,
                       verbose=not args.quiet, pop_size=args.pop,
-                      generations=args.gen)
+                      generations=args.gen, search_min=args.search_min,
+                      search_max=args.search_max)
 
     print("\n" + "=" * 72)
     if win is None:
@@ -525,9 +558,14 @@ def main():
     lo_alt, lo_res = win["low"]
     hi_alt, hi_res = win["high"]
     lo_res["altitude"], hi_res["altitude"] = lo_alt, hi_alt
+    dt_ign = lo_res["fall_time"] - hi_res["fall_time"]
     print(f"RESULT: soft landing possible for ignition altitudes "
           f"{lo_alt:.2f} m ... {hi_alt:.2f} m "
           f"(window {hi_alt - lo_alt:.2f} m)")
+    print(f"        time from the release at {cfg.drop_altitude:.1f} m: "
+          f"{hi_res['fall_time']:.3f} s (highest) ... "
+          f"{lo_res['fall_time']:.3f} s (lowest)")
+    print(f"        -> time window for the ignition command: {dt_ign:.3f} s")
     print("=" * 72)
     print_profile(cfg, lo_res, "LOWEST ignition altitude that still lands softly")
     print_profile(cfg, hi_res, "HIGHEST ignition altitude that still lands softly")

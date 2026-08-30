@@ -30,7 +30,10 @@ FIELDS = [
     ("Reference area",     "area",         "",      "cm2",   "leave empty = from diameter"),
     ("Cd",                 "cd",           "0.35",  "-",     "drag coefficient"),
     ("Air density",        "rho",          "1.225", "kg/m3", ""),
+    ("Thrust multiplier",  "thrust_mult",  "1.0",   "x",     "scales the whole motor table"),
     ("Soft-landing limit", "limit",        "3.0",   "m/s",   "max touchdown speed"),
+    ("Search from",        "search_min",   "1",     "m",     "lowest ignition altitude tried"),
+    ("Search to",          "search_max",   "",      "m",     "empty = drop altitude"),
     ("Min. throttle",      "throttle_min", "0.1",   "-",     "0.1 = flaps block 90 %"),
     ("Throttle phase",     "phase",        "0.1",   "s",     "length of one throttle step"),
     ("Time step",          "dt",           "0.002", "s",     "integration step"),
@@ -100,18 +103,22 @@ class App:
         res.pack(fill="x")
         self.summary = tk.StringVar(value="-")
         ttk.Label(res, textvariable=self.summary, font=("TkDefaultFont", 11, "bold"),
-                  foreground="#0a5").pack(anchor="w", pady=(0, 6))
+                  foreground="#0a5").pack(anchor="w", pady=(0, 2))
+        self.timing = tk.StringVar(value="")
+        ttk.Label(res, textvariable=self.timing,
+                  font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 6))
 
         grid = ttk.Frame(res)
         grid.pack(fill="x")
-        heads = ["", "Ignition altitude", "Speed at ignition", "Touchdown speed"]
+        heads = ["", "Ignition altitude", "Time from release", "Speed at ignition",
+                 "Touchdown speed"]
         for c, h in enumerate(heads):
             ttk.Label(grid, text=h, font=("TkDefaultFont", 9, "bold")).grid(
                 row=0, column=c, sticky="w", padx=8)
         self.cells = {}
         for r, name in enumerate(("LOWEST ignition", "HIGHEST ignition"), start=1):
             ttk.Label(grid, text=name).grid(row=r, column=0, sticky="w", padx=8)
-            for c, key in enumerate(("alt", "entry", "td"), start=1):
+            for c, key in enumerate(("alt", "t", "entry", "td"), start=1):
                 v = tk.StringVar(value="-")
                 self.cells[(r, key)] = v
                 ttk.Label(grid, textvariable=v).grid(row=r, column=c, sticky="w", padx=8)
@@ -153,7 +160,8 @@ class App:
             throttle_min=self.num("throttle_min"),
             phase_length=self.num("phase"),
             dt=self.num("dt"),
-            motor=Motor(propellant_mass=self.num("propellant")),
+            motor=Motor(propellant_mass=self.num("propellant"),
+                        thrust_multiplier=self.num("thrust_mult", 1.0)),
         )
         area_cm2 = self.vars["area"].get().strip()
         cfg.area_override = float(area_cm2.replace(",", ".")) / 1e4 if area_cm2 else None
@@ -167,8 +175,11 @@ class App:
             return
         try:
             cfg = self.build_config()
+            s_max = self.vars["search_max"].get().strip()
             params = dict(coarse_step=self.num("coarse_step"), tol=self.num("tol"),
-                          pop_size=int(self.num("pop")), generations=int(self.num("gen")))
+                          pop_size=int(self.num("pop")), generations=int(self.num("gen")),
+                          search_min=self.num("search_min", 1.0),
+                          search_max=float(s_max.replace(",", ".")) if s_max else None)
         except ValueError as exc:
             messagebox.showerror("Invalid input", str(exc))
             return
@@ -176,9 +187,11 @@ class App:
         self.log.delete("1.0", "end")
         for key in self.cells:
             self.cells[key].set("-")
+        self.timing.set("")
         self.summary.set("computing ...")
         m = cfg.motor
-        self.put("log", f"burn {m.burn_time:.3f} s, peak {m.peak_thrust:.1f} N, "
+        self.put("log", f"thrust multiplier {m.thrust_multiplier:g}x\n"
+                        f"burn {m.burn_time:.3f} s, peak {m.peak_thrust:.1f} N, "
                         f"total impulse {m.total_impulse:.1f} Ns, "
                         f"peak T/W {m.peak_thrust / (cfg.gross_mass * G):.2f}, "
                         f"area {cfg.area * 1e4:.1f} cm2\n"
@@ -239,8 +252,9 @@ class App:
     def finish(self, cfg, win):
         self.idle()
         if win is None:
-            self.summary.set(f"No ignition altitude lands below "
-                             f"{cfg.max_touchdown_speed:g} m/s.")
+            self.summary.set(f"No ignition altitude in the searched range lands "
+                             f"below {cfg.max_touchdown_speed:g} m/s.")
+            self.timing.set("")
             return
         (lo_alt, lo), (hi_alt, hi) = win["low"], win["high"]
         self.summary.set(f"Soft landing possible for ignition altitudes "
@@ -248,8 +262,13 @@ class App:
                          f"(window {hi_alt - lo_alt:.2f} m)")
         for r, alt, res in ((1, lo_alt, lo), (2, hi_alt, hi)):
             self.cells[(r, "alt")].set(f"{alt:.2f} m")
+            self.cells[(r, "t")].set(f"{res['fall_time']:.3f} s")
             self.cells[(r, "entry")].set(f"{res['entry_speed']:.2f} m/s")
             self.cells[(r, "td")].set(f"{res['touchdown_speed']:.2f} m/s")
+        dt_ign = lo["fall_time"] - hi["fall_time"]
+        self.timing.set(f"Ignition must happen {hi['fall_time']:.3f} s ... "
+                        f"{lo['fall_time']:.3f} s after the release from "
+                        f"{cfg.drop_altitude:g} m  ->  time window {dt_ign:.3f} s")
 
         for name, alt, res in (("LOWEST", lo_alt, lo), ("HIGHEST", hi_alt, hi)):
             self.log.insert("end", f"\n{name} ignition altitude {alt:.2f} m -> "

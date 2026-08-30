@@ -22,6 +22,18 @@ vectorised differential-evolution optimiser over the throttle profile, the range
 ignition altitudes for which a touchdown below 3 m/s is achievable, and prints the
 lowest and the highest such altitude together with the throttle / thrust profile.
 
+## Extra knobs
+
+* `--thrust-mult` (GUI: *Thrust multiplier*) scales the whole motor lookup table by a
+  float > 0 before the simulation starts; everything else (burn time, mass history)
+  stays as it is.
+* `--search-min` / `--search-max` (GUI: *Search from* / *Search to*) limit the range of
+  ignition altitudes that is searched.
+* The feasible set is treated as a single contiguous window, so the coarse scan stops
+  at the first failure after a series of successes.
+* The report also gives the time from the release down to each of the two ignition
+  altitudes and the resulting time window for the ignition command.
+
 ## Usage
 
 ```
