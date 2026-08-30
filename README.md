@@ -85,6 +85,9 @@ the motor, the throttle clamp and the D9 booster are this project's.
   able to stop it. Attitude is carried as two body-fixed unit vectors - the thrust axis
   `b` and a transverse reference `g` that marks the roll orientation - never as Euler
   angles, because the two servos are bolted to the airframe and their axes roll with it.
+* **Fin control**: four all-moving NACA 0012 fins, +/-15 deg in 90 ms, 0.50 m aft of
+  the CG - steering, the only roll authority on the vehicle, and airbrakes. See the
+  section below.
 * **Two TVC channels**: +/-10 deg servo through a 2:1 linkage -> +/-5 deg of nozzle,
   500 deg/s, 2000 deg/s^2, 0.15 deg quantisation, on a 0.70 m arm.
 * **Aerodynamics**: axial force plus a slender-body normal force with the CP 0.35 m aft
@@ -117,40 +120,87 @@ transverse rate < 60 deg/s, and actually be on the ground. The rate gate reads t
 * **The D9 rule**: the booster is lit only when the plan says the main motor cannot
   close the landing even at full clamp. It cannot then be throttled, stopped or relit.
 
+## Fin control
+
+Four all-moving cruciform fins (the airframe's own geometry: 120 mm root, 63 mm tip,
+70 mm span, 26.6 deg sweep), NACA 0012, **+/-15 deg with 90 ms end stop to end stop**,
+mounted **0.50 m aft of the CG**. Deflection limit, travel time, arm and the whole
+planform are editable in the GUI and on the command line.
+
+They do three different jobs, and the mixer keeps them separate:
+
+```
+delta_i = roll + A*cos(phi_i) + B*sin(phi_i)   +   brake * (+1,-1,+1,-1)
+          \____________ control ____________/       \___ pure drag ___/
+```
+
+* **Steering.** A and B are solved from the torque the gimbal *cannot* deliver -
+  the whole demand while the motor is unlit, and whatever is left when the nozzle is
+  at its stop. The fins' own crossflow angle of attack is cancelled in the mixer, the
+  same dynamic inversion the nozzle gets, done in the fin's variable: without it the
+  commanded deflection and the delivered angle of attack differ by the vehicle's
+  sideslip and the two actuators limit-cycle against each other.
+* **Roll**, which the gimbal provably cannot touch. A slow rate damper (1.5 rad/s,
+  capped at 2 deg of travel): the roll inertia is 0.004 kg m^2, so one degree of fin
+  is worth ~800 deg/s^2 and a loop sized by authority instead of by inertia demands
+  more than a 333 deg/s actuator can track.
+* **Airbrakes.** Splayed +,-,+,- the set cancels its own lift and roll torque and
+  leaves pure drag: **free-fall Cd 0.581 against 0.350 bare, 1.66x**. Control is
+  allocated first and the brake takes what travel is left.
+
+Two things the model shows that are worth knowing before building it:
+
+* **The attitude loop must stay asleep for most of the free fall.** Fighting the
+  weathercock at 40 m/s with four fins means large, asymmetric deflections, and four
+  asymmetric fins are a roll torque - measured, it spun the airframe to 340 deg/s
+  before the motor was even lit. The loop wakes 40 m above the commanded ignition
+  altitude, which is far enough to settle and late enough to fly the descent at trim.
+* **A splayed airbrake is not roll-neutral in practice.** Once the fins stall
+  asymmetrically (15 deg of splay plus the sideslip of a weathercocking airframe is
+  past stall) the set induces 60-130 deg/s of roll. The roll channel absorbs it -
+  which is the clearest argument in the model for having one.
+
 ## Results (5400 flights, 135 entry states x 40)
 
 ![Landing success across the entry envelope](figures/fig1_success_envelope.png)
 
 | | |
 |---|---|
-| success, all five gates | **42.9 %** |
-| \|vz\| < 3 m/s | 45.2 % (p95 12.5 m/s) |
-| \|vh\| < 0.75 m/s | 81.1 % (p95 1.32 m/s) |
-| tilt < 10 deg | 97.7 % (p95 8.1 deg) |
-| rate < 60 deg/s | 95.7 % (p95 58.0 deg/s) |
+| success, all five gates | **49.6 %** |
+| \|vz\| < 3 m/s | 49.6 % (p95 11.2 m/s) |
+| \|vh\| < 0.75 m/s | 91.3 % (p95 0.93 m/s) |
+| tilt < 10 deg | 99.9 % (p95 5.2 deg) |
+| transverse rate < 60 deg/s | 99.8 % (p95 11.8 deg/s) |
 | D9 lit | 100 % of flights |
 
-**The vertical channel is the whole story** - success equals the vz gate almost exactly,
-and attitude control is never the limit. Where the loss comes from, measured by turning
-one dispersion off at a time (12 flights x 25 cells each):
+**Success now equals the vertical gate exactly.** With fin control the attitude
+problem is closed - tilt and rate pass 99.8 % of the time and the roll the vehicle
+arrived with is nulled every flight - and what is left is purely propulsive.
 
-| configuration | success | \|vz\| gate |
-|---|---|---|
-| baseline | 45.3 % | 45.3 % |
-| **no thrust scatter** | **83.0 %** | 87.0 % |
-| no roll | 51.0 % | 51.3 % |
-| igniter spread removed *and the pad with it* | 24.3 % | 26.7 % |
+Turning one thing off at a time (16 flights x 25 cells each, common random numbers):
 
-The +/-15 % thrust scatter is the dominant term: it is worth ~38 points on its own. The
-igniter row is the interesting one - removing the spread makes things *worse*, because
-the delay pad is also the vehicle's only ignition margin, and a command sized on a
-perfect igniter sits exactly on the floor.
+| configuration | success | \|vz\| | \|vh\| | tilt | rate | p95 rate |
+|---|---|---|---|---|---|---|
+| fins + airbrake (default) | **46.2 %** | 46.2 | 86.8 | 99.8 | 99.8 | 39 deg/s |
+| fins, brake deployed all flight | 46.2 % | 48.2 | 84.2 | 98.5 | 93.5 | 64 |
+| fins, no airbrake | 45.0 % | 46.8 | 84.8 | 99.0 | 97.5 | 53 |
+| **no fins at all** | **40.0 %** | 41.0 | 78.8 | 98.8 | 96.5 | 55 |
+| fins, no D9 booster | 13.2 % | 13.2 | 42.0 | 99.8 | 99.0 | 7 |
+| fins, no thrust scatter | **85.5 %** | 85.8 | 99.5 | 99.8 | 100.0 | 16 |
 
-The band of usable ignition altitudes is about 14 m wide and the 300 ms igniter spread
-is about 13.5 m of it, so no command altitude covers every delay. Sweeping the commanded
-ignition altitude by hand at 150 m / vx = 0 (30 flights each) puts the optimum at
-**56-58 m at 56.7 %**, and the planner picks **56.2 m** by itself - the pre-flight logic
-is right, the vehicle is simply short of margin.
+* **The fins are worth about 6 points** and they buy it in the vertical channel, not
+  the attitude one: the airbrake takes energy out of the free fall before the motor
+  ever lights.
+* **The D9 is worth 33 points.** Without it the main motor alone cannot close this
+  landing from 140-180 m at all - 13 %.
+* **The +/-15 % thrust scatter is still the dominant term**, worth ~39 points on its
+  own. It is what stands between this vehicle and a solved problem.
+
+The band of usable ignition altitudes is about 14 m wide and the 300 ms igniter
+spread is about 13.5 m of it, so no command altitude covers every delay. Sweeping the
+commanded ignition altitude by hand at 150 m / vx = 0 put the optimum at **56-58 m**,
+and the planner picks **56.6 m** by itself - the pre-flight logic is right, the
+vehicle is short of margin.
 
 ![Where the vehicle arrives](figures/fig2_touchdown_dispersion.png)
 ![A single flight](figures/fig3_single_flight.png)
@@ -163,13 +213,17 @@ is right, the vehicle is simply short of margin.
 python3 tvc_sim.py                       # the default campaign + figures
 python3 tvc_sim.py --runs 10 --h-step 20 --vx-step 3.5   # quick look
 python3 tvc_sim.py --boosters 0          # without the D9
+python3 tvc_sim.py --no-fins             # gimbal only, roll uncontrolled
+python3 tvc_sim.py --fin-deflect 20 --fin-travel 0.05 --fin-brake always
+python3 tvc_sim.py --save run.npz        # ... and redraw later with --load run.npz
 python3 tvc_sim.py --verify              # model invariants
 ```
 
 `--verify` checks what an aggregate success rate cannot show: the gimbal basis stays
-orthonormal (7e-15), the dynamic inversion round-trips (1e-15), and the inherited roll
-survives the whole flight untouched, since nothing in the model makes a torque about
-the body axis.
+orthonormal (7e-15), the dynamic inversion round-trips (1e-15), the inherited roll
+survives the whole flight untouched **with the fins disabled** - nothing else in the
+model makes a torque about the body axis - and with them enabled the same spin is
+nulled to well under 1 deg/s by touchdown.
 
 `numba` is optional but makes the campaign ~40x faster; `matplotlib` is needed for the
 figures. Both are in `requirements.txt`.

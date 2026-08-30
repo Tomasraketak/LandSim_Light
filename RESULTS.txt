@@ -1,75 +1,77 @@
      5/135  h=140.0 m  vx=-3 m/s   success  50.0 %
-    10/135  h=140.0 m  vx=+2 m/s   success  45.0 %
+    10/135  h=140.0 m  vx=+2 m/s   success  50.0 %
     15/135  h=140.0 m  vx=+7 m/s   success  50.0 %
-    20/135  h=145.0 m  vx=-3 m/s   success  42.5 %
-    25/135  h=145.0 m  vx=+2 m/s   success  45.0 %
-    30/135  h=145.0 m  vx=+7 m/s   success  40.0 %
-    35/135  h=150.0 m  vx=-3 m/s   success  45.0 %
-    40/135  h=150.0 m  vx=+2 m/s   success  47.5 %
-    45/135  h=150.0 m  vx=+7 m/s   success  52.5 %
+    20/135  h=145.0 m  vx=-3 m/s   success  57.5 %
+    25/135  h=145.0 m  vx=+2 m/s   success  50.0 %
+    30/135  h=145.0 m  vx=+7 m/s   success  50.0 %
+    35/135  h=150.0 m  vx=-3 m/s   success  55.0 %
+    40/135  h=150.0 m  vx=+2 m/s   success  60.0 %
+    45/135  h=150.0 m  vx=+7 m/s   success  50.0 %
     50/135  h=155.0 m  vx=-3 m/s   success  50.0 %
     55/135  h=155.0 m  vx=+2 m/s   success  45.0 %
-    60/135  h=155.0 m  vx=+7 m/s   success  42.5 %
-    65/135  h=160.0 m  vx=-3 m/s   success  52.5 %
-    70/135  h=160.0 m  vx=+2 m/s   success  50.0 %
-    75/135  h=160.0 m  vx=+7 m/s   success  47.5 %
-    80/135  h=165.0 m  vx=-3 m/s   success  42.5 %
-    85/135  h=165.0 m  vx=+2 m/s   success  50.0 %
+    60/135  h=155.0 m  vx=+7 m/s   success  50.0 %
+    65/135  h=160.0 m  vx=-3 m/s   success  50.0 %
+    70/135  h=160.0 m  vx=+2 m/s   success  37.5 %
+    75/135  h=160.0 m  vx=+7 m/s   success  50.0 %
+    80/135  h=165.0 m  vx=-3 m/s   success  55.0 %
+    85/135  h=165.0 m  vx=+2 m/s   success  47.5 %
     90/135  h=165.0 m  vx=+7 m/s   success  47.5 %
-    95/135  h=170.0 m  vx=-3 m/s   success  42.5 %
-   100/135  h=170.0 m  vx=+2 m/s   success  47.5 %
-   105/135  h=170.0 m  vx=+7 m/s   success  35.0 %
-   110/135  h=175.0 m  vx=-3 m/s   success  27.5 %
-   115/135  h=175.0 m  vx=+2 m/s   success  42.5 %
-   120/135  h=175.0 m  vx=+7 m/s   success  27.5 %
-   125/135  h=180.0 m  vx=-3 m/s   success  40.0 %
-   130/135  h=180.0 m  vx=+2 m/s   success  35.0 %
-   135/135  h=180.0 m  vx=+7 m/s   success  37.5 %
+    95/135  h=170.0 m  vx=-3 m/s   success  62.5 %
+   100/135  h=170.0 m  vx=+2 m/s   success  55.0 %
+   105/135  h=170.0 m  vx=+7 m/s   success  52.5 %
+   110/135  h=175.0 m  vx=-3 m/s   success  55.0 %
+   115/135  h=175.0 m  vx=+2 m/s   success  55.0 %
+   120/135  h=175.0 m  vx=+7 m/s   success  40.0 %
+   125/135  h=180.0 m  vx=-3 m/s   success  35.0 %
+   130/135  h=180.0 m  vx=+2 m/s   success  40.0 %
+   135/135  h=180.0 m  vx=+7 m/s   success  42.5 %
 ==============================================================================
 LandSim Light - 3-D / TVC Monte Carlo
 ==============================================================================
   motor             : long, 120.4 N peak, 2.61 s, 221.8 Ns
   boosters carried  : 1 x Klima D9 (20.0 Ns each), lit by the on-board rule
   mass / Cd         : 3.200 kg + boosters / 0.35
+  fins              : 4 fins, 64.0 cm2 each, AR 1.53, CL_alpha 2.13 /rad, +/-15 deg in 90 ms (333 deg/s), arm 0.50 m, roll arm 80 mm; airbrake adds dCd 0.231
+  airbrake mode     : auto  (free-fall Cd 0.581 against 0.350 bare)
   entry grid        : 140-180 m step 5, vx 0 +/-7 m/s step 1
   dispersions       : igniter U(0, 300) ms, thrust +/-15 % over 700 ms, roll U(0, 90) deg/s
   flights           : 135 cells x 40 = 5400
 
-  SUCCESS (all five gates)   :  42.9 %
-    |v_z| < 3.0 m/s              :  45.2 %   p95  12.51 m/s
-    |v_h| < 0.75 m/s           :  81.1 %   p95   1.32 m/s
-    tilt  < 10.0 deg             :  97.7 %   p95   8.07 deg
-    rate  < 60.0 deg/s           :  95.7 %   p95  57.96 deg/s
+  SUCCESS (all five gates)   :  49.6 %
+    |v_z| < 3.0 m/s              :  49.6 %   p95  11.20 m/s
+    |v_h| < 0.75 m/s           :  91.3 %   p95   0.93 m/s
+    tilt  < 10.0 deg             :  99.9 %   p95   5.19 deg
+    rate  < 60.0 deg/s           :  99.8 %   p95  11.78 deg/s
   D9 lit in                  : 100.0 % of flights
-  burnout before touchdown   :  26.0 %
-  mean commanded ignition    :  57.6 m, mean clamp 0.83
+  burnout before touchdown   :  31.5 %
+  mean commanded ignition    :  56.6 m, mean clamp 0.81
 
   success [%] by release altitude:
-     140.0 m :  47.7
-     145.0 m :  44.3
-     150.0 m :  45.2
-     155.0 m :  45.8
-     160.0 m :  47.7
-     165.0 m :  44.8
-     170.0 m :  41.2
-     175.0 m :  33.7
-     180.0 m :  35.7
+     140.0 m :  50.2
+     145.0 m :  53.3
+     150.0 m :  53.0
+     155.0 m :  48.3
+     160.0 m :  47.5
+     165.0 m :  50.3
+     170.0 m :  51.7
+     175.0 m :  49.8
+     180.0 m :  41.8
   success [%] by horizontal entry speed:
-     -7.0 m/s :  40.6
-     -6.0 m/s :  41.1
-     -5.0 m/s :  41.9
-     -4.0 m/s :  41.7
-     -3.0 m/s :  43.6
-     -2.0 m/s :  43.1
-     -1.0 m/s :  46.1
-     +0.0 m/s :  48.3
-     +1.0 m/s :  45.6
-     +2.0 m/s :  45.3
-     +3.0 m/s :  41.9
-     +4.0 m/s :  39.2
-     +5.0 m/s :  41.4
-     +6.0 m/s :  41.4
-     +7.0 m/s :  42.2
+     -7.0 m/s :  48.3
+     -6.0 m/s :  48.6
+     -5.0 m/s :  51.1
+     -4.0 m/s :  50.3
+     -3.0 m/s :  52.2
+     -2.0 m/s :  47.5
+     -1.0 m/s :  50.3
+     +0.0 m/s :  51.1
+     +1.0 m/s :  50.6
+     +2.0 m/s :  48.9
+     +3.0 m/s :  50.0
+     +4.0 m/s :  48.1
+     +5.0 m/s :  50.6
+     +6.0 m/s :  47.8
+     +7.0 m/s :  48.1
 
   figures written:
     figures/fig1_success_envelope.png
@@ -77,3 +79,10 @@ LandSim Light - 3-D / TVC Monte Carlo
     figures/fig3_single_flight.png
     figures/fig4_ignition_and_booster.png
     figures/fig5_gates.png
+configuration                success   vz    vh   tilt  rate  p95vz p95tilt p95rate
+fins + airbrake (default)    46.2   46.2   86.8   99.8   99.8  10.43   6.35   39.1
+fins, brake always           46.2   48.2   84.2   98.5   93.5  10.41   7.26   64.0
+fins, no airbrake            45.0   46.8   84.8   99.0   97.5  10.59   8.27   53.3
+no fins at all               40.0   41.0   78.8   98.8   96.5  11.92   7.85   54.8
+fins, no D9                  13.2   13.2   42.0   99.8   99.0  25.64   6.29    6.6
+fins, no thrust scatter      85.5   85.8   99.5   99.8  100.0   3.58   4.49   16.3

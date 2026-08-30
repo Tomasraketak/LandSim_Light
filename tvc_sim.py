@@ -94,6 +94,44 @@ THROTTLE_SPEED = 12.84    # clamp slew [1/s]
 THROTTLE_ACCEL = 257.0    # clamp acceleration [1/s^2]
 K_MIN, K_MAX = 0.10, 1.00
 
+# ---------------------------------------------------------------------------
+# FIN CONTROL - four cruciform fins, NACA 0012, all-moving
+#
+# Geometry is the airframe's own: 120 mm root, 63 mm tip, 70 mm span, 35 mm sweep
+# (26.6 deg), four of them, no cant. They sit 0.50 m aft of the CG - further back
+# than the 0.35 m aero CP arm, which is the body-plus-fins average.
+#
+# What they buy, in order of importance to THIS vehicle:
+#   * they work with the motor OFF. During the free fall the gimbal has nothing to
+#     push against, so before ignition the fins are the only actuator there is.
+#   * splayed alternately (+,-,+,-) they cancel their own lift and roll torque and
+#     leave pure drag: AIRBRAKES. On a vehicle whose entire problem is arriving with
+#     more energy than the grain can absorb, that is worth more than the steering.
+#   * they can produce a ROLL torque, which the gimbal provably cannot - the gimbal
+#     moment (-L*b) x F is perpendicular to b by construction.
+FIN_COUNT = 4
+FIN_ROOT = 0.120          # m, root chord
+FIN_TIP = 0.063           # m, tip chord
+FIN_SPAN = 0.070          # m, exposed semi-span (the "height" on the drawing)
+FIN_ARM = 0.50            # m, CG -> fin quarter-chord, aft
+FIN_MAX_DEFLECT = 15.0    # deg
+FIN_TRAVEL_TIME = 0.09    # s to go from one end stop to the other (2 x max)
+FIN_CD0 = 0.012           # NACA 0012 profile drag at this Reynolds number
+FIN_ALPHA_STALL = 14.0    # deg
+FIN_CL_MAX = 0.95
+FIN_ROLL_GAIN = 1.5       # rad/s, roll-rate damping bandwidth. Deliberately slow:
+                          # the roll inertia is m*R^2/2 = 0.004 kg m^2, so a single
+                          # degree of fin deflection is worth ~800 deg/s^2. A loop
+                          # sized by "authority" rather than by inertia demands
+                          # deflections the 333 deg/s actuator cannot track and the
+                          # roll axis limit-cycles at hundreds of deg/s.
+FIN_ROLL_MAX = 2.0        # deg of the travel the roll channel may spend
+FIN_MIN_AIRSPEED = 8.0    # m/s below which the fins are not used for control
+FIN_CTRL_LEAD = 40.0      # m above the commanded ignition altitude at which the fin
+                          # attitude loop wakes up - far enough for the transient to
+                          # settle before the motor lights, late enough that the long
+                          # free fall is flown at trim
+
 # Rates
 DT_PHYS = 0.001           # plant step [s]
 CTRL_DIV = 5              # -> 200 Hz control
@@ -142,6 +180,130 @@ N_OUT = 16                # length of the per-flight result vector
 # Both motors are described to the compiled kernels by plain arrays, so the same
 # code runs with or without numba.
 # ======================================================================
+class Fins:
+    """Four all-moving cruciform fins.
+
+    The lift slope is the low-aspect-ratio (Helmbold) value, not 2*pi: these fins
+    have an effective aspect ratio near 1.5 once mirrored in the body, and using the
+    thin-aerofoil slope would over-state their authority by a factor of four.
+    """
+
+    def __init__(self, count=FIN_COUNT, root=FIN_ROOT, tip=FIN_TIP, span=FIN_SPAN,
+                 arm=FIN_ARM, max_deflect=FIN_MAX_DEFLECT,
+                 travel_time=FIN_TRAVEL_TIME, body_diameter=DIAMETER,
+                 enabled=True):
+        self.count = int(count)
+        self.enabled = bool(enabled) and self.count > 0
+        self.area = 0.5 * (root + tip) * span              # m2, one fin
+        self.span = span
+        self.arm = arm
+        self.max_deflect = max_deflect
+        self.travel_time = travel_time
+        # rate limit: the quoted time is END STOP TO END STOP, i.e. 2 x max_deflect
+        self.rate = 2.0 * max_deflect / travel_time if travel_time > 0 else 1e6
+        ar = 2.0 * span * span / self.area                 # mirrored in the body
+        self.aspect = ar
+        self.cl_alpha = 2.0 * math.pi * ar / (2.0 + math.sqrt(ar * ar + 4.0))
+        # spanwise centre of pressure -> the roll arm
+        self.roll_arm = 0.5 * body_diameter + 0.4 * span
+
+    def cd_extra(self, deflect_deg=0.0):
+        """Fin drag expressed as an addition to the BODY drag coefficient, so the
+        1-D planner can use one number. Induced drag included."""
+        a = math.radians(min(abs(deflect_deg), FIN_ALPHA_STALL))
+        cl = min(self.cl_alpha * a, FIN_CL_MAX)  # same cap as fin_cl
+        cd = FIN_CD0 + cl * cl / (math.pi * self.aspect * 0.85)
+        return self.count * self.area * cd / AREA
+
+    def describe(self):
+        return (f"{self.count} fins, {self.area * 1e4:.1f} cm2 each, AR {self.aspect:.2f}, "
+                f"CL_alpha {self.cl_alpha:.2f} /rad, +/-{self.max_deflect:.0f} deg in "
+                f"{self.travel_time * 1000:.0f} ms ({self.rate:.0f} deg/s), arm "
+                f"{self.arm:.2f} m, roll arm {self.roll_arm * 1000:.0f} mm; "
+                f"airbrake adds dCd {self.cd_extra(self.max_deflect):.3f}")
+
+
+@njit(cache=True, inline='always')
+def fin_cl(alpha, cl_alpha):
+    """NACA 0012 lift curve, linear then stalled - and it does stall: 15 deg of
+    deflection on top of a few degrees of crossflow is right at the edge."""
+    a_st = math.radians(FIN_ALPHA_STALL)
+    cl_st = cl_alpha * a_st
+    if cl_st > FIN_CL_MAX:
+        cl_st = FIN_CL_MAX
+    if alpha > a_st:
+        return cl_st * math.exp(-(alpha - a_st) * 1.5)
+    if alpha < -a_st:
+        return -cl_st * math.exp(-(-alpha - a_st) * 1.5)
+    cl = cl_alpha * alpha
+    if cl > cl_st:
+        cl = cl_st
+    elif cl < -cl_st:
+        cl = -cl_st
+    return cl
+
+
+@njit(cache=True)
+def fin_forces(bx, by, bz, u1x, u1y, u1z, u2x, u2y, u2z,
+               vx, vy, vz, wx, wy, wz, defl, n_fin, fin_area, fin_arm, roll_arm,
+               cl_alpha, aspect):
+    """Total force and moment of the fin set, in world axes.
+
+    Each fin is a flat surface whose hinge is the spanwise direction r_i; positive
+    deflection pushes along n_i = b x r_i. The fin sees the vehicle's airspeed plus
+    the local velocity from the body rate (w x r), so the fins damp rotation on
+    their own - that damping is a real, and here useful, part of the model.
+
+    The force is applied at fin_arm along +b (the fins trail ABOVE the CG during a
+    nose-down descent) and roll_arm out along r_i, which is what gives the set a
+    roll moment the gimbal cannot produce.
+    """
+    fx = fy = fz = 0.0
+    tx = ty = tz = 0.0
+    for i in range(n_fin):
+        ang = 2.0 * math.pi * i / n_fin
+        ca, sa = math.cos(ang), math.sin(ang)
+        rx = ca * u1x + sa * u2x
+        ry = ca * u1y + sa * u2y
+        rz = ca * u1z + sa * u2z
+        nx = by * rz - bz * ry
+        ny = bz * rx - bx * rz
+        nz = bx * ry - by * rx
+        # position of this fin's centre of pressure
+        px = fin_arm * bx + roll_arm * rx
+        py = fin_arm * by + roll_arm * ry
+        pz = fin_arm * bz + roll_arm * rz
+        # local airspeed at the fin
+        lx = vx + (wy * pz - wz * py)
+        ly = vy + (wz * px - wx * pz)
+        lz = vz + (wx * py - wy * px)
+        v2 = lx * lx + ly * ly + lz * lz
+        if v2 < 1.0:
+            continue
+        v = math.sqrt(v2)
+        va = -(lx * bx + ly * by + lz * bz)      # axial airspeed, nose-to-tail
+        if va < 2.0:
+            va = 2.0
+        cross = lx * nx + ly * ny + lz * nz      # crossflow along +n
+        alpha = math.radians(defl[i]) - cross / va
+        q = 0.5 * RHO * v2
+        cl = fin_cl(alpha, cl_alpha)
+        cd = FIN_CD0 + cl * cl / (math.pi * aspect * 0.85)
+        lift = q * fin_area * cl
+        drag = q * fin_area * cd
+        # lift along +n, drag OPPOSING the vehicle's motion through the air
+        ffx = lift * nx - drag * lx / v
+        ffy = lift * ny - drag * ly / v
+        ffz = lift * nz - drag * lz / v
+        fx += ffx
+        fy += ffy
+        fz += ffz
+        tx += py * ffz - pz * ffy
+        ty += pz * ffx - px * ffz
+        tz += px * ffy - py * ffx
+    return fx, fy, fz, tx, ty, tz
+
+
 def motor_arrays(motor: Motor):
     return motor.t.copy(), motor.f.copy(), motor.cum_impulse.copy()
 
@@ -514,7 +676,7 @@ def freefall_to(h_start, h_target, vx0, vz0, cd, mass, dt):
 
 
 @njit(cache=True)
-def find_ignition(h_start, vx0, vz0, cd, mass0, delay_pad, boost_ready,
+def find_ignition(h_start, vx0, vz0, cd, cd_free, mass0, delay_pad, boost_ready,
                   mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop):
     """Commanded ignition altitude and the matching command time.
 
@@ -548,7 +710,7 @@ def find_ignition(h_start, vx0, vz0, cd, mass0, delay_pad, boost_ready,
     step = (h_start - 5.0) / (n - 1)
     for i in range(n):
         hh = 5.0 + i * step
-        _, vzi, _ = freefall_to(h_start, hh, vx0, vz0, cd, mass0, 0.005)
+        _, vzi, _ = freefall_to(h_start, hh, vx0, vz0, cd_free, mass0, 0.005)
         vz_td = project_rh(hh, vzi, 0.0, mass0 - prop_mass,
                            mt, mf, mc, prop_mass, i_total, cd,
                            bt, bf, bb, b_prop, b_ign, PLAN_TARGET_VZ)
@@ -570,7 +732,7 @@ def find_ignition(h_start, vx0, vz0, cd, mass0, delay_pad, boost_ready,
     lo, hi = max(5.0, h_lo_ok - step), h_lo_ok
     for _ in range(8):
         mid = 0.5 * (lo + hi)
-        _, vzi, _ = freefall_to(h_start, mid, vx0, vz0, cd, mass0, 0.005)
+        _, vzi, _ = freefall_to(h_start, mid, vx0, vz0, cd_free, mass0, 0.005)
         vz_td = project_rh(mid, vzi, 0.0, mass0 - prop_mass,
                            mt, mf, mc, prop_mass, i_total, cd,
                            bt, bf, bb, b_prop, b_ign, PLAN_TARGET_VZ)
@@ -582,7 +744,7 @@ def find_ignition(h_start, vx0, vz0, cd, mass0, delay_pad, boost_ready,
     lo, hi = h_hi_ok, min(h_start - 1.0, h_hi_ok + step)
     for _ in range(8):
         mid = 0.5 * (lo + hi)
-        _, vzi, _ = freefall_to(h_start, mid, vx0, vz0, cd, mass0, 0.005)
+        _, vzi, _ = freefall_to(h_start, mid, vx0, vz0, cd_free, mass0, 0.005)
         vz_td = project_rh(mid, vzi, 0.0, mass0 - prop_mass,
                            mt, mf, mc, prop_mass, i_total, cd,
                            bt, bf, bb, b_prop, b_ign, PLAN_TARGET_VZ)
@@ -592,7 +754,7 @@ def find_ignition(h_start, vx0, vz0, cd, mass0, delay_pad, boost_ready,
             hi = mid
     h_max = lo
 
-    _, vz_at, _ = freefall_to(h_start, h_min, vx0, vz0, cd, mass0, 0.005)
+    _, vz_at, _ = freefall_to(h_start, h_min, vx0, vz0, cd_free, mass0, 0.005)
     pad = abs(vz_at) * delay_pad + 0.5 * G * delay_pad * delay_pad
     h_cmd = h_min + pad
     if h_cmd > h_max:
@@ -606,7 +768,7 @@ def find_ignition(h_start, vx0, vz0, cd, mass0, delay_pad, boost_ready,
         h_cmd = h_max
     if h_cmd > h_start - 1.0:
         h_cmd = h_start - 1.0
-    _, _, t_cmd = freefall_to(h_start, h_cmd, vx0, vz0, cd, mass0, 0.005)
+    _, _, t_cmd = freefall_to(h_start, h_cmd, vx0, vz0, cd_free, mass0, 0.005)
     return h_cmd, t_cmd, h_min
 
 
@@ -620,6 +782,8 @@ def find_ignition(h_start, vx0, vz0, cd, mass0, delay_pad, boost_ready,
 def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
         n_boost, use_boost_rule, roll_max, ign_delay_max, delay_pad,
         thr_scatter, thr_tau, gyro_ff,
+        n_fin, fin_area, fin_arm, fin_roll_arm, fin_cl_alpha, fin_aspect,
+        fin_max, fin_rate, fin_brake_mode, cd_free,
         mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop, b_total,
         tel, n_tel, h_cmd_in):
     np.random.seed(seed)
@@ -646,9 +810,9 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
     if h_cmd_in > 0.0:
         h_cmd = h_cmd_in
     else:
-        h_cmd, _, _ = find_ignition(h_start, vx0, vz0, cd, mass0, delay_pad,
-                                    boost_ready, mt, mf, mc, prop_mass,
-                                    i_total, bt, bf, bb, b_prop)
+        h_cmd, _, _ = find_ignition(h_start, vx0, vz0, cd, cd_free, mass0,
+                                    delay_pad, boost_ready, mt, mf, mc,
+                                    prop_mass, i_total, bt, bf, bb, b_prop)
 
     # ---- state -----------------------------------------------------------
     x, y, h = 0.0, 0.0, h_start
@@ -684,6 +848,9 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
     # angular rate: the inherited spin about the body axis
     wx, wy, wz = roll_rate * bx, roll_rate * by, roll_rate * bz
 
+    defl = np.zeros(4)           # fin deflections [deg]
+    defl_cmd = np.zeros(4)
+    fin_brake_now = 0.0
     srv1 = srv2 = 0.0            # servo angles [deg]
     sr1 = sr2 = 0.0              # servo rates [deg/s]
     cmd1 = cmd2 = 0.0
@@ -841,6 +1008,112 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
                 cmd1 = 0.0
                 cmd2 = 0.0
 
+            # ---------------- fin allocation ----------------
+            # The fins pick up what the gimbal cannot: the whole demand while the
+            # motor is unlit, whatever is left when the nozzle is at its stop, and
+            # the roll axis, which the gimbal cannot touch at all.
+            if n_fin > 0.5:
+                # torque the gimbal will actually deliver with the command above
+                s1c = math.sin(math.radians(cmd1 / TVC_RATIO))
+                s2c = math.sin(math.radians(cmd2 / TVC_RATIO))
+                gsx = s1c * c1x + s2c * c2x
+                gsy = s1c * c1y + s2c * c2y
+                gsz = s1c * c1z + s2c * c2z
+                tgx = -L_GIMBAL * t_est * (by * gsz - bz * gsy)
+                tgy = -L_GIMBAL * t_est * (bz * gsx - bx * gsz)
+                tgz = -L_GIMBAL * t_est * (bx * gsy - by * gsx)
+                if not engine_on:
+                    tgx = tgy = tgz = 0.0
+                rfx = trx - tgx
+                rfy = try_ - tgy
+                rfz = trz - tgz
+                # roll: pure rate damping towards zero. There is no roll ATTITUDE
+                # to hold - nothing in the mission cares which way round the vehicle
+                # is - but arriving spinning is a gate, and a spin costs the two
+                # transverse channels their gyroscopic coupling.
+                tau_roll = I_a * FIN_ROLL_GAIN * (0.0 - w_roll)
+
+                v_f = math.sqrt(v2)
+                qf = 0.5 * RHO * v2
+                k_t = 2.0 * fin_arm * qf * fin_area * fin_cl_alpha
+                k_r = n_fin * fin_roll_arm * qf * fin_area * fin_cl_alpha
+                # Fins do nothing at low airspeed, and the inversion knows it: 1/q
+                # runs away as the vehicle leaves the release point at walking pace,
+                # so every channel saturates on a demand it cannot meet, the four
+                # deflections saturate ASYMMETRICALLY, and the set spins the airframe
+                # up to hundreds of deg/s before it has any authority to stop it.
+                # Below this speed the fins simply hold their airbrake position.
+                if v_f < FIN_MIN_AIRSPEED:
+                    k_t = 0.0
+                    k_r = 0.0
+                # During the free fall the fins do NOT fight the weathercock. The
+                # airframe is statically stable and trims itself within a few degrees
+                # of the airflow, which is where it wants to be at ignition anyway;
+                # holding it dead vertical instead costs large deflections, and four
+                # fins deflected hard and asymmetrically are a roll torque - measured,
+                # it spun the airframe to 340 deg/s before the motor was even lit.
+                # Attitude control starts with the ignition command; the airbrake and
+                # the roll damper run the whole way down.
+                if t_ign_cmd < 0.0 and h > h_cmd + FIN_CTRL_LEAD:
+                    k_t = 0.0
+                if k_t < 1e-6:
+                    a_cmd_f = b_cmd_f = 0.0
+                else:
+                    # the fin set's transverse torque runs OPPOSITE to the gimbal's
+                    # for the same force, because the fins are aft of the CG
+                    a_cmd_f = -(rfx * c1x + rfy * c1y + rfz * c1z) / k_t
+                    b_cmd_f = -(rfx * c2x + rfy * c2y + rfz * c2z) / k_t
+                d_roll = 0.0 if k_r < 1e-6 else tau_roll / k_r
+                d_roll = clampf(d_roll, -math.radians(FIN_ROLL_MAX),
+                                math.radians(FIN_ROLL_MAX))
+                a_cmd_f = clampf(math.degrees(a_cmd_f), -fin_max, fin_max)
+                b_cmd_f = clampf(math.degrees(b_cmd_f), -fin_max, fin_max)
+                d_roll = math.degrees(d_roll)
+
+                # airbrake: alternating +,-,+,- cancels both the lift and the roll
+                # torque of the set and leaves pure drag. Deployed while the motor
+                # is unlit, which is where the energy has to come out - and stowed
+                # at ignition so the travel belongs to the controller.
+                if fin_brake_mode > 1.5:
+                    fin_brake_now = fin_max
+                elif fin_brake_mode > 0.5 and not engine_on:
+                    fin_brake_now = fin_max
+                else:
+                    fin_brake_now = 0.0
+
+                # Control first, brake with what is left. Adding the brake term on
+                # top and clipping the sum would spend the travel on drag and leave
+                # the controller with nothing at the one moment it needs it most.
+                # Axial airspeed, for the crossflow correction below.
+                va_f = -(vx * bx + vy * by + vz * bz)
+                if va_f < 3.0:
+                    va_f = 3.0
+                for _i in range(int(n_fin)):
+                    ang_i = 2.0 * math.pi * _i / n_fin
+                    alt = 1.0 if _i % 2 == 0 else -1.0
+                    ctrl = (d_roll + a_cmd_f * math.cos(ang_i)
+                            + b_cmd_f * math.sin(ang_i))
+                    # Cancel the angle of attack the crossflow already puts on this
+                    # fin. Without it the commanded DEFLECTION and the delivered
+                    # ANGLE OF ATTACK differ by the vehicle's own sideslip, the fins
+                    # fight their own weathercock moment through the loop instead of
+                    # in the allocation, and the gimbal ends up in a limit cycle
+                    # against them. This is the same dynamic inversion the nozzle
+                    # gets, done in the fin's own variable.
+                    rix = math.cos(ang_i) * c1x + math.sin(ang_i) * c2x
+                    riy = math.cos(ang_i) * c1y + math.sin(ang_i) * c2y
+                    riz = math.cos(ang_i) * c1z + math.sin(ang_i) * c2z
+                    nix = by * riz - bz * riy
+                    niy = bz * rix - bx * riz
+                    niz = bx * riy - by * rix
+                    ctrl += math.degrees((vx * nix + vy * niy + vz * niz) / va_f)
+                    ctrl = clampf(ctrl, -fin_max, fin_max)
+                    room = fin_max - abs(ctrl)
+                    brake = fin_brake_now
+                    if brake > room:
+                        brake = room
+                    defl_cmd[_i] = clampf(ctrl + brake * alt, -fin_max, fin_max)
+
             # Horizontal trim integrator. It exists to hold a standing tilt against
             # a persistent side force, because the ZEV term vanishes as v_h -> 0 and
             # cannot. This campaign models no wind, and against a pure initial drift
@@ -880,6 +1153,19 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
         srv2 += sr2 * DT_PHYS
         srv1 = clampf(srv1, -TVC_SERVO_MAX, TVC_SERVO_MAX)
         srv2 = clampf(srv2, -TVC_SERVO_MAX, TVC_SERVO_MAX)
+
+        # ---------------- fin actuators ----------------
+        # Same deceleration-aware rate limit as the gimbal servos. The quoted 90 ms
+        # is end stop to end stop, so the rate is 2*max/90 ms.
+        if n_fin > 0.5:
+            for _i in range(int(n_fin)):
+                e_f = defl_cmd[_i] - defl[_i]
+                if e_f > fin_rate * DT_PHYS:
+                    defl[_i] += fin_rate * DT_PHYS
+                elif e_f < -fin_rate * DT_PHYS:
+                    defl[_i] -= fin_rate * DT_PHYS
+                else:
+                    defl[_i] = defl_cmd[_i]
 
         # ---------------- throttle actuator ----------------
         kd_des = clampf((k_cmd - k_act) / DT_PHYS, -THROTTLE_SPEED, THROTTLE_SPEED)
@@ -938,6 +1224,18 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
             tay = L_CP * fnk * (bz * ahx - bx * ahz) - c_damp * (wy - wr_t * by)
             taz = L_CP * fnk * (bx * ahy - by * ahx) - c_damp * (wz - wr_t * bz)
 
+        if n_fin > 0.5:
+            ffx, ffy, ffz, ftx, fty, ftz = fin_forces(
+                bx, by, bz, c1x, c1y, c1z, c2x, c2y, c2z,
+                vx, vy, vz, wx, wy, wz, defl, int(n_fin), fin_area, fin_arm,
+                fin_roll_arm, fin_cl_alpha, fin_aspect)
+            f_ax += ffx
+            f_ay += ffy
+            f_az += ffz
+            tax += ftx
+            tay += fty
+            taz += ftz
+
         f_tx, f_ty, f_tz = thrust * tdx, thrust * tdy, thrust * tdz
         # gimbal moment = (-L*b) x F: perpendicular to b, so no roll torque exists
         ttx = -L_GIMBAL * thrust * (by * sz - bz * sy)
@@ -975,6 +1273,9 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
             tel[tel_i, 9] = srv2
             tel[tel_i, 10] = math.degrees(math.sqrt(wx * wx + wy * wy + wz * wz))
             tel[tel_i, 11] = thr_boost
+            tel[tel_i, 12] = defl[0]
+            tel[tel_i, 13] = defl[1]
+            tel[tel_i, 14] = math.degrees(wx * bx + wy * by + wz * bz)
             tel_i += 1
 
         # ---------------- integrate ----------------
@@ -1076,6 +1377,16 @@ class TvcConfig:
     thrust_scatter: float = THRUST_SCATTER
     thrust_tau: float = THRUST_TAU
     roll_max: float = ROLL_RATE_MAX
+    # fins
+    fins: bool = True
+    fin_count: int = FIN_COUNT
+    fin_root: float = FIN_ROOT
+    fin_tip: float = FIN_TIP
+    fin_span: float = FIN_SPAN
+    fin_arm: float = FIN_ARM
+    fin_max_deflect: float = FIN_MAX_DEFLECT
+    fin_travel_time: float = FIN_TRAVEL_TIME
+    fin_brake: str = "auto"          # "auto" (unlit only) | "always" | "off"
     # controller
     wn: float = WN_DEFAULT
     zeta: float = ZETA_DEFAULT
@@ -1095,6 +1406,26 @@ class TvcConfig:
         b = Booster()
         return m, b
 
+    def fin_set(self) -> Fins:
+        return Fins(count=self.fin_count if self.fins else 0,
+                    root=self.fin_root, tip=self.fin_tip, span=self.fin_span,
+                    arm=self.fin_arm, max_deflect=self.fin_max_deflect,
+                    travel_time=self.fin_travel_time, enabled=self.fins)
+
+    def fin_args(self):
+        """(n, area, arm, roll arm, CL_alpha, AR, max, rate, brake mode) for the
+        compiled plant, plus the free-fall drag coefficient the planner should use."""
+        f = self.fin_set()
+        n = float(f.count) if f.enabled else 0.0
+        mode = {"off": 0.0, "auto": 1.0, "always": 2.0}.get(self.fin_brake, 1.0)
+        if not f.enabled:
+            mode = 0.0
+        cd_free = self.cd + (f.cd_extra(f.max_deflect)
+                             if (f.enabled and mode > 0.5) else
+                             (f.cd_extra(0.0) if f.enabled else 0.0))
+        return ((n, f.area, f.arm, f.roll_arm, f.cl_alpha, f.aspect,
+                 f.max_deflect, f.rate, mode), cd_free)
+
 
 def plan_ignition(cfg: TvcConfig, h0: float, vx0: float) -> float:
     """The commanded ignition altitude for one entry state (seed independent)."""
@@ -1103,8 +1434,9 @@ def plan_ignition(cfg: TvcConfig, h0: float, vx0: float) -> float:
     bt, bf, bb = booster_arrays(b)
     mass0 = cfg.gross_mass + cfg.n_boosters * b.total_mass
     ready = 1.0 if (cfg.n_boosters > 0 and cfg.use_booster_rule) else 0.0
+    _, cd_free = cfg.fin_args()
     h_cmd, _, _ = find_ignition(float(h0), float(vx0), float(cfg.vz0), cfg.cd,
-                                mass0, cfg.delay_pad, ready, mt, mf, mc,
+                                cd_free, mass0, cfg.delay_pad, ready, mt, mf, mc,
                                 m.propellant_mass, m.total_impulse,
                                 bt, bf, bb, b.propellant_mass)
     return float(h_cmd)
@@ -1116,13 +1448,16 @@ def fly_one(cfg: TvcConfig, seed: int, h0: float, vx0: float, n_tel: int = 0,
     m, b = cfg.tables()
     mt, mf, mc = motor_arrays(m)
     bt, bf, bb = booster_arrays(b)
-    tel = np.zeros((max(n_tel, 1), 12))
+    tel = np.zeros((max(n_tel, 1), 15))
+    fa, cd_free = cfg.fin_args()
     out, n = fly(seed, float(h0), float(vx0), float(cfg.vz0),
                  cfg.gross_mass, cfg.cd, cfg.wn, cfg.zeta,
                  float(cfg.n_boosters), 1.0 if cfg.use_booster_rule else 0.0,
                  cfg.roll_max, cfg.ign_delay_max, cfg.delay_pad,
                  cfg.thrust_scatter, cfg.thrust_tau,
                  1.0 if cfg.gyro_ff else 0.0,
+                 fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6], fa[7], fa[8],
+                 cd_free,
                  mt, mf, mc, m.propellant_mass, m.total_impulse,
                  bt, bf, bb, b.propellant_mass, b.total_mass, tel, n_tel,
                  float(h_cmd))
@@ -1139,9 +1474,10 @@ def run_campaign(cfg: TvcConfig, on_progress=None, should_stop=None):
     mt, mf, mc = motor_arrays(m)
     bt, bf, bb = booster_arrays(b)
     h_grid, vx_grid = cfg.entry_grid()
+    fa, cd_free = cfg.fin_args()
     seeds = cfg.seed0 + np.arange(cfg.runs)
     res = np.zeros((len(h_grid), len(vx_grid), cfg.runs, N_OUT))
-    tel = np.zeros((1, 12))
+    tel = np.zeros((1, 15))
     total = len(h_grid) * len(vx_grid)
     done = 0
     for i, h0 in enumerate(h_grid):
@@ -1155,6 +1491,8 @@ def run_campaign(cfg: TvcConfig, on_progress=None, should_stop=None):
                              cfg.roll_max, cfg.ign_delay_max, cfg.delay_pad,
                              cfg.thrust_scatter, cfg.thrust_tau,
                              1.0 if cfg.gyro_ff else 0.0,
+                             fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6],
+                             fa[7], fa[8], cd_free,
                              mt, mf, mc, m.propellant_mass, m.total_impulse,
                              bt, bf, bb, b.propellant_mass, b.total_mass, tel, 0,
                              h_cmd)
@@ -1311,7 +1649,7 @@ def make_figures(camp, outdir="figures", single=None):
         single = fly_one(cfg, int(camp["seeds"][0]), mid_h,
                          float(vx_grid[-1]), n_tel=4000)
     out, tel = single
-    fig, axes = plt.subplots(2, 2, figsize=(11.5, 7.0), dpi=140)
+    fig, axes = plt.subplots(3, 2, figsize=(11.5, 10.0), dpi=140)
     fig.patch.set_facecolor("#fcfcfb")
     t = tel[:, 0]
     ax = axes[0][0]
@@ -1345,6 +1683,23 @@ def make_figures(camp, outdir="figures", single=None):
     ax.plot(t, tel[:, 9], color=SERIES[2], lw=1.2, label="servo 2 [deg]")
     _style(ax, "Attitude and both gimbal channels", "time [s]", "deg")
     ax.legend(frameon=False, fontsize=8, labelcolor=INK2)
+
+    ax = axes[2][0]
+    ax.plot(t, tel[:, 12], color=SERIES[0], lw=1.6, label="fin 1")
+    ax.plot(t, tel[:, 13], color=SERIES[1], lw=1.6, label="fin 2")
+    lim = cfg.fin_max_deflect
+    ax.axhline(lim, color=INK2, lw=0.8, ls="--")
+    ax.axhline(-lim, color=INK2, lw=0.8, ls="--")
+    ax.text(t[0], lim, " deflection limit", fontsize=8, color=INK2, va="bottom")
+    _style(ax, "Fin deflection  (opposed = airbrake, differential = steering)",
+           "time [s]", "deg")
+    ax.legend(frameon=False, fontsize=8, labelcolor=INK2)
+
+    ax = axes[2][1]
+    ax.plot(t, tel[:, 14], color=SERIES[2], lw=2)
+    ax.axhline(0, color=INK2, lw=0.8)
+    _style(ax, f"Roll rate - the fins null the spin the vehicle arrived with "
+               f"({out[15]:.1f} deg/s at touchdown)", "time [s]", "deg/s")
     fig.suptitle(f"One flight - release {single[1][0, 1]:.0f} m, "
                  f"ignition commanded at {out[5]:.1f} m, lit at {out[6]:.1f} m "
                  f"after {out[7] * 1000:.0f} ms, "
@@ -1426,6 +1781,26 @@ def make_figures(camp, outdir="figures", single=None):
 
 # ======================================================================
 # --- REPORT / CLI -----------------------------------------------------
+def save_campaign(camp, path):
+    """Store the raw per-flight results so the figures can be redrawn without
+    re-flying 5400 trajectories."""
+    cfg = camp["cfg"]
+    np.savez_compressed(path, out=camp["out"], h_grid=camp["h_grid"],
+                        vx_grid=camp["vx_grid"], seeds=camp["seeds"],
+                        cfg=np.array([repr(cfg)], dtype=object))
+    return path
+
+
+def load_campaign(path, cfg: "TvcConfig" = None):
+    d = np.load(path, allow_pickle=True)
+    if cfg is None:
+        cfg = eval(str(d["cfg"][0]),                      # noqa: S307 - our own repr
+                   {"TvcConfig": TvcConfig, "Motor": Motor, "Booster": Booster,
+                    "Fins": Fins})
+    return {"out": d["out"], "h_grid": d["h_grid"], "vx_grid": d["vx_grid"],
+            "seeds": d["seeds"], "cfg": cfg}
+
+
 def print_report(camp):
     s = summarise(camp)
     cfg = camp["cfg"]
@@ -1438,6 +1813,13 @@ def print_report(camp):
     print(f"  boosters carried  : {cfg.n_boosters} x {b.name} "
           f"({b.total_impulse:.1f} Ns each), lit by the on-board rule")
     print(f"  mass / Cd         : {cfg.gross_mass:.3f} kg + boosters / {cfg.cd}")
+    f = cfg.fin_set()
+    if f.enabled:
+        print(f"  fins              : {f.describe()}")
+        print(f"  airbrake mode     : {cfg.fin_brake}  "
+              f"(free-fall Cd {cfg.fin_args()[1]:.3f} against {cfg.cd:.3f} bare)")
+    else:
+        print("  fins              : none")
     print(f"  entry grid        : {cfg.h_lo:.0f}-{cfg.h_hi:.0f} m step "
           f"{cfg.h_step:.0f}, vx 0 +/-{cfg.vx_max:.0f} m/s step {cfg.vx_step:.0f}")
     print(f"  dispersions       : igniter U(0, {cfg.ign_delay_max * 1000:.0f}) ms, "
@@ -1491,18 +1873,32 @@ def verify():
         back = -L_ * T_ * np.cross(b, sv)
         worst_inv = max(worst_inv, float(np.max(np.abs(back - tau_perp))))
     # roll rate is untouched by any modelled torque
-    cfg = TvcConfig(roll_max=90.0)
+    cfg = TvcConfig(roll_max=90.0, fins=False)
     worst_roll = 0.0
     for sd in range(11, 19):
         out, tel = fly_one(cfg, sd, 150.0, 7.0, n_tel=4000)
         worst_roll = max(worst_roll, abs(tel[0, 10] - out[15]))
+    # with fins the roll IS controllable, and that is the point of them
+    cfg_f = TvcConfig(roll_max=90.0)
+    rolls_in, rolls_out = [], []
+    for sd in range(11, 19):
+        out, tel = fly_one(cfg_f, sd, 150.0, 7.0, n_tel=4000)
+        rolls_in.append(tel[0, 10])
+        rolls_out.append(out[15])
+    f = cfg_f.fin_set()
     print("verification")
     print(f"  gimbal basis orthonormal to        : {worst_basis:.2e}")
     print(f"  dynamic inversion round trip       : {worst_inv:.2e}")
-    print(f"  roll rate drift over 8 flights     : {worst_roll:.2e} deg/s "
-          f"(nothing in the model makes a torque about the body axis, so the "
-          f"inherited spin must survive the whole flight untouched)")
-    ok = worst_basis < 1e-9 and worst_inv < 1e-9 and worst_roll < 0.5
+    print(f"  roll drift, fins OFF, 8 flights    : {worst_roll:.2e} deg/s "
+          f"(the gimbal moment is perpendicular to the body axis by construction, "
+          f"so without fins the inherited spin must survive untouched)")
+    print(f"  roll, fins ON  : entry {np.mean(rolls_in):5.1f} deg/s "
+          f"-> touchdown {np.mean(rolls_out):4.1f} deg/s (mean of 8)")
+    print(f"  fin airbrake   : free-fall Cd {cfg_f.fin_args()[1]:.3f} against "
+          f"{cfg_f.cd:.3f} bare, i.e. "
+          f"{cfg_f.fin_args()[1] / cfg_f.cd:.2f}x the drag")
+    ok = (worst_basis < 1e-9 and worst_inv < 1e-9 and worst_roll < 0.5
+          and np.mean(rolls_out) < 5.0)
     print(f"  -> {'OK' if ok else 'FAILED'}")
     return ok
 
@@ -1525,11 +1921,27 @@ def main():
     ap.add_argument("--thrust-scatter", type=float, default=THRUST_SCATTER)
     ap.add_argument("--thrust-tau", type=float, default=THRUST_TAU)
     ap.add_argument("--roll-max", type=float, default=ROLL_RATE_MAX)
+    ap.add_argument("--no-fins", action="store_true",
+                    help="fly without fin control (gimbal only, roll uncontrolled)")
+    ap.add_argument("--fin-count", type=int, default=FIN_COUNT)
+    ap.add_argument("--fin-root", type=float, default=FIN_ROOT * 1000, help="mm")
+    ap.add_argument("--fin-tip", type=float, default=FIN_TIP * 1000, help="mm")
+    ap.add_argument("--fin-span", type=float, default=FIN_SPAN * 1000, help="mm")
+    ap.add_argument("--fin-arm", type=float, default=FIN_ARM, help="m from the CG")
+    ap.add_argument("--fin-deflect", type=float, default=FIN_MAX_DEFLECT,
+                    help="deg, +/-")
+    ap.add_argument("--fin-travel", type=float, default=FIN_TRAVEL_TIME,
+                    help="s, end stop to end stop")
+    ap.add_argument("--fin-brake", choices=("auto", "always", "off"), default="auto",
+                    help="when the fins are splayed as airbrakes")
     ap.add_argument("--wn", type=float, default=WN_DEFAULT)
     ap.add_argument("--zeta", type=float, default=ZETA_DEFAULT)
     ap.add_argument("--no-gyro-ff", action="store_true")
     ap.add_argument("--figures", default="figures", help="output directory")
     ap.add_argument("--no-figures", action="store_true")
+    ap.add_argument("--save", default="", help="write the raw results to an .npz")
+    ap.add_argument("--load", default="",
+                    help="redraw the report and figures from a saved .npz")
     ap.add_argument("--verify", action="store_true",
                     help="run the model's invariant checks and exit")
     ap.add_argument("--quiet", action="store_true")
@@ -1546,8 +1958,18 @@ def main():
                     ign_delay_max=args.ign_delay, delay_pad=args.ign_delay,
                     thrust_scatter=args.thrust_scatter, thrust_tau=args.thrust_tau,
                     roll_max=args.roll_max, wn=args.wn, zeta=args.zeta,
+                    fins=not args.no_fins, fin_count=args.fin_count,
+                    fin_root=args.fin_root / 1000.0, fin_tip=args.fin_tip / 1000.0,
+                    fin_span=args.fin_span / 1000.0, fin_arm=args.fin_arm,
+                    fin_max_deflect=args.fin_deflect,
+                    fin_travel_time=args.fin_travel, fin_brake=args.fin_brake,
                     gyro_ff=not args.no_gyro_ff)
-    camp = run_campaign(cfg, on_progress=None if args.quiet else print)
+    if args.load:
+        camp = load_campaign(args.load)
+    else:
+        camp = run_campaign(cfg, on_progress=None if args.quiet else print)
+    if args.save:
+        save_campaign(camp, args.save)
     print_report(camp)
     if not args.no_figures:
         paths = make_figures(camp, args.figures)

@@ -63,6 +63,18 @@ TVC_FIELDS = [
     ("Figure directory",  "figdir",    "figures", ""),
 ]
 
+# The four all-moving fins. Deflection limit and travel time are the two numbers
+# the hardware actually fixes, so they sit first.
+FIN_FIELDS = [
+    ("Fin count",        "fin_count",   "4",    "-"),
+    ("Max deflection",   "fin_deflect", "15",   "deg +/-"),
+    ("Travel time",      "fin_travel",  "0.09", "s end-to-end"),
+    ("Arm from CG",      "fin_arm",     "0.50", "m"),
+    ("Root chord",       "fin_root",    "120",  "mm"),
+    ("Tip chord",        "fin_tip",     "63",   "mm"),
+    ("Span (height)",    "fin_span",    "70",   "mm"),
+]
+
 
 class CircularConfig(Config):
     """Config that allows the reference area to be overridden directly."""
@@ -202,6 +214,7 @@ class App:
         self.log.pack(fill="both", expand=True)
 
         self.build_tvc_tab(tvc_tab)
+        self.show_fins()
         self.show_motor()
         self.root.after(100, self.poll)
 
@@ -227,6 +240,33 @@ class App:
             ttk.Entry(inp, textvariable=var, width=8).grid(row=row, column=col + 1,
                                                            sticky="w", pady=2)
             ttk.Label(inp, text=unit, foreground="#888", width=10).grid(
+                row=row, column=col + 2, sticky="w")
+
+        fin = ttk.LabelFrame(tab, text="Fin control (NACA 0012, all-moving)",
+                             padding=8)
+        fin.pack(fill="x", pady=(6, 0))
+        self.fin_on = tk.BooleanVar(value=True)
+        ttk.Checkbutton(fin, text="fins active", variable=self.fin_on,
+                        command=self.show_fins).grid(row=0, column=0, sticky="w",
+                                                     padx=(6, 12))
+        ttk.Label(fin, text="airbrake:").grid(row=0, column=1, sticky="e")
+        self.fin_brake = tk.StringVar(value="auto")
+        ttk.Combobox(fin, textvariable=self.fin_brake, width=8, state="readonly",
+                     values=("auto", "always", "off")).grid(row=0, column=2,
+                                                            sticky="w", padx=(4, 12))
+        self.fin_info = tk.StringVar(value="")
+        ttk.Label(fin, textvariable=self.fin_info, foreground="#666").grid(
+            row=0, column=3, columnspan=8, sticky="w")
+        for i, (label, key, default, unit) in enumerate(FIN_FIELDS):
+            col, row = (i % 4) * 3, 1 + i // 4
+            ttk.Label(fin, text=label + ":").grid(row=row, column=col, sticky="e",
+                                                  padx=(6, 4), pady=2)
+            var = tk.StringVar(value=default)
+            self.tvars[key] = var
+            var.trace_add("write", lambda *_: self.show_fins())
+            ttk.Entry(fin, textvariable=var, width=7).grid(row=row, column=col + 1,
+                                                           sticky="w", pady=2)
+            ttk.Label(fin, text=unit, foreground="#888", width=11).grid(
                 row=row, column=col + 2, sticky="w")
 
         bar = ttk.Frame(tab)
@@ -259,6 +299,19 @@ class App:
         sb.pack(side="right", fill="y")
         self.tvc_log.pack(fill="both", expand=True)
 
+    def show_fins(self):
+        """Live read-out of what the entered fin geometry is actually worth."""
+        try:
+            cfg = self.tvc_config()
+        except (ValueError, KeyError):
+            self.fin_info.set("")
+            return
+        f = cfg.fin_set()
+        if not f.enabled:
+            self.fin_info.set("no fins - roll uncontrolled, no airbrake")
+            return
+        self.fin_info.set(f.describe())
+
     def tvc_config(self):
         def num(key):
             return float(self.tvars[key].get().strip().replace(",", "."))
@@ -271,7 +324,12 @@ class App:
             vx_max=num("vx_max"), vx_step=num("vx_step"), runs=int(num("runs")),
             ign_delay_max=num("ign_delay"), delay_pad=num("ign_delay"),
             thrust_scatter=num("scatter"), thrust_tau=num("tau"),
-            roll_max=num("roll"), wn=num("wn"), zeta=num("zeta"))
+            roll_max=num("roll"), wn=num("wn"), zeta=num("zeta"),
+            fins=bool(self.fin_on.get()), fin_count=int(num("fin_count")),
+            fin_root=num("fin_root") / 1000.0, fin_tip=num("fin_tip") / 1000.0,
+            fin_span=num("fin_span") / 1000.0, fin_arm=num("fin_arm"),
+            fin_max_deflect=num("fin_deflect"), fin_travel_time=num("fin_travel"),
+            fin_brake=self.fin_brake.get())
 
     def start_tvc(self):
         if self.worker and self.worker.is_alive():
@@ -322,7 +380,8 @@ class App:
                             f"\nsingle flight from {h0:.0f} m, vx {cfg.vx_max:+.0f} m/s"
                             f"  ->  {'LANDED' if out[0] > 0.5 else 'FAILED'}\n"
                             f"  touchdown {out[1]:.2f} m/s down, {out[2]:.2f} m/s "
-                            f"across, tilt {out[3]:.1f} deg, rate {out[4]:.1f} deg/s\n"
+                            f"across, tilt {out[3]:.1f} deg, transverse rate "
+                            f"{out[4]:.1f} deg/s, roll {out[15]:.1f} deg/s\n"
                             f"  ignition commanded {out[5]:.1f} m, lit {out[6]:.1f} m "
                             f"after {out[7] * 1000:.0f} ms; "
                             f"D9 {'lit at %.2f s' % out[9] if out[8] > 0.5 else 'unused'}\n")
