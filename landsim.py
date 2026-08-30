@@ -120,6 +120,11 @@ class Config:
     max_time: float = 30.0           # s, simulation cut-off after ignition
     motor: Motor = field(default_factory=Motor)
 
+    @staticmethod
+    def with_propellant(propellant_mass: float, **kwargs) -> "Config":
+        """Build a Config whose motor burns a different propellant mass."""
+        return Config(motor=Motor(propellant_mass=propellant_mass), **kwargs)
+
     @property
     def area(self) -> float:
         return math.pi * (self.diameter / 2.0) ** 2
@@ -314,9 +319,29 @@ def optimise_profile(cfg: Config, ignition_altitude: float, pop_size=64,
 # --------------------------------------------------------------------------- #
 #  Search for the feasible ignition-altitude window
 # --------------------------------------------------------------------------- #
+class Cancelled(Exception):
+    """Raised when a caller-supplied stop callback aborts the search."""
+
+
 def find_window(cfg: Config, coarse_step=5.0, tol=0.25, verbose=True,
-                pop_size=64, generations=120):
-    """Return the lowest and the highest ignition altitude with a soft landing."""
+                pop_size=64, generations=120, on_progress=None,
+                should_stop=None):
+    """Return the lowest and the highest ignition altitude with a soft landing.
+
+    on_progress : optional callable(str) receiving human-readable progress lines
+    should_stop : optional callable() -> bool; when it returns True the search
+                  is aborted with a Cancelled exception
+    """
+    def report(msg):
+        if on_progress is not None:
+            on_progress(msg)
+        elif verbose:
+            print(msg)
+
+    def check_stop():
+        if should_stop is not None and should_stop():
+            raise Cancelled()
+
     limit = cfg.max_touchdown_speed
     lo_bound = 1.0
     hi_bound = cfg.drop_altitude
@@ -325,16 +350,45 @@ def find_window(cfg: Config, coarse_step=5.0, tol=0.25, verbose=True,
     grid = np.arange(lo_bound, hi_bound + 1e-9, coarse_step)
     results, warm = {}, None
     for h in grid:
+        check_stop()
         r = optimise_profile(cfg, float(h), pop_size=pop_size,
                              generations=generations, seed=int(h * 7) & 0xFFFF,
                              x0=warm)
         results[float(h)] = r
         if r["touchdown_speed"] < limit:
             warm = r["profile"]
-        if verbose:
+        flag = "OK " if r["touchdown_speed"] <= limit else "   "
+        report(f"  {flag}h = {h:6.1f} m   entry {r['entry_speed']:5.1f} m/s"
+               f"   best touchdown {r['touchdown_speed']:7.2f} m/s")
+        check_stop()
+
+    # --- if the coarse grid missed the (possibly narrow) window, zoom in around
+    #     the most promising altitude a few times before giving up ------------
+    step = coarse_step
+    for _ in range(4):
+        feasible = [h for h, r in results.items() if r["touchdown_speed"] <= limit]
+        if feasible:
+            break
+        best_h = min(results, key=lambda h: results[h]["touchdown_speed"])
+        step = step / 4.0
+        if step < tol:
+            break
+        report(f"  no soft landing on this grid, refining around "
+               f"h = {best_h:.1f} m with step {step:.2f} m")
+        fine = np.arange(max(lo_bound, best_h - 4 * step),
+                         min(hi_bound, best_h + 4 * step) + 1e-9, step)
+        for h in fine:
+            check_stop()
+            h = float(h)
+            if h in results:
+                continue
+            r = optimise_profile(cfg, h, pop_size=pop_size, generations=generations,
+                                 seed=int(h * 17) & 0xFFFF,
+                                 x0=results[best_h]["profile"])
+            results[h] = r
             flag = "OK " if r["touchdown_speed"] <= limit else "   "
-            print(f"  {flag}h = {h:6.1f} m   entry {r['entry_speed']:5.1f} m/s"
-                  f"   best touchdown {r['touchdown_speed']:7.2f} m/s")
+            report(f"  {flag}h = {h:6.2f} m   entry {r['entry_speed']:5.1f} m/s"
+                   f"   best touchdown {r['touchdown_speed']:7.2f} m/s")
 
     feasible = [h for h, r in results.items() if r["touchdown_speed"] <= limit]
     if not feasible:
@@ -343,6 +397,7 @@ def find_window(cfg: Config, coarse_step=5.0, tol=0.25, verbose=True,
     h_lo_ok, h_hi_ok = min(feasible), max(feasible)
 
     def ok(h, warm_profile):
+        check_stop()
         r = optimise_profile(cfg, h, pop_size=pop_size, generations=generations,
                              seed=int(h * 131) & 0xFFFF, x0=warm_profile)
         return r["touchdown_speed"] <= limit, r
@@ -359,6 +414,7 @@ def find_window(cfg: Config, coarse_step=5.0, tol=0.25, verbose=True,
             b, best_lo = mid, r
         else:
             a = mid
+        report(f"  lower edge  in <{a:6.2f}, {b:6.2f}> m")
     low_alt, low_res = b, best_lo
 
     # --- refine the upper edge --------------------------------------------
@@ -373,6 +429,7 @@ def find_window(cfg: Config, coarse_step=5.0, tol=0.25, verbose=True,
             a, best_hi = mid, r
         else:
             b = mid
+        report(f"  upper edge  in <{a:6.2f}, {b:6.2f}> m")
     high_alt, high_res = a, best_hi
 
     return {"low": (low_alt, low_res), "high": (high_alt, high_res)}
@@ -408,6 +465,8 @@ def main():
     ap.add_argument("--drop-alt", type=float, default=150.0,
                     help="altitude where the free fall starts [m]")
     ap.add_argument("--mass", type=float, default=GROSS_MASS, help="gross mass [kg]")
+    ap.add_argument("--propellant", type=float, default=PROPELLANT_MASS,
+                    help="propellant mass [kg]")
     ap.add_argument("--diameter", type=float, default=DIAMETER, help="diameter [m]")
     ap.add_argument("--cd", type=float, default=CD, help="drag coefficient")
     ap.add_argument("--rho", type=float, default=RHO, help="air density [kg/m3]")
@@ -426,7 +485,7 @@ def main():
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
-    cfg = Config(drop_altitude=args.drop_alt, gross_mass=args.mass,
+    cfg = Config.with_propellant(args.propellant, drop_altitude=args.drop_alt, gross_mass=args.mass,
                  diameter=args.diameter, cd=args.cd, rho=args.rho,
                  max_touchdown_speed=args.max_touchdown,
                  throttle_min=args.throttle_min, phase_length=args.phase,

@@ -31,3 +31,20 @@ python3 landsim.py --coarse-step 5 --gen 200 --pop 80 --tol 0.1   # higher quali
 ```
 
 Requires only `numpy`.
+
+## GUI
+
+```
+python3 gui.py
+```
+
+A minimal Tkinter window where you can edit the drop altitude, initial velocity,
+gross and propellant mass, diameter (or the reference area directly), Cd, air
+density, the soft-landing limit, the minimum throttle, the phase length, the
+integration step and the optimiser settings. It runs the search in a background
+thread (with a Stop button and a live progress log) and shows the two resulting
+ignition altitudes together with the speed at ignition and the touchdown speed,
+plus the throttle / thrust profile for each.
+
+Tkinter ships with the standard Python installers on Windows and macOS; on Debian/
+Ubuntu install it with `sudo apt install python3-tk`.
