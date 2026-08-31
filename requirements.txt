@@ -1,3 +1,14 @@
+# Runtime requirements.
+#
+#   numpy        - everything
+#   matplotlib   - the figures of the 3-D campaign
+#   numba        - OPTIONAL, but the 3-D campaign is ~40x slower without it
+#
+# Nothing in this project imports scipy.
+#
+# If an import fails with "AttributeError: _ARRAY_API not found", the environment has
+# a package compiled against NumPy 1.x being imported under NumPy 2.x - upgrading the
+# offending package (usually scipy) fixes it:  pip install -U scipy
 numpy>=1.24
 matplotlib>=3.7
-numba>=0.58   # optional, ~40x faster
+numba>=0.59        # optional
