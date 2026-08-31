@@ -181,6 +181,58 @@ That is why the attitude loop also stays asleep for most of the free fall - it w
 40 m above the commanded ignition altitude, far enough to settle, late enough that the
 long descent is flown at trim instead of at a fought-for attitude.
 
+### Fitting the gains instead of guessing them
+
+Seven numbers in the controller are not fixed by any physics: the two bandwidths, the
+two damping ratios, the roll-damper gain and the two schedule exponents. `--tune` fits
+them on the ground against a reduced campaign (9 entry states x 12 flights per
+candidate, 60 candidates, differential evolution) and writes `tvc_gains.json`, which
+every later run loads automatically.
+
+Three things keep it honest and affordable:
+
+* **Common random numbers** - every candidate flies the identical seed list over the
+  identical entry states, so a difference between two gain sets is a difference
+  between the gain sets, not sampling noise.
+* **The ignition altitudes are solved once.** They depend on the vehicle and the entry
+  state, never on the gains, and they cost more than the flights do.
+* **The score is not raw success.** Success on this vehicle is dominated by the
+  propulsive |vz| gate, which the gains barely move, so a success-only objective is
+  nearly flat and the search wanders. The cost is the miss fraction plus a bounded
+  margin penalty on all four gates, which keeps the gradient where the gains act.
+
+**Scheduling.** Both actuators are already dynamically inverted, so the loop gain is
+nominally independent of throttle and airspeed. What inversion cannot undo is the
+authority limit - at 12 N of clamped thrust the nozzle makes a tenth of the torque it
+makes at 120 N - so the demanded bandwidth is additionally scaled by
+`(T_real/100 N)**sched_tvc` for the nozzle and `(q/700 Pa)**sched_fin` for the fins,
+with the exponents left for the tuner to find. It found them clearly non-zero:
+
+| | fitted | meaning |
+|---|---|---|
+| `wn` / `zeta` (TVC) | 5.93 / 0.64 | slower and lighter than the guessed 9.0 / 1.0 |
+| `sched_tvc` | **+0.60** | gentle at low clamp, aggressive at full thrust |
+| `wn_fin` / `zeta_fin` | 6.46 / 1.60 | heavily damped - the fins fly the free fall |
+| `sched_fin` | **+0.30** | aggressiveness follows dynamic pressure |
+| `roll_gain` | 1.39 | close to the hand-set 1.5 |
+
+What it bought, on the full 5400-flight campaign:
+
+| | guessed gains | **tuned** |
+|---|---|---|
+| success | 44.9 % | **45.4 %** |
+| tilt gate | 98.8 % (p95 7.3 deg) | **100.0 %** (p95 5.6 deg) |
+| rate gate | 99.3 % (p95 46 deg/s) | **100.0 %** (p95 **7.3** deg/s) |
+| \|vh\| gate | 87.2 % | 89.7 % |
+| **dV spent on steering** | 0.37 m/s | **0.13 m/s** |
+
+Success moves by half a point, which is honest: it is capped by the thrust scatter and
+the igniter spread, and no gain set touches either. But the attitude channels stop
+costing anything at all - every flight now lands inside the tilt and rate gates, the
+touchdown rate drops by a factor of six, and the burn gives away a third as much of its
+thrust to steering. Success once again equals the |vz| gate exactly: the controller is
+no longer part of the problem.
+
 ### Do the fins save the motor from steering with its own thrust?
 
 Yes, and it is measurable - it is just a small term on this vehicle. The steering loss
@@ -242,19 +294,21 @@ go sideways. Both `--booster-cant` and `--booster-azimuth` are settable.
 
 | | |
 |---|---|
-| success, all five gates | **44.9 %** |
-| \|vz\| < 3 m/s | 46.5 % (p95 11.8 m/s) |
-| \|vh\| < 0.75 m/s | 87.2 % (p95 1.07 m/s) |
-| tilt < 10 deg | 98.8 % (p95 7.3 deg) |
-| transverse rate < 60 deg/s | 99.3 % (p95 46 deg/s) |
+| success, all five gates | **45.4 %** |
+| \|vz\| < 3 m/s | 45.4 % (p95 11.4 m/s) |
+| \|vh\| < 0.75 m/s | 89.7 % (p95 1.03 m/s) |
+| tilt < 10 deg | 100.0 % (p95 5.6 deg) |
+| transverse rate < 60 deg/s | 100.0 % (p95 7.3 deg/s) |
 | D9 lit | 100 % of flights |
-| dV spent on steering | 0.37 m/s (clamp waste 9.2 m/s) |
+| dV spent on steering | 0.13 m/s (clamp waste 9.4 m/s) |
 
-**Success is within two points of the vertical gate.** With fin control the attitude
-problem is essentially closed - tilt and rate pass ~99 % of the time and the roll the
-vehicle arrived with is nulled every flight - and what is left is propulsive. (With an
-axially mounted D9 the two are identical, at 49.6 %; the 15 deg cant is what opens the
-gap - see below.)
+(with the tuned gains from `tvc_gains.json` - see *Fitting the gains* below)
+
+**Success equals the vertical gate exactly.** With fin control the attitude
+problem is essentially closed - tilt and rate pass on **every** flight and the roll the
+vehicle arrived with is nulled every time - and what is left is propulsive. (With an
+axially mounted D9 the number is ~4 points higher; the 15 deg cant is what costs it -
+see below.)
 
 Turning one thing off at a time (16 flights x 25 cells each, common random numbers):
 
@@ -291,6 +345,8 @@ vehicle is short of margin.
 ```
 python3 tvc_sim.py                       # the default campaign + figures
 python3 tvc_sim.py --runs 10 --h-step 20 --vx-step 3.5   # quick look
+python3 tvc_sim.py --tune                # fit the gains first, then fly them
+python3 tvc_sim.py --no-gains            # ignore tvc_gains.json, use the defaults
 python3 tvc_sim.py --motor short         # the 269 N / 1.55 s motor
 python3 tvc_sim.py --boosters 0          # without the D9
 python3 tvc_sim.py --no-fins             # gimbal only, roll uncontrolled

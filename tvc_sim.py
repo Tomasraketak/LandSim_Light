@@ -163,8 +163,21 @@ TILT_CAP = 20.0           # ... up to this cap [deg]. Tighter than the reference
                           # that a wide cone spends more dV on steering than the
                           # horizontal channel is worth.
 KI_VX = 0.0               # horizontal trim integral gain (see the plant)
-WN_DEFAULT = 9.0          # attitude loop bandwidth [rad/s]
+WN_DEFAULT = 9.0          # attitude loop bandwidth while the motor is lit [rad/s]
 ZETA_DEFAULT = 1.0        # damping ratio
+WN_FIN_DEFAULT = 7.0      # attitude loop bandwidth on the fins alone [rad/s]
+ZETA_FIN_DEFAULT = 1.0
+
+# Gain SCHEDULING references. Both actuators are already dynamically inverted - the
+# nozzle command is divided by T*L and the fin command by q*S*CL_alpha*arm - so the
+# loop gain is nominally independent of throttle and airspeed. What inversion cannot
+# undo is the AUTHORITY LIMIT: at 12 N of clamped thrust the nozzle can make a tenth
+# of the torque it makes at 120 N, and a loop asking for the same bandwidth simply
+# saturates. The schedules below trim the demanded bandwidth by how much authority is
+# actually there, with the exponent left for the tuner to find (0 = no schedule).
+T_SCHED_REF = 100.0       # N of real, post-clamp thrust the TVC bandwidth refers to
+Q_SCHED_REF = 700.0       # Pa of dynamic pressure the fin bandwidth refers to
+SCHED_LO, SCHED_HI = 0.35, 2.0   # clamp on either schedule factor
 
 # Touchdown gates (the reference's five, read on magnitudes)
 GATE_VZ = 3.00            # m/s
@@ -793,7 +806,8 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, mass0, delay_pad, boost_ready,
 # uncontrolled roll - happens inside this loop at DT_PHYS.
 # ======================================================================
 @njit(cache=True)
-def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
+def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
+        roll_gain, sched_tvc, sched_fin,
         n_boost, use_boost_rule, roll_max, ign_delay_max, delay_pad,
         thr_scatter, thr_tau, gyro_ff,
         n_fin, fin_area, fin_arm, fin_roll_arm, fin_cl_alpha, fin_aspect,
@@ -1025,8 +1039,25 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
                 tafy = ffk * (bz * ahx - bx * ahz)
                 tafz = ffk * (bx * ahy - by * ahx)
 
-            k_rate = 2.0 * zeta * wn
-            k_th = wn / (2.0 * zeta)
+            # real, post-clamp thrust - the nozzle's actual authority
+            t_est = t_nom * k_act
+            if t_est < 8.0:
+                t_est = 8.0
+
+            # ---- which loop is flying, and how hard ----
+            # One attitude loop, but its gains belong to whichever actuator is
+            # authoritative: the nozzle once the motor is lit, the fins before that.
+            # Each is then scheduled on the authority it actually has - real
+            # post-clamp thrust for the nozzle, dynamic pressure for the fins.
+            if engine_on:
+                wn_a, zeta_a = wn, zeta
+                fac = (t_est / T_SCHED_REF) ** sched_tvc if sched_tvc != 0.0 else 1.0
+            else:
+                wn_a, zeta_a = wn_fin, zeta_fin
+                fac = (q / Q_SCHED_REF) ** sched_fin if sched_fin != 0.0 else 1.0
+            wn_a = wn_a * clampf(fac, SCHED_LO, SCHED_HI)
+            k_rate = 2.0 * zeta_a * wn_a
+            k_th = wn_a / (2.0 * zeta_a)
             ocx, ocy, ocz = k_th * eax, k_th * eay, k_th * eaz
             arx = k_rate * (ocx - gtx)
             ary = k_rate * (ocy - gty)
@@ -1044,9 +1075,6 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
             # dynamic inversion. tau = -L*T*(b x s) inverts EXACTLY to
             # s = (b x tau)/(L*T) because s is perpendicular to b. Without it the
             # loop gain would sweep by 100x as the thrust runs down the curve.
-            t_est = t_nom * k_act
-            if t_est < 8.0:
-                t_est = 8.0
             inv = 1.0 / (t_est * L_GIMBAL)
             sqx = (by * trz - bz * try_) * inv
             sqy = (bz * trx - bx * trz) * inv
@@ -1090,7 +1118,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
                 # to hold - nothing in the mission cares which way round the vehicle
                 # is - but arriving spinning is a gate, and a spin costs the two
                 # transverse channels their gyroscopic coupling.
-                tau_roll = I_a * FIN_ROLL_GAIN * (0.0 - w_roll)
+                tau_roll = I_a * roll_gain * (0.0 - w_roll)
 
                 v_f = math.sqrt(v2)
                 qf = 0.5 * RHO * v2
@@ -1462,8 +1490,13 @@ class TvcConfig:
     fin_travel_time: float = FIN_TRAVEL_TIME
     fin_brake: str = "auto"          # "auto" (unlit only) | "always" | "off"
     # controller
-    wn: float = WN_DEFAULT
+    wn: float = WN_DEFAULT                 # bandwidth with the motor lit (TVC)
     zeta: float = ZETA_DEFAULT
+    wn_fin: float = WN_FIN_DEFAULT         # bandwidth on the fins alone
+    zeta_fin: float = ZETA_FIN_DEFAULT
+    roll_gain: float = FIN_ROLL_GAIN
+    sched_tvc: float = 0.0                 # bandwidth ~ (thrust / 100 N) ** this
+    sched_fin: float = 0.0                 # bandwidth ~ (q / 700 Pa) ** this
     gyro_ff: bool = True
     seed0: int = 20260830
 
@@ -1479,6 +1512,16 @@ class TvcConfig:
                   thrust_multiplier=self.thrust_mult)
         b = Booster()
         return m, b
+
+    def gains(self):
+        """The seven numbers the tuner searches, in one place."""
+        return (self.wn, self.zeta, self.wn_fin, self.zeta_fin, self.roll_gain,
+                self.sched_tvc, self.sched_fin)
+
+    def with_gains(self, g) -> "TvcConfig":
+        from dataclasses import replace
+        return replace(self, wn=g[0], zeta=g[1], wn_fin=g[2], zeta_fin=g[3],
+                       roll_gain=g[4], sched_tvc=g[5], sched_fin=g[6])
 
     def fin_set(self) -> Fins:
         return Fins(count=self.fin_count if self.fins else 0,
@@ -1528,6 +1571,8 @@ def fly_one(cfg: TvcConfig, seed: int, h0: float, vx0: float, n_tel: int = 0,
     fa, cd_free = cfg.fin_args()
     out, n = fly(seed, float(h0), float(vx0), float(cfg.vz0),
                  cfg.gross_mass, cfg.cd, cfg.wn, cfg.zeta,
+                 cfg.wn_fin, cfg.zeta_fin, cfg.roll_gain,
+                 cfg.sched_tvc, cfg.sched_fin,
                  float(cfg.n_boosters), 1.0 if cfg.use_booster_rule else 0.0,
                  cfg.roll_max, cfg.ign_delay_max, cfg.delay_pad,
                  cfg.thrust_scatter, cfg.thrust_tau,
@@ -1541,7 +1586,17 @@ def fly_one(cfg: TvcConfig, seed: int, h0: float, vx0: float, n_tel: int = 0,
     return out, tel[:n]
 
 
-def run_campaign(cfg: TvcConfig, on_progress=None, should_stop=None):
+def ignition_grid(cfg: TvcConfig):
+    """The commanded ignition altitude for every cell. It depends on the vehicle and
+    the entry state but NOT on the controller gains, which is what makes the tuner
+    affordable: solved once, reused by every candidate."""
+    h_grid, vx_grid = cfg.entry_grid()
+    return np.array([[plan_ignition(cfg, float(h0), float(vx0)) for vx0 in vx_grid]
+                     for h0 in h_grid])
+
+
+def run_campaign(cfg: TvcConfig, on_progress=None, should_stop=None,
+                 h_cmd_grid=None):
     """Monte Carlo over the entry grid under COMMON RANDOM NUMBERS.
 
     Every cell flies the same list of seeds, so a difference between two
@@ -1559,10 +1614,13 @@ def run_campaign(cfg: TvcConfig, on_progress=None, should_stop=None):
     done = 0
     for i, h0 in enumerate(h_grid):
         for j, vx0 in enumerate(vx_grid):
-            h_cmd = plan_ignition(cfg, float(h0), float(vx0))
+            h_cmd = (float(h_cmd_grid[i, j]) if h_cmd_grid is not None
+                     else plan_ignition(cfg, float(h0), float(vx0)))
             for r, sd in enumerate(seeds):
                 out, _ = fly(int(sd), float(h0), float(vx0), float(cfg.vz0),
                              cfg.gross_mass, cfg.cd, cfg.wn, cfg.zeta,
+                             cfg.wn_fin, cfg.zeta_fin, cfg.roll_gain,
+                             cfg.sched_tvc, cfg.sched_fin,
                              float(cfg.n_boosters),
                              1.0 if cfg.use_booster_rule else 0.0,
                              cfg.roll_max, cfg.ign_delay_max, cfg.delay_pad,
@@ -1615,6 +1673,135 @@ def summarise(camp):
         "burnout_rate": flat[:, 10].mean() * 100.0,
         "flat": flat,
     }
+
+
+# ======================================================================
+# --- GAIN TUNING ------------------------------------------------------
+# The controller has seven numbers in it that no physics fixes: two bandwidths, two
+# damping ratios, the roll-damper gain and the two schedule exponents. Guessing them
+# is how a landing simulation ends up measuring the guess instead of the vehicle, so
+# they are FITTED here, on the ground, against a small campaign - and the fit is what
+# the main run then flies.
+#
+# Three things make it honest and affordable:
+#   * COMMON RANDOM NUMBERS. Every candidate flies the identical seed list over the
+#     identical entry states, so a difference between two gain sets is a difference
+#     between the gain sets.
+#   * The ignition altitudes are solved ONCE. They depend on the vehicle and the
+#     entry state, never on the gains, and they cost more than the flights do.
+#   * The score is not raw success. Success on this vehicle is dominated by the
+#     propulsive |vz| gate, which the gains barely touch, so a success-only score is
+#     nearly flat and the search wanders. The margin penalty below keeps the gradient
+#     where the gains actually act - attitude, rate and horizontal speed.
+# ======================================================================
+GAIN_NAMES = ("wn", "zeta", "wn_fin", "zeta_fin", "roll_gain",
+              "sched_tvc", "sched_fin")
+GAIN_BOUNDS = np.array([
+    (4.0, 16.0),      # wn        - TVC bandwidth [rad/s]
+    (0.6, 1.6),       # zeta      - TVC damping
+    (2.0, 12.0),      # wn_fin    - fin bandwidth [rad/s]
+    (0.6, 1.6),       # zeta_fin  - fin damping
+    (0.3, 6.0),       # roll_gain [rad/s]
+    (-0.6, 0.6),      # sched_tvc - bandwidth ~ (T/100 N) ** this
+    (-0.6, 0.6),      # sched_fin - bandwidth ~ (q/700 Pa) ** this
+])
+
+
+def gain_cost(camp):
+    """Lower is better. Miss fraction plus a bounded margin penalty."""
+    flat = summarise(camp)["flat"]
+    miss = 1.0 - flat[:, 0].mean()
+    pen = (np.minimum(flat[:, 1] / GATE_VZ, 3.0) ** 2 * 0.5
+           + np.minimum(flat[:, 2] / GATE_VH, 3.0) ** 2
+           + np.minimum(flat[:, 3] / GATE_TILT, 3.0) ** 2
+           + np.minimum(flat[:, 4] / GATE_OMEGA, 3.0) ** 2)
+    return float(miss + 0.06 * pen.mean()), float(1.0 - miss)
+
+
+def tune_gains(cfg: TvcConfig, budget=60, runs=12, cells=3, seed=1,
+               on_progress=None, should_stop=None):
+    """Fit the seven controller gains on a reduced campaign.
+
+    Returns (best gains tuple, report dict). `budget` is the number of candidate gain
+    sets flown; each one is a `cells x cells x runs` campaign.
+    """
+    from dataclasses import replace
+    rng = np.random.default_rng(seed)
+    # reduced but representative grid: the corners and the middle of the envelope
+    step_h = max(1.0, (cfg.h_hi - cfg.h_lo) / max(cells - 1, 1))
+    small = replace(cfg, h_step=step_h, vx_step=max(cfg.vx_max / ((cells - 1) / 2.0
+                                                                 if cells > 1 else 1),
+                                                    0.5),
+                    runs=runs)
+    h_cmd_grid = ignition_grid(small)
+    n_cells = h_cmd_grid.size
+
+    def report(msg):
+        if on_progress is not None:
+            on_progress(msg)
+
+    def evaluate(g):
+        if should_stop is not None and should_stop():
+            raise landsim.Cancelled()
+        camp = run_campaign(small.with_gains(tuple(g)), h_cmd_grid=h_cmd_grid)
+        return gain_cost(camp)
+
+    report(f"tuning {len(GAIN_NAMES)} gains on {n_cells} entry states x {runs} runs "
+           f"= {n_cells * runs} flights per candidate, {budget} candidates")
+
+    lo, hi = GAIN_BOUNDS[:, 0], GAIN_BOUNDS[:, 1]
+    pop_size = min(12, max(6, budget // 5))
+    pop = rng.uniform(lo, hi, size=(pop_size, len(lo)))
+    pop[0] = np.array(cfg.gains())          # the shipped default is candidate zero
+    cost = np.empty(pop_size)
+    succ = np.empty(pop_size)
+    for i in range(pop_size):
+        cost[i], succ[i] = evaluate(pop[i])
+        report(f"  seed candidate {i + 1}/{pop_size}: cost {cost[i]:.4f}  "
+               f"success {succ[i] * 100:5.1f} %")
+    used = pop_size
+
+    # differential evolution, the same one the 1-D optimiser uses
+    while used < budget:
+        for i in range(pop_size):
+            if used >= budget:
+                break
+            a, b, c = pop[rng.choice(pop_size, 3, replace=False)]
+            f = rng.uniform(0.4, 0.9)
+            trial = np.clip(a + f * (b - c), lo, hi)
+            mask = rng.random(len(lo)) < 0.8
+            mask[rng.integers(len(lo))] = True
+            trial = np.where(mask, trial, pop[i])
+            t_cost, t_succ = evaluate(trial)
+            used += 1
+            if t_cost < cost[i]:
+                pop[i], cost[i], succ[i] = trial, t_cost, t_succ
+                report(f"  {used:3d}/{budget}  improved: cost {t_cost:.4f}  "
+                       f"success {t_succ * 100:5.1f} %  "
+                       + "  ".join(f"{n}={v:.2f}" for n, v in
+                                   zip(GAIN_NAMES, trial)))
+    best = int(np.argmin(cost))
+    g = tuple(float(x) for x in pop[best])
+    report("  best: " + "  ".join(f"{n}={v:.3f}" for n, v in zip(GAIN_NAMES, g)))
+    return g, {"cost": float(cost[best]), "success": float(succ[best]),
+               "budget": budget, "runs": runs, "cells": n_cells}
+
+
+def save_gains(gains, report, path="tvc_gains.json"):
+    import json
+    with open(path, "w") as fh:
+        json.dump({"gains": dict(zip(GAIN_NAMES, gains)), "report": report}, fh,
+                  indent=2)
+    return path
+
+
+def load_gains(path="tvc_gains.json"):
+    import json
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        d = json.load(fh)
+    return tuple(float(d["gains"][n]) for n in GAIN_NAMES)
 
 
 # ======================================================================
@@ -1908,6 +2095,10 @@ def print_report(camp):
         print("  fins              : none")
     print(f"  entry grid        : {cfg.h_lo:.0f}-{cfg.h_hi:.0f} m step "
           f"{cfg.h_step:.0f}, vx 0 +/-{cfg.vx_max:.0f} m/s step {cfg.vx_step:.0f}")
+    print(f"  gains             : wn {cfg.wn:.2f} / zeta {cfg.zeta:.2f} (TVC, "
+          f"schedule {cfg.sched_tvc:+.2f}), wn {cfg.wn_fin:.2f} / zeta "
+          f"{cfg.zeta_fin:.2f} (fins, schedule {cfg.sched_fin:+.2f}), "
+          f"roll {cfg.roll_gain:.2f}")
     print(f"  dispersions       : igniter U(0, {cfg.ign_delay_max * 1000:.0f}) ms, "
           f"thrust +/-{cfg.thrust_scatter * 100:.0f} % over {cfg.thrust_tau * 1000:.0f} ms, "
           f"roll U(0, {cfg.roll_max:.0f}) deg/s")
@@ -2030,8 +2221,28 @@ def main():
                          "through the CG, so it makes no moment)")
     ap.add_argument("--booster-azimuth", type=float, default=D9_AZIMUTH,
                     help="deg, body-fixed azimuth of the D9 mounting")
-    ap.add_argument("--wn", type=float, default=WN_DEFAULT)
+    ap.add_argument("--wn", type=float, default=WN_DEFAULT,
+                    help="TVC attitude bandwidth [rad/s]")
     ap.add_argument("--zeta", type=float, default=ZETA_DEFAULT)
+    ap.add_argument("--wn-fin", type=float, default=WN_FIN_DEFAULT,
+                    help="attitude bandwidth on the fins alone [rad/s]")
+    ap.add_argument("--zeta-fin", type=float, default=ZETA_FIN_DEFAULT)
+    ap.add_argument("--roll-gain", type=float, default=FIN_ROLL_GAIN)
+    ap.add_argument("--sched-tvc", type=float, default=0.0,
+                    help="TVC bandwidth ~ (real thrust / 100 N) ** this")
+    ap.add_argument("--sched-fin", type=float, default=0.0,
+                    help="fin bandwidth ~ (dynamic pressure / 700 Pa) ** this")
+    ap.add_argument("--tune", action="store_true",
+                    help="fit the seven controller gains first, then fly the campaign "
+                         "with them")
+    ap.add_argument("--tune-budget", type=int, default=60,
+                    help="candidate gain sets to fly while tuning")
+    ap.add_argument("--tune-runs", type=int, default=12,
+                    help="flights per entry state while tuning")
+    ap.add_argument("--gains", default="tvc_gains.json",
+                    help="gain file to load if it exists (and to write with --tune)")
+    ap.add_argument("--no-gains", action="store_true",
+                    help="ignore the gain file and use the built-in defaults")
     ap.add_argument("--no-gyro-ff", action="store_true")
     ap.add_argument("--figures", default="figures", help="output directory")
     ap.add_argument("--no-figures", action="store_true")
@@ -2054,6 +2265,9 @@ def main():
                     ign_delay_max=args.ign_delay, delay_pad=args.ign_delay,
                     thrust_scatter=args.thrust_scatter, thrust_tau=args.thrust_tau,
                     roll_max=args.roll_max, wn=args.wn, zeta=args.zeta,
+                    wn_fin=args.wn_fin, zeta_fin=args.zeta_fin,
+                    roll_gain=args.roll_gain, sched_tvc=args.sched_tvc,
+                    sched_fin=args.sched_fin,
                     fins=not args.no_fins, fin_count=args.fin_count,
                     fin_root=args.fin_root / 1000.0, fin_tip=args.fin_tip / 1000.0,
                     fin_span=args.fin_span / 1000.0, fin_arm=args.fin_arm,
@@ -2063,6 +2277,18 @@ def main():
                     booster_cant=args.booster_cant,
                     booster_azimuth=args.booster_azimuth,
                     gyro_ff=not args.no_gyro_ff)
+    if args.tune:
+        g, rep = tune_gains(cfg, budget=args.tune_budget, runs=args.tune_runs,
+                            on_progress=None if args.quiet else print)
+        cfg = cfg.with_gains(g)
+        save_gains(g, rep, args.gains)
+        print(f"  gains written to {args.gains}\n")
+    elif not args.no_gains:
+        g = load_gains(args.gains)
+        if g is not None:
+            cfg = cfg.with_gains(g)
+            print(f"  gains loaded from {args.gains}\n")
+
     if args.load:
         camp = load_campaign(args.load)
     else:

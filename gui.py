@@ -60,8 +60,15 @@ TVC_FIELDS = [
     ("Roll rate max",     "roll",      "90",  "deg/s"),
     ("D9 cant",           "b_cant",    "15",  "deg"),
     ("D9 mount azimuth",  "b_azim",    "0",   "deg"),
-    ("Attitude bandwidth", "wn",       "9.0", "rad/s"),
-    ("Damping ratio",     "zeta",      "1.0", "-"),
+    ("TVC bandwidth",     "wn",        "9.0", "rad/s"),
+    ("TVC damping",       "zeta",      "1.0", "-"),
+    ("TVC schedule",      "sched_tvc", "0.0", "exp. on T"),
+    ("Fin bandwidth",     "wn_fin",    "7.0", "rad/s"),
+    ("Fin damping",       "zeta_fin",  "1.0", "-"),
+    ("Fin schedule",      "sched_fin", "0.0", "exp. on q"),
+    ("Roll damper gain",  "roll_gain", "1.5", "rad/s"),
+    ("Tune candidates",   "tune_budget", "60", "gain sets"),
+    ("Tune runs/cell",    "tune_runs", "12",  "flights"),
     ("Figure directory",  "figdir",    "figures", ""),
 ]
 
@@ -312,6 +319,9 @@ class App:
         self.tvc_stop.pack(side="left", padx=6)
         ttk.Button(bar, text="Single flight + figure",
                    command=self.tvc_single).pack(side="left")
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
+        self.tune_btn = ttk.Button(bar, text="Tune gains", command=self.start_tune)
+        self.tune_btn.pack(side="left")
         self.tvc_prog = ttk.Progressbar(bar, mode="indeterminate", length=180)
         self.tvc_prog.pack(side="right")
 
@@ -359,6 +369,9 @@ class App:
             ign_delay_max=num("ign_delay"), delay_pad=num("ign_delay"),
             thrust_scatter=num("scatter"), thrust_tau=num("tau"),
             roll_max=num("roll"), wn=num("wn"), zeta=num("zeta"),
+            wn_fin=num("wn_fin"), zeta_fin=num("zeta_fin"),
+            roll_gain=num("roll_gain"), sched_tvc=num("sched_tvc"),
+            sched_fin=num("sched_fin"),
             fins=bool(self.fin_on.get()), fin_count=int(num("fin_count")),
             fin_root=num("fin_root") / 1000.0, fin_tip=num("fin_tip") / 1000.0,
             fin_span=num("fin_span") / 1000.0, fin_arm=num("fin_arm"),
@@ -389,6 +402,54 @@ class App:
         self.worker = threading.Thread(target=self.tvc_work, args=(cfg,),
                                        daemon=True)
         self.worker.start()
+
+    def start_tune(self):
+        """Fit the seven controller gains on a reduced campaign, then write them into
+        the fields so the next full run flies them."""
+        if self.worker and self.worker.is_alive():
+            return
+        try:
+            cfg = self.tvc_config()
+            budget = int(self.num_t("tune_budget"))
+            runs = int(self.num_t("tune_runs"))
+        except ValueError as exc:
+            messagebox.showerror("Invalid input", str(exc))
+            return
+        self.tvc_summary.set("tuning gains ...")
+        self.stop_flag.clear()
+        self.tvc_btn.configure(state="disabled")
+        self.tune_btn.configure(state="disabled")
+        self.tvc_stop.configure(state="normal")
+        self.tvc_prog.start(12)
+        self.worker = threading.Thread(target=self.tune_work,
+                                       args=(cfg, budget, runs), daemon=True)
+        self.worker.start()
+
+    def tune_work(self, cfg, budget, runs):
+        try:
+            g, rep = tvc_sim.tune_gains(cfg, budget=budget, runs=runs,
+                                        on_progress=lambda s: self.put("tlog", s),
+                                        should_stop=self.stop_flag.is_set)
+            tvc_sim.save_gains(g, rep)
+            self.put("ttuned", (g, rep))
+        except Cancelled:
+            self.put("tcancelled", None)
+        except Exception as exc:                      # noqa: BLE001
+            self.put("terror", f"{type(exc).__name__}: {exc}")
+
+    def apply_gains(self, g, rep):
+        for key, val in zip(("wn", "zeta", "wn_fin", "zeta_fin", "roll_gain",
+                             "sched_tvc", "sched_fin"), g):
+            self.tvars[key].set(f"{val:.3f}")
+        self.tvc_summary.set(f"gains tuned - {rep['success'] * 100:.1f} % on the "
+                             f"tuning grid (cost {rep['cost']:.4f}); "
+                             f"written to tvc_gains.json")
+        self.tvc_log.insert("end", "  the fields above now hold the tuned gains; "
+                                   "run the campaign to fly them\n")
+        self.tvc_log.see("end")
+
+    def num_t(self, key):
+        return float(self.tvars[key].get().strip().replace(",", "."))
 
     def tvc_work(self, cfg):
         try:
@@ -611,6 +672,9 @@ class App:
                 elif kind == "tdone":
                     self.tvc_finish(*payload)
                     self.tvc_idle()
+                elif kind == "ttuned":
+                    self.apply_gains(*payload)
+                    self.tvc_idle()
                 elif kind == "tcancelled":
                     self.tvc_summary.set("cancelled")
                     self.tvc_idle()
@@ -629,6 +693,7 @@ class App:
     def tvc_idle(self):
         self.tvc_prog.stop()
         self.tvc_btn.configure(state="normal")
+        self.tune_btn.configure(state="normal")
         self.tvc_stop.configure(state="disabled")
 
     def idle(self):
