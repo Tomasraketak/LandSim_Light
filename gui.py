@@ -126,6 +126,37 @@ ALL_FIELDS = (AIRFRAME_FIELDS + INERTIA_FIELDS + ACTUATOR_FIELDS + MOTOR_FIELDS
               + FIN_FIELDS + SCENARIO_1D_FIELDS + CAMPAIGN_FIELDS + GAIN_FIELDS)
 
 
+class Tooltip:
+    """Minimal hover tooltip.
+
+    The hints used to sit in a fourth grid column, which is what made this page
+    unreadable: a grid column is as wide as its widest cell in ANY row, so one long
+    hint pushed every field in that column sideways and the groups ran into each
+    other. Hovering is where an explanation belongs anyway.
+    """
+
+    def __init__(self, widget, text):
+        self.widget, self.text, self.tip = widget, text, None
+        widget.bind("<Enter>", self.show, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+
+    def show(self, _event=None):
+        if self.tip or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 12
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.tip, text=self.text, justify="left", background="#ffffe0",
+                 relief="solid", borderwidth=1, padx=6, pady=3).pack()
+
+    def hide(self, _event=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
 class CircularConfig(Config):
     """1-D config that allows the reference area to be overridden directly."""
 
@@ -178,77 +209,137 @@ class App:
         self.root.after(100, self.poll)
 
     # ------------------------------------------------------------------ #
-    def _grid_fields(self, parent, fields, columns=3, trace=None):
-        """Lay a field table out in `columns` label/entry/unit triples."""
+    def _fields(self, parent, fields, columns=3, trace=None):
+        """Lay a field table out as `columns` groups of label / entry / unit.
+
+        Each group gets its own equally weighted column pair, the label column is
+        right-aligned and the hint is a tooltip rather than a fourth cell - a grid
+        column is as wide as its widest member, so a long hint used to shove
+        everything to its right into the next group.
+        """
+        grid = ttk.Frame(parent)
+        grid.pack(fill="x")
+        # every column keeps its natural width and one trailing spacer takes the
+        # slack, so the groups stay together on the left instead of being stretched
+        # across the whole window
+        grid.columnconfigure(columns * 3, weight=1)
         for i, (label, key, _default, unit, hint) in enumerate(fields):
-            col, row = (i % columns) * 4, i // columns
-            ttk.Label(parent, text=label + ":").grid(row=row, column=col, sticky="e",
-                                                     padx=(6, 4), pady=2)
+            col, row = (i % columns) * 3, i // columns
+            lab = ttk.Label(grid, text=label + ":", anchor="e", width=17)
+            lab.grid(row=row, column=col, sticky="e", padx=(8, 4), pady=3)
             var = self.vars[key]
             if trace is not None:
                 var.trace_add("write", lambda *_a, f=trace: f())
-            ttk.Entry(parent, textvariable=var, width=8).grid(
-                row=row, column=col + 1, sticky="w", pady=2)
-            ttk.Label(parent, text=unit, foreground="#888", width=9).grid(
-                row=row, column=col + 2, sticky="w")
-            ttk.Label(parent, text=hint, foreground="#aaa").grid(
-                row=row, column=col + 3, sticky="w", padx=(0, 12))
+            ent = ttk.Entry(grid, textvariable=var, width=9)
+            ent.grid(row=row, column=col + 1, sticky="w", pady=3)
+            unit_lab = ttk.Label(grid, text=unit, foreground="#777", width=10,
+                                 anchor="w")
+            unit_lab.grid(row=row, column=col + 2, sticky="w", padx=(4, 16))
+            if hint:
+                for w in (lab, ent, unit_lab):
+                    Tooltip(w, hint)
+        return grid
+
+    def _note(self, parent, text):
+        """A full-width explanatory line under a group."""
+        ttk.Label(parent, text=text, foreground="#777", wraplength=1050,
+                  justify="left").pack(anchor="w", padx=8, pady=(2, 0))
 
     # ------------------------------------------------------------------ #
     #  Page 1: the vehicle
     # ------------------------------------------------------------------ #
+    def _scrollable(self, tab):
+        """A vertically scrollable page, so a small screen scrolls instead of
+        clipping the bottom of the vehicle."""
+        canvas = tk.Canvas(tab, highlightthickness=0)
+        bar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner.bind("<Configure>",
+                   lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(win, width=e.width))
+        # The wheel has to be grabbed globally to reach the child frames, so it is
+        # grabbed only while the pointer is actually over this page - otherwise it
+        # would scroll the vehicle while the user is reading the log on another tab.
+        def on_wheel(event, fixed=None):
+            step = fixed if fixed is not None else int(-event.delta / 120)
+            canvas.yview_scroll(step, "units")
+
+        def grab(_e=None):
+            canvas.bind_all("<MouseWheel>", on_wheel)
+            canvas.bind_all("<Button-4>", lambda e: on_wheel(e, -1))
+            canvas.bind_all("<Button-5>", lambda e: on_wheel(e, 1))
+
+        def release(_e=None):
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                canvas.unbind_all(seq)
+
+        canvas.bind("<Enter>", grab)
+        canvas.bind("<Leave>", release)
+        inner.bind("<Enter>", grab)
+        inner.bind("<Leave>", release)
+        return inner
+
     def build_vehicle_tab(self, tab):
-        ttk.Label(tab, foreground="#555",
+        tab = self._scrollable(tab)
+        ttk.Label(tab, foreground="#555", wraplength=1050, justify="left",
                   text="The rocket itself. Both simulations read this page - describe "
                        "the vehicle once here, and the other two pages only describe "
-                       "the flight.").pack(anchor="w")
+                       "the flight. Hover any field for what it means.").pack(
+            anchor="w", pady=(0, 4))
 
         mot = ttk.LabelFrame(tab, text="Landing motor", padding=8)
-        mot.pack(fill="x", pady=(6, 0))
+        mot.pack(fill="x", pady=(4, 0))
         row = ttk.Frame(mot)
-        row.grid(row=0, column=0, columnspan=12, sticky="w", pady=(0, 4))
+        row.pack(fill="x", pady=(0, 4))
         for key, text in (("long", "long  (120 N peak, 2.61 s, 222 Ns)"),
                           ("short", "short  (269 N peak, 1.55 s, 259 Ns)")):
             ttk.Radiobutton(row, text=text, value=key, variable=self.motor_var,
-                            command=self.show_motor).pack(side="left", padx=(0, 14))
-        ttk.Label(row, textvariable=self.motor_info,
-                  foreground="#666").pack(side="left")
-        self._grid_fields(mot, MOTOR_FIELDS, columns=3, trace=self.show_motor)
+                            command=self.show_motor).pack(side="left", padx=(8, 18))
+        ttk.Label(mot, textvariable=self.motor_info, foreground="#777").pack(
+            anchor="w", padx=8, pady=(0, 4))
+        self._fields(mot, MOTOR_FIELDS, columns=3, trace=self.show_motor)
 
         air = ttk.LabelFrame(tab, text="Airframe", padding=8)
         air.pack(fill="x", pady=(8, 0))
-        self._grid_fields(air, AIRFRAME_FIELDS, columns=3)
+        self._fields(air, AIRFRAME_FIELDS, columns=3)
 
-        inr = ttk.LabelFrame(tab, text="Inertia and arms  (3-D only)", padding=8)
+        inr = ttk.LabelFrame(tab, text="Inertia and arms   (3-D only)", padding=8)
         inr.pack(fill="x", pady=(8, 0))
-        self._grid_fields(inr, INERTIA_FIELDS, columns=3)
-        ttk.Button(inr, text="MMOI from a 1.40 m rod",
-                   command=self.mmoi_from_rod).grid(row=90, column=0, columnspan=2,
-                                                    sticky="w", pady=(6, 0))
-        ttk.Label(inr, foreground="#888",
+        self._fields(inr, INERTIA_FIELDS, columns=3)
+        rowb = ttk.Frame(inr)
+        rowb.pack(fill="x", pady=(6, 0))
+        ttk.Button(rowb, text="MMOI from a 1.40 m rod",
+                   command=self.mmoi_from_rod).pack(side="left", padx=(8, 10))
+        ttk.Label(rowb, foreground="#777",
                   text="slender rod m*L^2/12 and solid cylinder m*R^2/2 - a starting "
-                       "point, not a substitute for a CAD number").grid(
-            row=90, column=2, columnspan=10, sticky="w")
+                       "point, not a substitute for a CAD number").pack(side="left")
 
-        act = ttk.LabelFrame(tab, text="Actuators  (3-D only, except the clamp range)",
+        act = ttk.LabelFrame(tab, text="Actuators   (3-D only, except the clamp range)",
                              padding=8)
         act.pack(fill="x", pady=(8, 0))
-        self._grid_fields(act, ACTUATOR_FIELDS, columns=3)
+        self._fields(act, ACTUATOR_FIELDS, columns=3)
 
-        fin = ttk.LabelFrame(tab, text="Fin control (NACA 0012, all-moving)", padding=8)
+        fin = ttk.LabelFrame(tab, text="Fin control   (NACA 0012, all-moving)",
+                             padding=8)
         fin.pack(fill="x", pady=(8, 0))
         head = ttk.Frame(fin)
-        head.grid(row=0, column=0, columnspan=12, sticky="w", pady=(0, 4))
+        head.pack(fill="x", pady=(0, 4))
         ttk.Checkbutton(head, text="fins active", variable=self.fin_on,
-                        command=self.show_fins).pack(side="left", padx=(0, 12))
+                        command=self.show_fins).pack(side="left", padx=(8, 16))
         ttk.Label(head, text="airbrake:").pack(side="left")
         ttk.Combobox(head, textvariable=self.fin_brake, width=8, state="readonly",
-                     values=("auto", "always", "off")).pack(side="left", padx=(4, 12))
-        ttk.Checkbutton(head, text="aero drift nulling",
-                        variable=self.fin_drift).pack(side="left", padx=(0, 12))
-        ttk.Label(head, textvariable=self.fin_info,
-                  foreground="#666").pack(side="left")
-        self._grid_fields(fin, FIN_FIELDS, columns=4, trace=self.show_fins)
+                     values=("auto", "always", "off")).pack(side="left", padx=(4, 16))
+        ttk.Checkbutton(head, text="aerodynamic drift nulling",
+                        variable=self.fin_drift).pack(side="left")
+        ttk.Label(fin, textvariable=self.fin_info, foreground="#777",
+                  wraplength=1050, justify="left").pack(anchor="w", padx=8,
+                                                        pady=(0, 4))
+        self._fields(fin, FIN_FIELDS, columns=3, trace=self.show_fins)
 
         ttk.Button(tab, text="Reset the vehicle to defaults",
                    command=self.reset_vehicle).pack(anchor="w", pady=(10, 0))
@@ -257,14 +348,14 @@ class App:
     #  Page 2: the 1-D ignition-window search
     # ------------------------------------------------------------------ #
     def build_1d_tab(self, tab):
-        ttk.Label(tab, foreground="#555",
+        ttk.Label(tab, foreground="#555", wraplength=1050, justify="left",
                   text="Vertical axis only. Searches for the range of ignition "
                        "altitudes from which a throttle profile exists that lands "
                        "softly, and prints the profile for both edges.").pack(anchor="w")
 
         inp = ttk.LabelFrame(tab, text="Scenario and search", padding=8)
         inp.pack(fill="x", pady=(6, 0))
-        self._grid_fields(inp, SCENARIO_1D_FIELDS, columns=3)
+        self._fields(inp, SCENARIO_1D_FIELDS, columns=3)
 
         bar = ttk.Frame(tab)
         bar.pack(fill="x", pady=(8, 4))
@@ -322,7 +413,7 @@ class App:
     def build_tvc_tab(self, tab):
         top = ttk.Frame(tab)
         top.pack(fill="x")
-        ttk.Label(top, foreground="#555",
+        ttk.Label(top, foreground="#555", wraplength=1050, justify="left",
                   text="Two translational axes, a rolling airframe, two TVC channels "
                        "and four fins. Every cell of the entry grid is flown N times "
                        "with a random igniter delay, thrust scatter and roll rate; the "
@@ -334,16 +425,17 @@ class App:
         else:
             txt, col = ("numba NOT installed - the flight kernel runs as plain Python, "
                         "roughly 40x slower.  pip install numba", "#c0392b")
-        ttk.Label(top, text=txt, foreground=col).pack(anchor="w")
+        ttk.Label(top, text=txt, foreground=col, wraplength=1050,
+                  justify="left").pack(anchor="w")
 
         cols = ttk.Frame(tab)
         cols.pack(fill="x", pady=(6, 0))
         camp = ttk.LabelFrame(cols, text="Campaign and dispersions", padding=8)
         camp.pack(side="left", fill="both", expand=True)
-        self._grid_fields(camp, CAMPAIGN_FIELDS, columns=2)
+        self._fields(camp, CAMPAIGN_FIELDS, columns=2)
         gains = ttk.LabelFrame(cols, text="Controller gains", padding=8)
         gains.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        self._grid_fields(gains, GAIN_FIELDS, columns=2)
+        self._fields(gains, GAIN_FIELDS, columns=2)
 
         bar = ttk.Frame(tab)
         bar.pack(fill="x", pady=(8, 4))

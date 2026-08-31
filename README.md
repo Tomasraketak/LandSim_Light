@@ -906,6 +906,7 @@ Three pages:
 * **Vehicle** - the rocket itself: motor, airframe, inertia and arms, both actuators,
   the clamp range, the D9 mounting and the fins. Both simulations read this page, so
   the vehicle is described once and the other two pages only describe the flight.
+  The page scrolls, and every field explains itself on hover.
 * **1-D ignition window** - the scenario and the throttle-profile search.
 * **3-D / TVC Monte Carlo** - the entry grid, the dispersions, the controller gains and
   the tuner, with a large simulation log: it prints the full run header (every vehicle
