@@ -291,6 +291,7 @@ vehicle is short of margin.
 ```
 python3 tvc_sim.py                       # the default campaign + figures
 python3 tvc_sim.py --runs 10 --h-step 20 --vx-step 3.5   # quick look
+python3 tvc_sim.py --motor short         # the 269 N / 1.55 s motor
 python3 tvc_sim.py --boosters 0          # without the D9
 python3 tvc_sim.py --no-fins             # gimbal only, roll uncontrolled
 python3 tvc_sim.py --fin-deflect 20 --fin-travel 0.05 --fin-brake always
@@ -304,8 +305,22 @@ survives the whole flight untouched **with the fins disabled** - nothing else in
 model makes a torque about the body axis - and with them enabled the same spin is
 nulled to well under 1 deg/s by touchdown.
 
-`numba` is optional but makes the campaign ~40x faster; `matplotlib` is needed for the
-figures. Both are in `requirements.txt`.
+### Speed
+
+The flight kernel (`fly`, the planner projections, the fin aerodynamics) is compiled
+with **numba** when it is installed - about 14 ms per trajectory, so a 5400-flight
+campaign takes ~12 minutes on four cores' worth of one core. Without numba the same
+code runs as plain Python, roughly 40x slower, which is the difference between a
+coffee and a weekend. The 3-D tab of the GUI uses exactly the same compiled kernel and
+says at the top which of the two it got; if it is red, `pip install numba`.
+
+The first call spends a few seconds compiling - that is normal, and the cache makes
+later runs in the same environment start immediately.
+
+The 1-D modes need no numba: their optimiser simulates the whole population at once as
+numpy arrays.
+
+`matplotlib` is needed for the figures. Everything is in `requirements.txt`.
 
 ---
 

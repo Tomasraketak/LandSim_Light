@@ -227,8 +227,37 @@ class App:
         intro = ("Two translational axes plus a rolling airframe and two TVC "
                  "channels.\nEvery cell of the entry grid is flown N times with a "
                  "random igniter delay, thrust scatter and roll rate;\nthe on-board "
-                 "rule decides in flight whether to light the D9.")
+                 "rule decides in flight whether to light the D9.\nMass, propellant, "
+                 "diameter/area, Cd, air density and the thrust multiplier are taken "
+                 "from the first tab.")
         ttk.Label(tab, text=intro, foreground="#555").pack(anchor="w")
+
+        # Speed matters here far more than in the 1-D modes: a campaign is thousands
+        # of trajectories at 1 kHz, and the plant is compiled with numba when it is
+        # available. Without it the same run is roughly 40x slower, so the state is
+        # worth saying out loud rather than leaving the user to wonder.
+        speed = ttk.Frame(tab)
+        speed.pack(fill="x", pady=(4, 0))
+        if tvc_sim.HAVE_NUMBA:
+            txt = ("numba active - the flight kernel is compiled (~14 ms per flight; "
+                   "the first call spends a few seconds compiling)")
+            col = "#0a5"
+        else:
+            txt = ("numba NOT installed - the flight kernel runs as plain Python, "
+                   "roughly 40x slower. Install it with:  pip install numba")
+            col = "#c0392b"
+        ttk.Label(speed, text=txt, foreground=col).pack(anchor="w")
+
+        motor_row = ttk.Frame(tab)
+        motor_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(motor_row, text="Landing motor:").pack(side="left", padx=(0, 8))
+        for key, text in (("long", "long  (120 N peak, 2.61 s, 222 Ns)"),
+                          ("short", "short  (269 N peak, 1.55 s, 259 Ns)")):
+            ttk.Radiobutton(motor_row, text=text, value=key,
+                            variable=self.motor_var,
+                            command=self.show_motor).pack(side="left", padx=(0, 14))
+        ttk.Label(motor_row, textvariable=self.motor_info,
+                  foreground="#666").pack(side="left")
 
         inp = ttk.LabelFrame(tab, text="Campaign", padding=8)
         inp.pack(fill="x", pady=(6, 0))
