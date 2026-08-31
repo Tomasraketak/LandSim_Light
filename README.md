@@ -233,6 +233,38 @@ touchdown rate drops by a factor of six, and the burn gives away a third as much
 thrust to steering. Success once again equals the |vz| gate exactly: the controller is
 no longer part of the problem.
 
+### Why isn't the |vh| gate 100 %? It is.
+
+89.7 % looked like a horizontal-control limit. It is not - it is the vertical failures
+being counted twice. Conditioning on the flights that survived the |vz| gate, i.e. the
+ones where the horizontal correction actually ran to touchdown:
+
+| | all 5400 flights | the 2453 that survived \|vz\| |
+|---|---|---|
+| \|vh\| < 0.75 m/s | 89.7 % | **100.0 %** |
+| p95 \|vh\| | 1.03 m/s | **0.28 m/s** |
+| tilt < 10 deg | 100.0 % | 100.0 % |
+| rate < 60 deg/s | 100.0 % | 100.0 % |
+
+And it is 100 % in **every** entry-drift cell, not just on average:
+
+| entry vx | -7 | -5 | -3 | 0 | +3 | +5 | +7 |
+|---|---|---|---|---|---|---|---|
+| \|vh\| gate, all flights | 70.8 | 83.1 | 98.9 | 100 | 100 | 86.9 | 74.4 |
+| \|vh\| gate, \|vz\| survivors | **100** | **100** | **100** | **100** | **100** | **100** | **100** |
+| mean \|vh\| of survivors [m/s] | 0.22 | 0.18 | 0.17 | 0.16 | 0.14 | 0.17 | 0.18 |
+
+The reason is timing, not authority. The lateral law is `a = -v_h/t_go`, which is
+asymptotic: it converges over the last second or so of the burn, and the fins only
+firm it up as dynamic pressure allows. A flight that runs out of grain at 12 m and
+arrives at the ground a second and a half early is scored on a correction that was
+still in progress - so its 1.5 m/s of leftover drift is a *symptom of the propulsive
+failure*, not an independent one. Nothing is wrong with the horizontal channel: give it
+the flight it was designed for and it lands inside a third of its gate.
+
+The report and the GUI now print both readings, because only the conditional one says
+anything about the controller.
+
 ### Do the fins save the motor from steering with its own thrust?
 
 Yes, and it is measurable - it is just a small term on this vehicle. The steering loss

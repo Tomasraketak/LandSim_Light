@@ -1650,6 +1650,8 @@ def summarise(camp):
     out = camp["out"]
     flat = out.reshape(-1, N_OUT)
     succ = flat[:, 0]
+    surv = flat[:, 1] < GATE_VZ          # survived the vertical gate
+    n_s = int(surv.sum())
     grid = out[:, :, :, 0].mean(axis=2) * 100.0
     return {
         "success": succ.mean() * 100.0,
@@ -1664,6 +1666,17 @@ def summarise(camp):
         "p95_vh": float(np.percentile(flat[:, 2], 95)),
         "p95_tilt": float(np.percentile(flat[:, 3], 95)),
         "p95_om": float(np.percentile(flat[:, 4], 95)),
+        # Conditioned on the vehicle having survived the VERTICAL gate. The
+        # attitude and horizontal channels converge over the last second or so of
+        # the burn - a = -v/t_go is asymptotic - so a flight that arrives at the
+        # ground early, at 10 m/s, is scored on a correction that was still in
+        # progress. Reading |vh|, tilt and rate over those flights measures the
+        # propulsive failure a second time, not the controller.
+        "gate_vh_c": float((flat[surv, 2] < GATE_VH).mean() * 100.0) if n_s else 0.0,
+        "gate_tilt_c": float((flat[surv, 3] < GATE_TILT).mean() * 100.0) if n_s else 0.0,
+        "gate_om_c": float((flat[surv, 4] < GATE_OMEGA).mean() * 100.0) if n_s else 0.0,
+        "p95_vh_c": float(np.percentile(flat[surv, 2], 95)) if n_s else 0.0,
+        "n_surv": int(n_s),
         "boost_rate": flat[:, 8].mean() * 100.0,
         "boost_grid": out[:, :, :, 8].mean(axis=2) * 100.0,
         "mean_h_cmd": float(flat[:, 5].mean()),
@@ -2114,6 +2127,15 @@ def print_report(camp):
           f"   p95 {s['p95_tilt']:6.2f} deg")
     print(f"    rate  < {GATE_OMEGA} deg/s           : {s['gate_om']:5.1f} %"
           f"   p95 {s['p95_om']:6.2f} deg/s")
+    print()
+    print(f"  ... and over the {s['n_surv']} flights that survived the VERTICAL gate,"
+          f" i.e. where\n      the horizontal and attitude corrections actually ran"
+          f" to touchdown:")
+    print(f"    |v_h| < {GATE_VH} m/s           : {s['gate_vh_c']:5.1f} %"
+          f"   p95 {s['p95_vh_c']:6.2f} m/s")
+    print(f"    tilt  < {GATE_TILT} deg             : {s['gate_tilt_c']:5.1f} %")
+    print(f"    rate  < {GATE_OMEGA} deg/s           : {s['gate_om_c']:5.1f} %")
+    print()
     print(f"  D9 lit in                  : {s['boost_rate']:5.1f} % of flights")
     print(f"  burnout before touchdown   : {s['burnout_rate']:5.1f} %")
     print(f"  mean commanded ignition    : {s['mean_h_cmd']:5.1f} m, "

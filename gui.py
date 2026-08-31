@@ -500,7 +500,10 @@ class App:
             f"dV on steering {s['dv_tilt']:.2f} m/s, clamp waste "
             f"{s['dv_clamp']:.1f} m/s\n"
             f"p95: vz {s['p95_vz']:.2f} m/s   vh {s['p95_vh']:.2f} m/s   "
-            f"tilt {s['p95_tilt']:.1f} deg   rate {s['p95_om']:.1f} deg/s")
+            f"tilt {s['p95_tilt']:.1f} deg   rate {s['p95_om']:.1f} deg/s\n"
+            f"over the {s['n_surv']} flights that survived the vertical gate:  "
+            f"|vh| {s['gate_vh_c']:.1f} %   tilt {s['gate_tilt_c']:.1f} %   "
+            f"rate {s['gate_om_c']:.1f} %   (p95 |vh| {s['p95_vh_c']:.2f} m/s)")
         self.tvc_log.insert("end", "\nsuccess [%] by release altitude:\n")
         for h, v in zip(camp["h_grid"], s["by_h"]):
             self.tvc_log.insert("end", f"  {h:6.1f} m : {v:5.1f}\n")
