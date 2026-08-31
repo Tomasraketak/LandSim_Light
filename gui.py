@@ -58,6 +58,8 @@ TVC_FIELDS = [
     ("Thrust scatter",    "scatter",   "0.15", "+/- frac"),
     ("Scatter window",    "tau",       "0.7", "s"),
     ("Roll rate max",     "roll",      "90",  "deg/s"),
+    ("D9 cant",           "b_cant",    "15",  "deg"),
+    ("D9 mount azimuth",  "b_azim",    "0",   "deg"),
     ("Attitude bandwidth", "wn",       "9.0", "rad/s"),
     ("Damping ratio",     "zeta",      "1.0", "-"),
     ("Figure directory",  "figdir",    "figures", ""),
@@ -249,6 +251,9 @@ class App:
         ttk.Checkbutton(fin, text="fins active", variable=self.fin_on,
                         command=self.show_fins).grid(row=0, column=0, sticky="w",
                                                      padx=(6, 12))
+        self.fin_drift = tk.BooleanVar(value=False)
+        ttk.Checkbutton(fin, text="aero drift nulling", variable=self.fin_drift).grid(
+            row=0, column=4, sticky="w", padx=(12, 0))
         ttk.Label(fin, text="airbrake:").grid(row=0, column=1, sticky="e")
         self.fin_brake = tk.StringVar(value="auto")
         ttk.Combobox(fin, textvariable=self.fin_brake, width=8, state="readonly",
@@ -329,7 +334,9 @@ class App:
             fin_root=num("fin_root") / 1000.0, fin_tip=num("fin_tip") / 1000.0,
             fin_span=num("fin_span") / 1000.0, fin_arm=num("fin_arm"),
             fin_max_deflect=num("fin_deflect"), fin_travel_time=num("fin_travel"),
-            fin_brake=self.fin_brake.get())
+            fin_brake=self.fin_brake.get(),
+            fin_drift_null=bool(self.fin_drift.get()),
+            booster_cant=num("b_cant"), booster_azimuth=num("b_azim"))
 
     def start_tvc(self):
         if self.worker and self.worker.is_alive():
@@ -400,6 +407,8 @@ class App:
             f"tilt<{tvc_sim.GATE_TILT} {s['gate_tilt']:5.1f} %   "
             f"rate<{tvc_sim.GATE_OMEGA} {s['gate_om']:5.1f} %   "
             f"D9 used {s['boost_rate']:.0f} %\n"
+            f"dV on steering {s['dv_tilt']:.2f} m/s, clamp waste "
+            f"{s['dv_clamp']:.1f} m/s\n"
             f"p95: vz {s['p95_vz']:.2f} m/s   vh {s['p95_vh']:.2f} m/s   "
             f"tilt {s['p95_tilt']:.1f} deg   rate {s['p95_om']:.1f} deg/s")
         self.tvc_log.insert("end", "\nsuccess [%] by release altitude:\n")

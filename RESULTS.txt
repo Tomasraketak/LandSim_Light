@@ -1,30 +1,30 @@
      5/135  h=140.0 m  vx=-3 m/s   success  50.0 %
-    10/135  h=140.0 m  vx=+2 m/s   success  50.0 %
-    15/135  h=140.0 m  vx=+7 m/s   success  50.0 %
-    20/135  h=145.0 m  vx=-3 m/s   success  57.5 %
+    10/135  h=140.0 m  vx=+2 m/s   success  45.0 %
+    15/135  h=140.0 m  vx=+7 m/s   success  35.0 %
+    20/135  h=145.0 m  vx=-3 m/s   success  55.0 %
     25/135  h=145.0 m  vx=+2 m/s   success  50.0 %
-    30/135  h=145.0 m  vx=+7 m/s   success  50.0 %
-    35/135  h=150.0 m  vx=-3 m/s   success  55.0 %
-    40/135  h=150.0 m  vx=+2 m/s   success  60.0 %
-    45/135  h=150.0 m  vx=+7 m/s   success  50.0 %
-    50/135  h=155.0 m  vx=-3 m/s   success  50.0 %
-    55/135  h=155.0 m  vx=+2 m/s   success  45.0 %
-    60/135  h=155.0 m  vx=+7 m/s   success  50.0 %
-    65/135  h=160.0 m  vx=-3 m/s   success  50.0 %
-    70/135  h=160.0 m  vx=+2 m/s   success  37.5 %
-    75/135  h=160.0 m  vx=+7 m/s   success  50.0 %
-    80/135  h=165.0 m  vx=-3 m/s   success  55.0 %
+    30/135  h=145.0 m  vx=+7 m/s   success  47.5 %
+    35/135  h=150.0 m  vx=-3 m/s   success  52.5 %
+    40/135  h=150.0 m  vx=+2 m/s   success  52.5 %
+    45/135  h=150.0 m  vx=+7 m/s   success  52.5 %
+    50/135  h=155.0 m  vx=-3 m/s   success  42.5 %
+    55/135  h=155.0 m  vx=+2 m/s   success  42.5 %
+    60/135  h=155.0 m  vx=+7 m/s   success  40.0 %
+    65/135  h=160.0 m  vx=-3 m/s   success  45.0 %
+    70/135  h=160.0 m  vx=+2 m/s   success  42.5 %
+    75/135  h=160.0 m  vx=+7 m/s   success  45.0 %
+    80/135  h=165.0 m  vx=-3 m/s   success  52.5 %
     85/135  h=165.0 m  vx=+2 m/s   success  47.5 %
-    90/135  h=165.0 m  vx=+7 m/s   success  47.5 %
-    95/135  h=170.0 m  vx=-3 m/s   success  62.5 %
-   100/135  h=170.0 m  vx=+2 m/s   success  55.0 %
-   105/135  h=170.0 m  vx=+7 m/s   success  52.5 %
-   110/135  h=175.0 m  vx=-3 m/s   success  55.0 %
+    90/135  h=165.0 m  vx=+7 m/s   success  60.0 %
+    95/135  h=170.0 m  vx=-3 m/s   success  55.0 %
+   100/135  h=170.0 m  vx=+2 m/s   success  52.5 %
+   105/135  h=170.0 m  vx=+7 m/s   success  42.5 %
+   110/135  h=175.0 m  vx=-3 m/s   success  42.5 %
    115/135  h=175.0 m  vx=+2 m/s   success  55.0 %
-   120/135  h=175.0 m  vx=+7 m/s   success  40.0 %
-   125/135  h=180.0 m  vx=-3 m/s   success  35.0 %
-   130/135  h=180.0 m  vx=+2 m/s   success  40.0 %
-   135/135  h=180.0 m  vx=+7 m/s   success  42.5 %
+   120/135  h=175.0 m  vx=+7 m/s   success  22.5 %
+   125/135  h=180.0 m  vx=-3 m/s   success  42.5 %
+   130/135  h=180.0 m  vx=+2 m/s   success  37.5 %
+   135/135  h=180.0 m  vx=+7 m/s   success  40.0 %
 ==============================================================================
 LandSim Light - 3-D / TVC Monte Carlo
 ==============================================================================
@@ -37,41 +37,42 @@ LandSim Light - 3-D / TVC Monte Carlo
   dispersions       : igniter U(0, 300) ms, thrust +/-15 % over 700 ms, roll U(0, 90) deg/s
   flights           : 135 cells x 40 = 5400
 
-  SUCCESS (all five gates)   :  49.6 %
-    |v_z| < 3.0 m/s              :  49.6 %   p95  11.20 m/s
-    |v_h| < 0.75 m/s           :  91.3 %   p95   0.93 m/s
-    tilt  < 10.0 deg             :  99.9 %   p95   5.19 deg
-    rate  < 60.0 deg/s           :  99.8 %   p95  11.78 deg/s
+  SUCCESS (all five gates)   :  44.9 %
+    |v_z| < 3.0 m/s              :  46.5 %   p95  11.76 m/s
+    |v_h| < 0.75 m/s           :  87.2 %   p95   1.07 m/s
+    tilt  < 10.0 deg             :  98.8 %   p95   7.29 deg
+    rate  < 60.0 deg/s           :  99.3 %   p95  46.04 deg/s
   D9 lit in                  : 100.0 % of flights
-  burnout before touchdown   :  31.5 %
-  mean commanded ignition    :  56.6 m, mean clamp 0.81
+  burnout before touchdown   :  30.4 %
+  mean commanded ignition    :  56.6 m, mean clamp 0.82
+  dV spent on steering       :  0.37 m/s (clamp waste   9.2 m/s)
 
   success [%] by release altitude:
-     140.0 m :  50.2
-     145.0 m :  53.3
-     150.0 m :  53.0
-     155.0 m :  48.3
-     160.0 m :  47.5
-     165.0 m :  50.3
-     170.0 m :  51.7
-     175.0 m :  49.8
-     180.0 m :  41.8
+     140.0 m :  46.0
+     145.0 m :  51.5
+     150.0 m :  51.3
+     155.0 m :  44.8
+     160.0 m :  46.0
+     165.0 m :  48.7
+     170.0 m :  44.2
+     175.0 m :  32.0
+     180.0 m :  39.5
   success [%] by horizontal entry speed:
-     -7.0 m/s :  48.3
-     -6.0 m/s :  48.6
-     -5.0 m/s :  51.1
-     -4.0 m/s :  50.3
-     -3.0 m/s :  52.2
-     -2.0 m/s :  47.5
-     -1.0 m/s :  50.3
-     +0.0 m/s :  51.1
-     +1.0 m/s :  50.6
-     +2.0 m/s :  48.9
-     +3.0 m/s :  50.0
-     +4.0 m/s :  48.1
-     +5.0 m/s :  50.6
-     +6.0 m/s :  47.8
-     +7.0 m/s :  48.1
+     -7.0 m/s :  42.2
+     -6.0 m/s :  43.6
+     -5.0 m/s :  44.7
+     -4.0 m/s :  42.5
+     -3.0 m/s :  48.6
+     -2.0 m/s :  47.2
+     -1.0 m/s :  45.0
+     +0.0 m/s :  47.5
+     +1.0 m/s :  47.2
+     +2.0 m/s :  47.2
+     +3.0 m/s :  47.5
+     +4.0 m/s :  42.8
+     +5.0 m/s :  42.8
+     +6.0 m/s :  41.7
+     +7.0 m/s :  42.8
 
   figures written:
     figures/fig1_success_envelope.png
@@ -79,10 +80,3 @@ LandSim Light - 3-D / TVC Monte Carlo
     figures/fig3_single_flight.png
     figures/fig4_ignition_and_booster.png
     figures/fig5_gates.png
-configuration                success   vz    vh   tilt  rate  p95vz p95tilt p95rate
-fins + airbrake (default)    46.2   46.2   86.8   99.8   99.8  10.43   6.35   39.1
-fins, brake always           46.2   48.2   84.2   98.5   93.5  10.41   7.26   64.0
-fins, no airbrake            45.0   46.8   84.8   99.0   97.5  10.59   8.27   53.3
-no fins at all               40.0   41.0   78.8   98.8   96.5  11.92   7.85   54.8
-fins, no D9                  13.2   13.2   42.0   99.8   99.0  25.64   6.29    6.6
-fins, no thrust scatter      85.5   85.8   99.5   99.8  100.0   3.58   4.49   16.3

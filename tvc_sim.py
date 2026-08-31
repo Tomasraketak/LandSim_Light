@@ -109,6 +109,13 @@ K_MIN, K_MAX = 0.10, 1.00
 #     more energy than the grain can absorb, that is worth more than the steering.
 #   * they can produce a ROLL torque, which the gimbal provably cannot - the gimbal
 #     moment (-L*b) x F is perpendicular to b by construction.
+# The D9 booster is not mounted axially: it is canted 15 deg and aimed THROUGH the
+# CG, so it makes no moment, but its thrust has a lateral component that pushes on
+# the horizontal channel - and, being bolted to the airframe, that component rotates
+# with the roll. The cant also costs 1 - cos(15 deg) = 3.4 % of its impulse upwards.
+D9_CANT = 15.0            # deg from the body axis
+D9_AZIMUTH = 0.0          # deg, body-fixed azimuth of the mounting, from the u1 axis
+
 FIN_COUNT = 4
 FIN_ROOT = 0.120          # m, root chord
 FIN_TIP = 0.063           # m, tip chord
@@ -127,6 +134,13 @@ FIN_ROLL_GAIN = 1.5       # rad/s, roll-rate damping bandwidth. Deliberately slo
                           # roll axis limit-cycles at hundreds of deg/s.
 FIN_ROLL_MAX = 2.0        # deg of the travel the roll channel may spend
 FIN_MIN_AIRSPEED = 8.0    # m/s below which the fins are not used for control
+DRIFT_TILT_GAIN = 1.5     # deg of commanded tilt per m/s of drift
+DRIFT_TILT_MAX = 8.0      # deg, cap on the aerodynamic drift-nulling tilt. NOT a
+                          # taste setting: an all-moving fin must spend the body's
+                          # angle of attack on cancelling its own crossflow before it
+                          # can steer at all, so past ~10 deg of trim the set
+                          # saturates - asymmetrically, which puts the roll straight
+                          # back. Measured, 18 deg re-introduced 290 deg/s of spin.
 FIN_CTRL_LEAD = 40.0      # m above the commanded ignition altitude at which the fin
                           # attitude loop wakes up - far enough for the transient to
                           # settle before the motor lights, late enough that the long
@@ -172,7 +186,7 @@ THRUST_TAU = 0.70         # s, correlation window of that scatter
 ROLL_RATE_MAX = 90.0      # deg/s, U(0, max) with a random sign
 SIG_ALIGN = 0.25          # deg, initial attitude alignment error (physical)
 
-N_OUT = 16                # length of the per-flight result vector
+N_OUT = 17                # length of the per-flight result vector
 
 
 # ======================================================================
@@ -783,7 +797,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
         n_boost, use_boost_rule, roll_max, ign_delay_max, delay_pad,
         thr_scatter, thr_tau, gyro_ff,
         n_fin, fin_area, fin_arm, fin_roll_arm, fin_cl_alpha, fin_aspect,
-        fin_max, fin_rate, fin_brake_mode, cd_free,
+        fin_max, fin_rate, fin_brake_mode, fin_drift, cd_free, b_cant, b_azim,
         mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop, b_total,
         tel, n_tel, h_cmd_in):
     np.random.seed(seed)
@@ -806,13 +820,17 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
     # draws (the vehicle cannot know its igniter delay in advance), so a campaign
     # solves it once per grid cell and passes it in - it costs more than the flight
     # itself.
+    # The planner's 1-D projection only cares about the vertical, so it is handed
+    # the booster's AXIAL component - a 15 deg cant costs 3.4 % of its impulse
+    # upwards, and the rest goes sideways where the horizontal channel gets it.
+    bf_ax = bf * math.cos(b_cant)
     boost_ready = 1.0 if (n_boost > 0.5 and use_boost_rule > 0.5) else 0.0
     if h_cmd_in > 0.0:
         h_cmd = h_cmd_in
     else:
         h_cmd, _, _ = find_ignition(h_start, vx0, vz0, cd, cd_free, mass0,
                                     delay_pad, boost_ready, mt, mf, mc,
-                                    prop_mass, i_total, bt, bf, bb, b_prop)
+                                    prop_mass, i_total, bt, bf_ax, bb, b_prop)
 
     # ---- state -----------------------------------------------------------
     x, y, h = 0.0, 0.0, h_start
@@ -850,6 +868,8 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
 
     defl = np.zeros(4)           # fin deflections [deg]
     defl_cmd = np.zeros(4)
+    ctrl_arr = np.zeros(4)
+    xflow = np.zeros(4)
     fin_brake_now = 0.0
     srv1 = srv2 = 0.0            # servo angles [deg]
     sr1 = sr2 = 0.0              # servo rates [deg/s]
@@ -867,6 +887,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
     ax_bias = ay_bias = 0.0
     max_tilt = 0.0
     dv_clamp = 0.0
+    dv_tilt = 0.0
     k_sum = 0.0
     k_n = 0.0
     h_ign_real = 0.0
@@ -904,7 +925,8 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
             tb_p = tb if tb >= 0.0 else 0.0
             k_level, resid = solve_plan(h, vz, tb_p, dry,
                                         mt, mf, mc, prop_mass, i_total, cd,
-                                        bt, bf, bb, b_prop, b_t_ign, 0.02, PLAN_TARGET_VZ)
+                                        bt, bf_ax, bb, b_prop, b_t_ign, 0.02,
+                                        PLAN_TARGET_VZ)
             # ---- the booster rule ----
             # A D9 is a one-way door: it cannot be throttled, stopped or relit. So it
             # is lit only once the plan says the main motor CANNOT close the landing
@@ -920,8 +942,46 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
         # ---------------- controller, 200 Hz ----------------
         if step % CTRL_DIV == 0:
             dt_c = DT_PHYS * CTRL_DIV
+            # body-fixed gimbal / fin axes, needed by everything below
+            c1x, c1y, c1z, c2x, c2y, c2z = gimbal_basis(bx, by, bz, gx, gy, gz)
+            # Feed the canted booster's side force forward. The flight computer
+            # knows it lit the D9 and knows which way the airframe is pointing, so
+            # the 15 deg cant is a KNOWN horizontal input, not a disturbance to be
+            # discovered through the velocity error. Subtracting it here lets the
+            # main motor cancel it while the vehicle stays vertical, instead of the
+            # guidance chasing the drift it causes.
+            bxf = byf = 0.0
+            if thr_boost > 0.0:
+                mfx = math.cos(b_azim) * c1x + math.sin(b_azim) * c2x
+                mfy = math.cos(b_azim) * c1y + math.sin(b_azim) * c2y
+                sb = math.sin(b_cant)
+                bxf = -thr_boost * (-sb * mfx) / mass
+                byf = -thr_boost * (-sb * mfy) / mass
             ux, uy, uz, t_go = guidance_dir(h, vx, vy, vz, mass, cd,
-                                            ax_bias, ay_bias)
+                                            ax_bias + bxf, ay_bias + byf)
+            # ---- aerodynamic drift nulling, before the motor is lit ----
+            # The body's own normal force is a free horizontal actuator while the
+            # vehicle is still falling: tilting the thrust axis TOWARDS the drift
+            # increases the component of the airflow perpendicular to the body, and
+            # that normal force pushes back against the drift. Killing the sideways
+            # velocity here costs no propellant at all, and it is worth more than
+            # that - the burn can then be flown nearly vertical instead of spending
+            # its thrust on steering, which is the one thing this vehicle cannot
+            # afford. It is handed over to the ordinary guidance law once the
+            # attitude loop wakes up for the ignition.
+            if (fin_drift > 0.5 and t_ign_cmd < 0.0 and h > h_cmd + FIN_CTRL_LEAD
+                    and n_fin > 0.5):
+                vh_m = math.sqrt(vx * vx + vy * vy)
+                if vh_m > 0.2:
+                    tl = math.tan(math.radians(clampf(vh_m * DRIFT_TILT_GAIN, 0.0,
+                                                      DRIFT_TILT_MAX)))
+                    ux = tl * vx / vh_m
+                    uy = tl * vy / vh_m
+                    uz = 1.0
+                    nrm = math.sqrt(ux * ux + uy * uy + 1.0)
+                    ux, uy, uz = ux / nrm, uy / nrm, uz / nrm
+                else:
+                    ux, uy, uz = 0.0, 0.0, 1.0
             # attitude error as a rotation vector: e = asin|b x u| * unit(b x u).
             # No atan2, no wrap, no gimbal lock - and perpendicular to b by
             # construction, so the loop can never ask for a roll it cannot make.
@@ -984,14 +1044,13 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
             # dynamic inversion. tau = -L*T*(b x s) inverts EXACTLY to
             # s = (b x tau)/(L*T) because s is perpendicular to b. Without it the
             # loop gain would sweep by 100x as the thrust runs down the curve.
-            t_est = t_nom * k_act + thr_boost
+            t_est = t_nom * k_act
             if t_est < 8.0:
                 t_est = 8.0
             inv = 1.0 / (t_est * L_GIMBAL)
             sqx = (by * trz - bz * try_) * inv
             sqy = (bz * trx - bx * trz) * inv
             sqz = (bx * try_ - by * trx) * inv
-            c1x, c1y, c1z, c2x, c2y, c2z = gimbal_basis(bx, by, bz, gx, gy, gz)
             sd1 = clampf(sqx * c1x + sqy * c1y + sqz * c1z, -0.999, 0.999)
             sd2 = clampf(sqx * c2x + sqy * c2y + sqz * c2z, -0.999, 0.999)
             cmd1 = math.degrees(math.asin(sd1)) * TVC_RATIO
@@ -1054,7 +1113,8 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
                 # it spun the airframe to 340 deg/s before the motor was even lit.
                 # Attitude control starts with the ignition command; the airbrake and
                 # the roll damper run the whole way down.
-                if t_ign_cmd < 0.0 and h > h_cmd + FIN_CTRL_LEAD:
+                if (t_ign_cmd < 0.0 and h > h_cmd + FIN_CTRL_LEAD
+                        and fin_drift < 0.5):
                     k_t = 0.0
                 if k_t < 1e-6:
                     a_cmd_f = b_cmd_f = 0.0
@@ -1081,58 +1141,46 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
                 else:
                     fin_brake_now = 0.0
 
-                # Control first, brake with what is left. Adding the brake term on
-                # top and clipping the sum would spend the travel on drag and leave
-                # the controller with nothing at the one moment it needs it most.
-                # Axial airspeed, for the crossflow correction below.
+                # Control first, brake with what is left - and the brake magnitude
+                # is the SAME on all four fins, taken from the tightest one.
+                #
+                # This is why the splayed brake was rolling the vehicle. The set is
+                # roll-neutral only while every fin sits at the same |angle of
+                # attack|; with sideslip that needs different DEFLECTIONS on the two
+                # fins of a pair (the crossflow adds to one and subtracts from the
+                # other), and the correction is in the command. But if the fins are
+                # squeezed into whatever travel each one has left, the four end up at
+                # different angles - measured, 0.02 N m at 2 deg of sideslip and
+                # 0.65 N m at 30 deg. Against a roll inertia of 0.004 kg m^2 that is
+                # already hundreds of deg/s. Equalised, the residual is 0.005 N m.
+                # axial airspeed, for the crossflow correction
                 va_f = -(vx * bx + vy * by + vz * bz)
                 if va_f < 3.0:
                     va_f = 3.0
+                room = fin_max
                 for _i in range(int(n_fin)):
                     ang_i = 2.0 * math.pi * _i / n_fin
-                    alt = 1.0 if _i % 2 == 0 else -1.0
-                    ctrl = (d_roll + a_cmd_f * math.cos(ang_i)
-                            + b_cmd_f * math.sin(ang_i))
-                    # Cancel the angle of attack the crossflow already puts on this
-                    # fin. Without it the commanded DEFLECTION and the delivered
-                    # ANGLE OF ATTACK differ by the vehicle's own sideslip, the fins
-                    # fight their own weathercock moment through the loop instead of
-                    # in the allocation, and the gimbal ends up in a limit cycle
-                    # against them. This is the same dynamic inversion the nozzle
-                    # gets, done in the fin's own variable.
                     rix = math.cos(ang_i) * c1x + math.sin(ang_i) * c2x
                     riy = math.cos(ang_i) * c1y + math.sin(ang_i) * c2y
                     riz = math.cos(ang_i) * c1z + math.sin(ang_i) * c2z
                     nix = by * riz - bz * riy
                     niy = bz * rix - bx * riz
                     niz = bx * riy - by * rix
-                    ctrl += math.degrees((vx * nix + vy * niy + vz * niz) / va_f)
-                    ctrl = clampf(ctrl, -fin_max, fin_max)
-                    room = fin_max - abs(ctrl)
-                    brake = fin_brake_now
-                    if brake > room:
-                        brake = room
-                    defl_cmd[_i] = clampf(ctrl + brake * alt, -fin_max, fin_max)
-
-            # Horizontal trim integrator. It exists to hold a standing tilt against
-            # a persistent side force, because the ZEV term vanishes as v_h -> 0 and
-            # cannot. This campaign models no wind, and against a pure initial drift
-            # the integral is not a trim but a wind-up: over a 2 s burn at 5 m/s it
-            # builds several m/s^2 of demand that is still pushing after the drift is
-            # already dead, and lands the vehicle sideways the other way. So the gain
-            # is zero unless a side force is actually being modelled.
-            if engine_on and KI_VX > 0.0:
-                ax_bias = clampf(ax_bias - KI_VX * vx * dt_c, -4.0, 4.0)
-                ay_bias = clampf(ay_bias - KI_VX * vy * dt_c, -4.0, 4.0)
-
-            # Terminal descent law. It REPLACES the plan rather than only adding to
-            # it, because the endgame problem here is too MUCH thrust, not too
-            # little: at 120 N against a 31 N weight a plan still at full clamp
-            # stops the vehicle metres up. Its gate (slow AND low) is what keeps
-            # that safe - a law that engaged on altitude alone would take over at
-            # 15 m/s and fly the vehicle into the ground with propellant left.
-            if engine_on:
-                k_cmd = k_from_plan(k_level, 0.0, h, vz, mass, t_nom)
+                    xflow[_i] = math.degrees((vx * nix + vy * niy + vz * niz) / va_f)
+                    ctrl_i = (d_roll + a_cmd_f * math.cos(ang_i)
+                              + b_cmd_f * math.sin(ang_i) + xflow[_i])
+                    ctrl_i = clampf(ctrl_i, -fin_max, fin_max)
+                    ctrl_arr[_i] = ctrl_i
+                    r_i = fin_max - abs(ctrl_i)
+                    if r_i < room:
+                        room = r_i
+                brake = fin_brake_now
+                if brake > room:
+                    brake = room
+                for _i in range(int(n_fin)):
+                    alt = 1.0 if _i % 2 == 0 else -1.0
+                    defl_cmd[_i] = clampf(ctrl_arr[_i] + brake * alt,
+                                          -fin_max, fin_max)
 
         # ---------------- servo actuators (one per gimbal axis) ----------------
         # Rate-limited with a DECELERATION-AWARE target rate: the servo may only run
@@ -1195,9 +1243,12 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
         tn_ = math.sqrt(tdx * tdx + tdy * tdy + tdz * tdz)
         tdx, tdy, tdz = tdx / tn_, tdy / tn_, tdz / tn_
 
-        thrust = t_nom * k_act + thr_boost
+        thrust_main = t_nom * k_act
+        thrust = thrust_main + thr_boost
         if engine_on:
             dv_clamp += (t_nom - t_nom * k_act) / mass * DT_PHYS
+            # the vertical component the tilt gives away - "thrust spent on steering"
+            dv_tilt += thrust * (1.0 - tdz) / mass * DT_PHYS
             k_sum += k_act
             k_n += 1.0
 
@@ -1236,11 +1287,28 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
             tay += fty
             taz += ftz
 
-        f_tx, f_ty, f_tz = thrust * tdx, thrust * tdy, thrust * tdz
+        # The booster's own thrust direction: canted b_cant from the body axis
+        # towards a body-fixed azimuth, and aimed through the CG so it makes no
+        # moment. Its lateral component is a real horizontal input - and it rolls
+        # with the airframe, so a spinning vehicle averages it away and a
+        # roll-stabilised one does not.
+        f_tx = thrust_main * tdx
+        f_ty = thrust_main * tdy
+        f_tz = thrust_main * tdz
+        if thr_boost > 0.0:
+            cc_b, ss_b = math.cos(b_cant), math.sin(b_cant)
+            mx = math.cos(b_azim) * c1x + math.sin(b_azim) * c2x
+            my = math.cos(b_azim) * c1y + math.sin(b_azim) * c2y
+            mz = math.cos(b_azim) * c1z + math.sin(b_azim) * c2z
+            f_tx += thr_boost * (cc_b * bx - ss_b * mx)
+            f_ty += thr_boost * (cc_b * by - ss_b * my)
+            f_tz += thr_boost * (cc_b * bz - ss_b * mz)
         # gimbal moment = (-L*b) x F: perpendicular to b, so no roll torque exists
-        ttx = -L_GIMBAL * thrust * (by * sz - bz * sy)
-        tty = -L_GIMBAL * thrust * (bz * sx - bx * sz)
-        ttz = -L_GIMBAL * thrust * (bx * sy - by * sx)
+        # the booster is aimed through the CG, so only the main motor's nozzle
+        # produces a moment
+        ttx = -L_GIMBAL * thrust_main * (by * sz - bz * sy)
+        tty = -L_GIMBAL * thrust_main * (bz * sx - bx * sz)
+        ttz = -L_GIMBAL * thrust_main * (bx * sy - by * sx)
 
         I_t = mass * (L_BODY * L_BODY / 12.0)
         I_a = mass * I_AXIAL_COEF
@@ -1348,6 +1416,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta,
     out[13] = max_tilt
     out[14] = t
     out[15] = math.degrees(abs(w_r))
+    out[16] = dv_tilt
     return out, tel_i
 
 
@@ -1363,6 +1432,8 @@ class TvcConfig:
     thrust_mult: float = 1.0
     n_boosters: int = 1
     use_booster_rule: bool = True
+    booster_cant: float = D9_CANT
+    booster_azimuth: float = D9_AZIMUTH
     # entry grid
     h_lo: float = 140.0
     h_hi: float = 180.0
@@ -1379,6 +1450,9 @@ class TvcConfig:
     roll_max: float = ROLL_RATE_MAX
     # fins
     fins: bool = True
+    fin_drift_null: bool = False     # aerodynamic drift nulling before ignition.
+                                     # Off by default - measured, it buys nothing on
+                                     # this airframe; see the README.
     fin_count: int = FIN_COUNT
     fin_root: float = FIN_ROOT
     fin_tip: float = FIN_TIP
@@ -1423,8 +1497,9 @@ class TvcConfig:
         cd_free = self.cd + (f.cd_extra(f.max_deflect)
                              if (f.enabled and mode > 0.5) else
                              (f.cd_extra(0.0) if f.enabled else 0.0))
+        drift = 1.0 if (f.enabled and self.fin_drift_null) else 0.0
         return ((n, f.area, f.arm, f.roll_arm, f.cl_alpha, f.aspect,
-                 f.max_deflect, f.rate, mode), cd_free)
+                 f.max_deflect, f.rate, mode, drift), cd_free)
 
 
 def plan_ignition(cfg: TvcConfig, h0: float, vx0: float) -> float:
@@ -1438,7 +1513,8 @@ def plan_ignition(cfg: TvcConfig, h0: float, vx0: float) -> float:
     h_cmd, _, _ = find_ignition(float(h0), float(vx0), float(cfg.vz0), cfg.cd,
                                 cd_free, mass0, cfg.delay_pad, ready, mt, mf, mc,
                                 m.propellant_mass, m.total_impulse,
-                                bt, bf, bb, b.propellant_mass)
+                                bt, bf * math.cos(math.radians(cfg.booster_cant)),
+                                bb, b.propellant_mass)
     return float(h_cmd)
 
 
@@ -1457,7 +1533,8 @@ def fly_one(cfg: TvcConfig, seed: int, h0: float, vx0: float, n_tel: int = 0,
                  cfg.thrust_scatter, cfg.thrust_tau,
                  1.0 if cfg.gyro_ff else 0.0,
                  fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6], fa[7], fa[8],
-                 cd_free,
+                 fa[9], cd_free, math.radians(cfg.booster_cant),
+                 math.radians(cfg.booster_azimuth),
                  mt, mf, mc, m.propellant_mass, m.total_impulse,
                  bt, bf, bb, b.propellant_mass, b.total_mass, tel, n_tel,
                  float(h_cmd))
@@ -1492,7 +1569,9 @@ def run_campaign(cfg: TvcConfig, on_progress=None, should_stop=None):
                              cfg.thrust_scatter, cfg.thrust_tau,
                              1.0 if cfg.gyro_ff else 0.0,
                              fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6],
-                             fa[7], fa[8], cd_free,
+                             fa[7], fa[8], fa[9], cd_free,
+                             math.radians(cfg.booster_cant),
+                             math.radians(cfg.booster_azimuth),
                              mt, mf, mc, m.propellant_mass, m.total_impulse,
                              bt, bf, bb, b.propellant_mass, b.total_mass, tel, 0,
                              h_cmd)
@@ -1531,6 +1610,8 @@ def summarise(camp):
         "boost_grid": out[:, :, :, 8].mean(axis=2) * 100.0,
         "mean_h_cmd": float(flat[:, 5].mean()),
         "mean_k": float(flat[:, 12].mean()),
+        "dv_tilt": float(flat[:, 16].mean()),
+        "dv_clamp": float(flat[:, 11].mean()),
         "burnout_rate": flat[:, 10].mean() * 100.0,
         "flat": flat,
     }
@@ -1812,6 +1893,11 @@ def print_report(camp):
           f"{m.burn_time:.2f} s, {m.total_impulse:.1f} Ns")
     print(f"  boosters carried  : {cfg.n_boosters} x {b.name} "
           f"({b.total_impulse:.1f} Ns each), lit by the on-board rule")
+    if cfg.n_boosters:
+        print(f"  booster mounting  : canted {cfg.booster_cant:.0f} deg through the "
+              f"CG at azimuth {cfg.booster_azimuth:.0f} deg -> "
+              f"{math.cos(math.radians(cfg.booster_cant)) * 100:.1f} % of its thrust "
+              f"axial, {math.sin(math.radians(cfg.booster_cant)) * 100:.1f} % sideways")
     print(f"  mass / Cd         : {cfg.gross_mass:.3f} kg + boosters / {cfg.cd}")
     f = cfg.fin_set()
     if f.enabled:
@@ -1841,6 +1927,8 @@ def print_report(camp):
     print(f"  burnout before touchdown   : {s['burnout_rate']:5.1f} %")
     print(f"  mean commanded ignition    : {s['mean_h_cmd']:5.1f} m, "
           f"mean clamp {s['mean_k']:.2f}")
+    print(f"  dV spent on steering       : {s['dv_tilt']:5.2f} m/s "
+          f"(clamp waste {s['dv_clamp']:5.1f} m/s)")
     print()
     print("  success [%] by release altitude:")
     for h, v in zip(camp["h_grid"], s["by_h"]):
@@ -1934,6 +2022,14 @@ def main():
                     help="s, end stop to end stop")
     ap.add_argument("--fin-brake", choices=("auto", "always", "off"), default="auto",
                     help="when the fins are splayed as airbrakes")
+    ap.add_argument("--fin-drift-null", action="store_true",
+                    help="try to kill the sideways drift aerodynamically before "
+                         "ignition (measured: does not pay on this airframe)")
+    ap.add_argument("--booster-cant", type=float, default=D9_CANT,
+                    help="deg the D9 is canted from the body axis (it is aimed "
+                         "through the CG, so it makes no moment)")
+    ap.add_argument("--booster-azimuth", type=float, default=D9_AZIMUTH,
+                    help="deg, body-fixed azimuth of the D9 mounting")
     ap.add_argument("--wn", type=float, default=WN_DEFAULT)
     ap.add_argument("--zeta", type=float, default=ZETA_DEFAULT)
     ap.add_argument("--no-gyro-ff", action="store_true")
@@ -1963,6 +2059,9 @@ def main():
                     fin_span=args.fin_span / 1000.0, fin_arm=args.fin_arm,
                     fin_max_deflect=args.fin_deflect,
                     fin_travel_time=args.fin_travel, fin_brake=args.fin_brake,
+                    fin_drift_null=args.fin_drift_null,
+                    booster_cant=args.booster_cant,
+                    booster_azimuth=args.booster_azimuth,
                     gyro_ff=not args.no_gyro_ff)
     if args.load:
         camp = load_campaign(args.load)

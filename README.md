@@ -148,17 +148,93 @@ delta_i = roll + A*cos(phi_i) + B*sin(phi_i)   +   brake * (+1,-1,+1,-1)
   leaves pure drag: **free-fall Cd 0.581 against 0.350 bare, 1.66x**. Control is
   allocated first and the brake takes what travel is left.
 
-Two things the model shows that are worth knowing before building it:
+### Why a splayed airbrake rolls the vehicle - and how it was fixed
 
-* **The attitude loop must stay asleep for most of the free fall.** Fighting the
-  weathercock at 40 m/s with four fins means large, asymmetric deflections, and four
-  asymmetric fins are a roll torque - measured, it spun the airframe to 340 deg/s
-  before the motor was even lit. The loop wakes 40 m above the commanded ignition
-  altitude, which is far enough to settle and late enough to fly the descent at trim.
-* **A splayed airbrake is not roll-neutral in practice.** Once the fins stall
-  asymmetrically (15 deg of splay plus the sideslip of a weathercocking airframe is
-  past stall) the set induces 60-130 deg/s of roll. The roll channel absorbs it -
-  which is the clearest argument in the model for having one.
+The splay pattern (+,-,+,-) is roll-neutral **only while every fin sits at the same
+|angle of attack|**, because the roll moment is the plain sum of the four fin forces
+and the lift curve is odd. With sideslip the crossflow adds to one fin of a pair and
+subtracts from the other, so equal angles of attack need *unequal deflections* - and
+once the fins stall (15 deg of splay plus the sideslip of a weathercocking airframe is
+past stall), a pattern of equal deflections stops cancelling. Measured on the fin
+model, four fins at a plain +/-15 deg:
+
+| sideslip | roll moment | with the crossflow cancelled in the command |
+|---|---|---|
+| 2 deg | 0.025 N m | -0.001 |
+| 10 deg | 0.221 N m | -0.003 |
+| 30 deg | 0.651 N m | 0.011 |
+
+Those look tiny until you divide by the roll inertia, `m*R^2/2 = 0.004 kg m^2`:
+0.2 N m held for one second is 45 rad/s. That is the whole story of the 340 deg/s
+spin-up seen in the first version.
+
+The fix is in the mixer, and it is two lines: the crossflow correction is applied to
+every fin, and **the brake magnitude is equalised across the set** (the tightest fin's
+remaining travel sets it for all four) instead of each fin getting whatever room it
+happens to have left. Squeezing the fins into unequal travel is what re-created the
+unequal angles the correction had just removed. Roll excursions during the free fall
+went from 200-340 deg/s to 30-80 deg/s, and the roll damper takes them from there.
+
+The residual is real, not numerical: at large sideslip the correction needs more than
++/-15 deg (at 20 deg of sideslip it asks for 36 deg) and the fins simply saturate.
+That is why the attitude loop also stays asleep for most of the free fall - it wakes
+40 m above the commanded ignition altitude, far enough to settle, late enough that the
+long descent is flown at trim instead of at a fought-for attitude.
+
+### Do the fins save the motor from steering with its own thrust?
+
+Yes, and it is measurable - it is just a small term on this vehicle. The steering loss
+`dV = integral T(1 - u_z)/m dt` is what the burn gives away by not pointing straight up:
+
+| | dV spent on steering | \|vh\| gate | p95 \|vh\| |
+|---|---|---|---|
+| with fins | **0.37 m/s** | 87.2 % | 1.07 m/s |
+| without fins | 0.57 m/s | 75.2 % | 1.45 m/s |
+
+The fins carry the attitude work the gimbal would otherwise have to do, and the
+horizontal channel lands twice as tightly. But against ~70 m/s of usable dV, half a
+metre per second of steering loss was never the thing standing between this vehicle
+and a landing - the thrust scatter is.
+
+### Aerodynamic drift nulling: implemented, measured, does not pay
+
+The obvious next step is to kill the sideways velocity **before** ignition with the
+airframe's own normal force - free, no propellant. It is implemented
+(`--fin-drift-null`) and it is off by default, because it does not work here:
+
+* entry drift at ignition, 160 m release with vx = +7 m/s: **6.2 m/s with it, 6.2 m/s
+  without**. All of that reduction is plain drag along the flight path.
+* success on the coarse grid: 41.0 % with, 43.0 % without.
+
+Two reasons, both structural. An all-moving fin has to spend the body's angle of attack
+on cancelling its own crossflow before it can steer at all, so past ~10 deg of trim the
+set saturates - asymmetrically, which puts the roll straight back (18 deg of commanded
+tilt re-introduced 290 deg/s of spin). And the airframe is statically stable enough
+that what the fins *can* hold is a few degrees, worth under 1 m/s^2 of side force,
+most of which is spent damping the weathercock oscillation rather than accumulating in
+one direction.
+
+### The D9 is canted 15 degrees
+
+The booster is not axial: it is canted 15 deg and aimed **through the CG**, so it makes
+no moment, but 25.9 % of its thrust goes sideways and only 96.6 % of its impulse
+upwards - and, being bolted to the airframe, that side force **rotates with the roll**.
+The planner is handed the axial component only; the controller feeds the lateral one
+forward, because the flight computer knows it lit the booster and knows which way the
+airframe points, so the cant is a known input rather than a disturbance to be
+discovered through the velocity error. Without that feedforward the cant costs 5 points
+of \|vh\| and 4 of tilt; with it, most of that comes back.
+
+The cant is not free even so - against an axially mounted D9, all else equal:
+
+| | success | \|vz\| | \|vh\| | dV on steering |
+|---|---|---|---|---|
+| D9 canted 15 deg | 44.9 % | 46.5 | 87.2 | 0.37 m/s |
+| D9 axial | 49.6 % | 49.6 | 91.3 | 0.25 m/s |
+
+It costs about 4-5 points, and it costs them in the vertical channel: 3.4 % of the
+booster's impulse never points up, and the main motor has to lean to cancel what does
+go sideways. Both `--booster-cant` and `--booster-azimuth` are settable.
 
 ## Results (5400 flights, 135 entry states x 40)
 
@@ -166,16 +242,19 @@ Two things the model shows that are worth knowing before building it:
 
 | | |
 |---|---|
-| success, all five gates | **49.6 %** |
-| \|vz\| < 3 m/s | 49.6 % (p95 11.2 m/s) |
-| \|vh\| < 0.75 m/s | 91.3 % (p95 0.93 m/s) |
-| tilt < 10 deg | 99.9 % (p95 5.2 deg) |
-| transverse rate < 60 deg/s | 99.8 % (p95 11.8 deg/s) |
+| success, all five gates | **44.9 %** |
+| \|vz\| < 3 m/s | 46.5 % (p95 11.8 m/s) |
+| \|vh\| < 0.75 m/s | 87.2 % (p95 1.07 m/s) |
+| tilt < 10 deg | 98.8 % (p95 7.3 deg) |
+| transverse rate < 60 deg/s | 99.3 % (p95 46 deg/s) |
 | D9 lit | 100 % of flights |
+| dV spent on steering | 0.37 m/s (clamp waste 9.2 m/s) |
 
-**Success now equals the vertical gate exactly.** With fin control the attitude
-problem is closed - tilt and rate pass 99.8 % of the time and the roll the vehicle
-arrived with is nulled every flight - and what is left is purely propulsive.
+**Success is within two points of the vertical gate.** With fin control the attitude
+problem is essentially closed - tilt and rate pass ~99 % of the time and the roll the
+vehicle arrived with is nulled every flight - and what is left is propulsive. (With an
+axially mounted D9 the two are identical, at 49.6 %; the 15 deg cant is what opens the
+gap - see below.)
 
 Turning one thing off at a time (16 flights x 25 cells each, common random numbers):
 
