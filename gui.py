@@ -126,6 +126,17 @@ ALL_FIELDS = (AIRFRAME_FIELDS + INERTIA_FIELDS + ACTUATOR_FIELDS + MOTOR_FIELDS
               + FIN_FIELDS + SCENARIO_1D_FIELDS + CAMPAIGN_FIELDS + GAIN_FIELDS)
 
 
+MPL_HINT = ("  A 'No module named matplotlib.backends.registry' error means a HALF-"
+            "UPGRADED matplotlib:\n  new .py files over an old install. Clean it out "
+            "and reinstall:\n"
+            "      pip uninstall -y matplotlib\n"
+            "      pip uninstall -y matplotlib      (run it twice - old copies hide "
+            "behind each other)\n"
+            "      pip install --no-cache-dir matplotlib\n"
+            "  The campaign results are unaffected; re-draw them later from a saved "
+            "run with\n      python tvc_sim.py --load results.npz\n")
+
+
 class Tooltip:
     """Minimal hover tooltip.
 
@@ -419,6 +430,16 @@ class App:
                        "with a random igniter delay, thrust scatter and roll rate; the "
                        "on-board rule decides in flight whether to light the D9. The "
                        "vehicle comes from the Vehicle page.").pack(anchor="w")
+        try:
+            import matplotlib                          # noqa: F401
+            self.mpl_ok, self.mpl_err = True, ""
+        except Exception as exc:                       # noqa: BLE001
+            self.mpl_ok, self.mpl_err = False, f"{type(exc).__name__}: {exc}"
+        if not self.mpl_ok:
+            ttk.Label(top, foreground="#c0392b", wraplength=1050, justify="left",
+                      text=f"matplotlib is BROKEN or missing, so no figures can be "
+                           f"drawn ({self.mpl_err}). The campaign itself runs fine.  "
+                           f"{MPL_HINT.strip()}").pack(anchor="w")
         if tvc_sim.HAVE_NUMBA:
             txt, col = ("numba active - the flight kernel is compiled (~14 ms per "
                         "flight; the first call spends a few seconds compiling)", "#0a5")
@@ -812,15 +833,16 @@ class App:
             # A campaign is minutes of flying. A plotting failure must not throw it
             # away, so the figures are drawn in their own try and the numbers are
             # delivered either way.
-            paths = []
+            paths, fig_err = [], None
             try:
                 paths = tvc_sim.make_figures(camp, self.vars["figdir"].get().strip()
                                              or "figures")
-            except Exception:                          # noqa: BLE001
+            except Exception as exc:                   # noqa: BLE001
                 import traceback
+                fig_err = f"{type(exc).__name__}: {exc}"
                 self.put("tlog", "FIGURES FAILED (the campaign itself is fine):\n"
                                  + traceback.format_exc())
-            self.put("tdone", (camp, paths))
+            self.put("tdone", (camp, paths, fig_err))
         except Cancelled:
             self.put("tcancelled", None)
         except Exception as exc:                      # noqa: BLE001
@@ -854,7 +876,7 @@ class App:
                              f"{'LANDED' if out[0] > 0.5 else 'FAILED'} at "
                              f"{out[1]:.2f} m/s down / {out[2]:.2f} m/s across")
 
-    def tvc_finish(self, camp, paths):
+    def tvc_finish(self, camp, paths, fig_err=None):
         s = tvc_sim.summarise(camp)
         self.tvc_summary.set(f"Success {s['success']:.1f} %   "
                              f"({camp['out'][:, :, :, 0].size} flights in "
@@ -880,8 +902,14 @@ class App:
             for p in paths:
                 self.tvc_log.insert("end", f"  {p}\n")
         else:
-            self.tvc_log.insert("end", "\nno figures were written - see the error "
-                                       "above; the numbers here are unaffected\n")
+            # Repeat the reason HERE. The traceback is printed the moment it happens,
+            # which by now is a full report further up the log - "see the error above"
+            # is useless advice when "above" is two screens away.
+            self.tvc_log.insert("end", f"\nNO FIGURES WERE WRITTEN - the numbers "
+                                       f"above are unaffected.\n  reason: "
+                                       f"{fig_err or 'unknown'}\n")
+            if fig_err and "matplotlib" in fig_err:
+                self.tvc_log.insert("end", MPL_HINT)
         self.tvc_log.see("end")
 
     # ------------------------------------------------------------------ #

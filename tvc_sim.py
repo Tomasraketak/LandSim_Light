@@ -820,7 +820,7 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
 # uncontrolled roll - happens inside this loop at DT_PHYS.
 # ======================================================================
 @njit(cache=True)
-def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
+def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fin,
         roll_gain, sched_tvc, sched_fin,
         n_boost, use_boost_rule, roll_max, ign_delay_max, delay_pad,
         thr_scatter, thr_tau, gyro_ff,
@@ -875,7 +875,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
     if h_cmd_in > 0.0:
         h_cmd = h_cmd_in
     else:
-        h_cmd, _, _ = find_ignition(h_start, vx0, vz0, cd, cd_free, area,
+        h_cmd, _, _ = find_ignition(h_start, vx0, vz0, cd_burn, cd_free, area,
                                     k_min, k_max, mass0, delay_pad, boost_ready,
                                     mt, mf, mc, prop_mass, i_total,
                                     bt, bf_ax, bb, b_prop)
@@ -972,7 +972,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
         if step % PLAN_DIV == 0 and t_ign_cmd >= 0.0 and h > 0.05:
             tb_p = tb if tb >= 0.0 else 0.0
             k_level, resid = solve_plan(h, vz, tb_p, dry,
-                                        mt, mf, mc, prop_mass, i_total, cd, area,
+                                        mt, mf, mc, prop_mass, i_total, cd_burn, area,
                                         k_min, k_max, bt, bf_ax, bb, b_prop,
                                         b_t_ign, 0.02, PLAN_TARGET_VZ)
             # ---- the booster rule ----
@@ -1632,6 +1632,18 @@ class TvcConfig:
         return ((n, f.area, f.arm, f.roll_arm, f.cl_alpha, f.aspect,
                  f.max_deflect, f.rate, mode, drift), cd_free)
 
+    @property
+    def cd_burn(self) -> float:
+        """Drag coefficient the PLANNER should use during the burn.
+
+        The fins are still out there at zero deflection while the motor runs, and
+        their parasitic drag is ~10 % of the body's. Leaving it out of the projection
+        makes the planner pessimistic by a few tenths of a m/s - measured against the
+        plant, which is the direction one wants to be wrong in, but it is free to be
+        right instead."""
+        f = self.fin_set()
+        return self.cd + (f.cd_extra(0.0) if f.enabled else 0.0)
+
 
 def plan_ignition(cfg: TvcConfig, h0: float, vx0: float) -> float:
     """The commanded ignition altitude for one entry state (seed independent)."""
@@ -1641,7 +1653,7 @@ def plan_ignition(cfg: TvcConfig, h0: float, vx0: float) -> float:
     mass0 = cfg.gross_mass + cfg.n_boosters * b.total_mass
     ready = 1.0 if (cfg.n_boosters > 0 and cfg.use_booster_rule) else 0.0
     _, cd_free = cfg.fin_args()
-    h_cmd, _, _ = find_ignition(float(h0), float(vx0), float(cfg.vz0), cfg.cd,
+    h_cmd, _, _ = find_ignition(float(h0), float(vx0), float(cfg.vz0), cfg.cd_burn,
                                 cd_free, cfg.area, cfg.k_min, cfg.k_max, mass0,
                                 cfg.delay_pad, ready, mt, mf, mc,
                                 m.propellant_mass, m.total_impulse,
@@ -1659,7 +1671,7 @@ def fly_one(cfg: TvcConfig, seed: int, h0: float, vx0: float, n_tel: int = 0,
     tel = np.zeros((max(n_tel, 1), 15))
     fa, cd_free = cfg.fin_args()
     out, n = fly(seed, float(h0), float(vx0), float(cfg.vz0),
-                 cfg.gross_mass, cfg.cd, cfg.wn, cfg.zeta,
+                 cfg.gross_mass, cfg.cd, cfg.cd_burn, cfg.wn, cfg.zeta,
                  cfg.wn_fin, cfg.zeta_fin, cfg.roll_gain,
                  cfg.sched_tvc, cfg.sched_fin,
                  float(cfg.n_boosters), 1.0 if cfg.use_booster_rule else 0.0,
@@ -1697,6 +1709,14 @@ def run_campaign(cfg: TvcConfig, on_progress=None, should_stop=None,
     h_grid, vx_grid = cfg.entry_grid()
     fa, cd_free = cfg.fin_args()
     veh = cfg.vehicle()
+    # Common random numbers ACROSS CONFIGURATIONS, independent BETWEEN CELLS.
+    #
+    # Using one seed list for every cell (which is what this did) makes each cell see
+    # the identical igniter delays, so neighbouring release altitudes fail on the same
+    # draws and the by-altitude curve wanders by ten points on 40 flights - it looks
+    # like physics and it is sampling. Offsetting the seeds per cell keeps the
+    # comparison between two CONFIGURATIONS exact (a given cell and run index always
+    # gets the same seed) while making the cells independent of each other.
     seeds = cfg.seed0 + np.arange(cfg.runs)
     res = np.zeros((len(h_grid), len(vx_grid), cfg.runs, N_OUT))
     tel = np.zeros((1, 15))
@@ -1706,9 +1726,11 @@ def run_campaign(cfg: TvcConfig, on_progress=None, should_stop=None,
         for j, vx0 in enumerate(vx_grid):
             h_cmd = (float(h_cmd_grid[i, j]) if h_cmd_grid is not None
                      else plan_ignition(cfg, float(h0), float(vx0)))
+            cell_offset = 7919 * (i * len(vx_grid) + j)
             for r, sd in enumerate(seeds):
-                out, _ = fly(int(sd), float(h0), float(vx0), float(cfg.vz0),
-                             cfg.gross_mass, cfg.cd, cfg.wn, cfg.zeta,
+                out, _ = fly(int(sd) + cell_offset,
+                             float(h0), float(vx0), float(cfg.vz0),
+                             cfg.gross_mass, cfg.cd, cfg.cd_burn, cfg.wn, cfg.zeta,
                              cfg.wn_fin, cfg.zeta_fin, cfg.roll_gain,
                              cfg.sched_tvc, cfg.sched_fin,
                              float(cfg.n_boosters),
@@ -1733,6 +1755,21 @@ def run_campaign(cfg: TvcConfig, on_progress=None, should_stop=None,
                 raise landsim.Cancelled()
     return {"h_grid": h_grid, "vx_grid": vx_grid, "seeds": seeds, "out": res,
             "cfg": cfg}
+
+
+def wilson(k, n, z=1.96):
+    """95 % confidence interval on a success rate, in percent.
+
+    A rate measured on a few dozen flights is worth about +/-7 points, which is
+    exactly the size of the "trend" a reader will otherwise try to explain.
+    """
+    if n <= 0:
+        return 0.0, 0.0
+    p = k / n
+    d = 1.0 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return max(0.0, (c - h)) * 100.0, min(1.0, (c + h)) * 100.0
 
 
 def summarise(camp):
@@ -2283,7 +2320,10 @@ def print_report(camp):
     print(f"  flights           : {camp['out'].shape[0] * camp['out'].shape[1]} cells"
           f" x {cfg.runs} = {camp['out'][:, :, :, 0].size}")
     print()
-    print(f"  SUCCESS (all five gates)   : {s['success']:5.1f} %")
+    n_all = camp["out"][:, :, :, 0].size
+    lo, hi = wilson(s["success"] / 100.0 * n_all, n_all)
+    print(f"  SUCCESS (all five gates)   : {s['success']:5.1f} %"
+          f"   [95 % interval {lo:.1f} - {hi:.1f} on {n_all} flights]")
     print(f"    |v_z| < {GATE_VZ} m/s              : {s['gate_vz']:5.1f} %"
           f"   p95 {s['p95_vz']:6.2f} m/s")
     print(f"    |v_h| < {GATE_VH} m/s           : {s['gate_vh']:5.1f} %"
@@ -2308,12 +2348,17 @@ def print_report(camp):
     print(f"  dV spent on steering       : {s['dv_tilt']:5.2f} m/s "
           f"(clamp waste {s['dv_clamp']:5.1f} m/s)")
     print()
-    print("  success [%] by release altitude:")
+    n_h = camp["out"].shape[1] * camp["out"].shape[2]
+    n_v = camp["out"].shape[0] * camp["out"].shape[2]
+    print(f"  success [%] by release altitude   (95 % interval, {n_h} flights each)")
+    print("     - a wiggle inside these brackets is sampling, not physics:")
     for h, v in zip(camp["h_grid"], s["by_h"]):
-        print(f"    {h:6.1f} m : {v:5.1f}")
-    print("  success [%] by horizontal entry speed:")
+        lo, hi = wilson(v / 100.0 * n_h, n_h)
+        print(f"    {h:6.1f} m : {v:5.1f}   [{lo:5.1f} - {hi:5.1f}]")
+    print(f"  success [%] by horizontal entry speed   ({n_v} flights each)")
     for vx, v in zip(camp["vx_grid"], s["by_vx"]):
-        print(f"    {vx:+5.1f} m/s : {v:5.1f}")
+        lo, hi = wilson(v / 100.0 * n_v, n_v)
+        print(f"    {vx:+5.1f} m/s : {v:5.1f}   [{lo:5.1f} - {hi:5.1f}]")
 
 
 def verify():
@@ -2363,8 +2408,59 @@ def verify():
     print(f"  fin airbrake   : free-fall Cd {cfg_f.fin_args()[1]:.3f} against "
           f"{cfg_f.cd:.3f} bare, i.e. "
           f"{cfg_f.fin_args()[1] / cfg_f.cd:.2f}x the drag")
+
     ok = (worst_basis < 1e-9 and worst_inv < 1e-9 and worst_roll < 0.5
           and np.mean(rolls_out) < 5.0)
+
+    # ---- the guidance law must tilt the thrust AGAINST the drift ----
+    # A sign error here still lands the vehicle (the vertical channel is unaffected)
+    # and only shows up as drift that never dies, so it is worth an explicit check.
+    cfgv = TvcConfig()
+    ux, uy, uz, _tg = guidance_dir(40.0, 6.0, 0.0, -40.0, cfgv.gross_mass, cfgv.cd,
+                                   0.0, 0.0, cfgv.area)
+    sign_ok = ux < 0.0 and uz > 0.9
+    print(f"  guidance with +6 m/s of drift      : thrust direction "
+          f"({ux:+.3f}, {uy:+.3f}, {uz:+.3f}) - horizontal component must be "
+          f"NEGATIVE: {'ok' if sign_ok else 'WRONG SIGN'}")
+
+    # ---- the fins alone must regulate attitude with the motor unlit ----
+    # Everything in the burn is dominated by the nozzle, so a broken fin sign would
+    # hide there. In the free fall the fins are the only actuator there is.
+    cfgf = TvcConfig(roll_max=60.0, ign_delay_max=0.0, fins=True)
+    _o, telf = fly_one(cfgf, 5, 150.0, 7.0, n_tel=4000)
+    early = telf[(telf[:, 0] > 1.0) & (telf[:, 0] < 2.5)]
+    late = telf[(telf[:, 6] < 0.5) & (telf[:, 0] > 3.5)]
+    fin_ok = len(late) > 0 and np.abs(late[:, 5]).mean() < np.abs(early[:, 5]).mean()
+    print(f"  fins alone, motor unlit            : tilt {np.abs(early[:, 5]).mean():.1f}"
+          f" deg early -> {np.abs(late[:, 5]).mean() if len(late) else float('nan'):.1f}"
+          f" deg at ignition: {'ok' if fin_ok else 'NOT CONVERGING'}")
+
+    # ---- the planner's model of the flight must match the flight ----
+    # This is the check that caught the terminal-law mismatch: if the projection
+    # believes a different vehicle, every ignition altitude it picks is wrong.
+    cfgp = TvcConfig(thrust_scatter=0.0, ign_delay_max=0.0, roll_max=0.0)
+    m2, b2 = cfgp.tables()
+    mt2, mf2, mc2 = motor_arrays(m2)
+    bt2, bf2, bb2 = booster_arrays(b2)
+    bf2 = bf2 * math.cos(math.radians(cfgp.booster_cant))
+    mass0 = cfgp.gross_mass + cfgp.n_boosters * b2.total_mass
+    _fa, cd_free = cfgp.fin_args()
+    gaps = []
+    for h0 in (140.0, 160.0, 180.0):
+        hc = plan_ignition(cfgp, h0, 0.0)
+        o2, _t = fly_one(cfgp, 1, h0, 0.0, h_cmd=hc)
+        _vx, vi, _t2 = freefall_to(h0, o2[6], 0.0, 0.0, cd_free, cfgp.area, mass0,
+                                   0.005)
+        proj = project_rh(o2[6], vi, 0.0, mass0 - m2.propellant_mass,
+                          mt2, mf2, mc2, m2.propellant_mass, m2.total_impulse,
+                          cfgp.cd_burn, cfgp.area, cfgp.k_min, cfgp.k_max,
+                          bt2, bf2, bb2, b2.propellant_mass, 0.0, PLAN_TARGET_VZ)
+        gaps.append(abs(proj + o2[1]))
+    plan_ok = max(gaps) < 1.0
+    print(f"  planner vs plant, no dispersions   : worst touchdown-speed gap "
+          f"{max(gaps):.2f} m/s: {'ok' if plan_ok else 'MODELS DISAGREE'}")
+
+    ok = ok and sign_ok and fin_ok and plan_ok
     print(f"  -> {'OK' if ok else 'FAILED'}")
     return ok
 
@@ -2539,6 +2635,13 @@ def main():
             print("\n  FIGURES FAILED - the campaign itself is fine.")
             traceback.print_exc()
             print(f"\n  {type(exc).__name__}: {exc}")
+            if "matplotlib" in f"{exc}":
+                print("\n  'No module named matplotlib.backends.registry' means a "
+                      "HALF-UPGRADED matplotlib -\n  new .py files over an old "
+                      "install. Clean it out and reinstall:\n"
+                      "      pip uninstall -y matplotlib   (twice - old copies hide "
+                      "behind each other)\n"
+                      "      pip install --no-cache-dir matplotlib")
             if args.save:
                 print(f"  the results are saved; redraw them later with:\n"
                       f"    python3 tvc_sim.py --load {args.save}")

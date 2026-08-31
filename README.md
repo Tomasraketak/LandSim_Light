@@ -259,6 +259,61 @@ touchdown rate drops by a factor of six, and the burn gives away a third as much
 thrust to steering. Success once again equals the |vz| gate exactly: the controller is
 no longer part of the problem.
 
+### Reading the numbers: a 40-flight cell is worth +/-14 points
+
+The by-altitude table used to wander - 160 m worse than 180 m, and so on - which
+looks like physics and is not. Two things were wrong with how it was measured, and
+both are now fixed:
+
+* **Every cell flew the same seed list.** Common random numbers are right for
+  comparing two *configurations*, but using one list for every *cell* means
+  neighbouring release altitudes fail on the identical igniter draws, so the whole
+  curve moves together and wanders. Seeds are now offset per cell: a given cell and
+  run index still gets the same seed in every configuration (the comparison stays
+  exact) while the cells are independent of each other.
+* **No confidence intervals.** 28 successes out of 40 is 70 %, and its 95 % interval
+  is **[55 %, 82 %]**. The report now prints the interval next to every rate, with a
+  line saying in as many words that a wiggle inside the brackets is sampling.
+
+Measured properly, the trend is exactly what it should be. Same vehicle, vx = 0,
+1000 flights per altitude instead of 40:
+
+| release | 140 | 150 | 160 | 170 | 180 |
+|---|---|---|---|---|---|
+| success, **40 flights** | 52.5 | 75.0 | 65.0 | 60.0 | 60.0 |
+| success, **1000 flights** | 66.5 | 72.8 | 69.3 | 66.0 | **63.4** |
+| mean touchdown speed | 2.53 | 2.72 | 2.95 | 3.13 | **3.40 m/s** |
+
+Monotone from 150 m up, and the mean touchdown speed rises monotonically the whole
+way: a higher release means more speed at the ignition altitude and less margin. The
+"180 m beats 160 m" was a 40-flight artefact.
+
+(The dip at 140 m is real and is the other end of the same trade: from that low a
+release the vehicle arrives slowly enough that it over-brakes and floats, and the
+plan has to spoil a lot of a grain it cannot save.)
+
+### Things that were checked and turned out NOT to be the problem
+
+Written down because a negative result is worth as much as a positive one:
+
+* **Planner vs plant.** With every dispersion off, the clamp planner predicts a
+  touchdown of -1.9 m/s and the plant delivers -1.2 to -1.9 m/s. The models agree to
+  under a metre per second, and the residual is in the safe direction. This check is
+  now part of `--verify`, because the one time they *did* disagree it cost 18 points.
+* **D9 timing.** The pre-flight ignition search assumes the booster is lit at thrust
+  onset; in flight the rule lights it, on this vehicle, within 0.05 s of onset in
+  every flight. No inconsistency.
+* **A planning margin on the thrust scatter.** The failures are "lit too low for a
+  motor that then came in 15 % weak", so sizing the ignition altitude on a de-rated
+  motor should help. Measured on 1500 flights per setting: nominal 61.5 %
+  [59.0-63.9], -5 % 62.9 % [60.4-65.3], -10 % 63.4 % [60.9-65.8]. The intervals
+  overlap; the effect is one to two points at most and it is **not** shipped as a
+  default on that evidence.
+* **Guidance sign and fin-only attitude control**, both now asserted in `--verify`:
+  with +6 m/s of drift the commanded thrust direction is (-0.098, 0, +0.995) - tilted
+  *against* the drift - and with the motor unlit the fins alone take the weathercock
+  transient from 34 deg down to 4 deg by ignition.
+
 ### Why isn't the |vh| gate 100 %? It is.
 
 89.7 % looked like a horizontal-control limit. It is not - it is the vertical failures
@@ -352,17 +407,25 @@ go sideways. Both `--booster-cant` and `--booster-azimuth` are settable.
 
 | | |
 |---|---|
-| success, all five gates | **71.9 %** |
-| \|vz\| < 3 m/s | 71.9 % (p95 10.1 m/s) |
-| \|vh\| < 0.75 m/s | 93.6 % (p95 0.83 m/s) |
-| tilt < 10 deg | 100.0 % (p95 5.4 deg) |
-| transverse rate < 60 deg/s | 100.0 % (p95 10.3 deg/s) |
+| success, all five gates | **74.1 %**  [95 % interval 72.9 - 75.2] |
+| \|vz\| < 3 m/s | 74.1 % (p95 9.9 m/s) |
+| \|vh\| < 0.75 m/s | 94.6 % (p95 0.77 m/s) |
+| tilt < 10 deg | 100.0 % (p95 5.3 deg) |
+| transverse rate < 60 deg/s | 100.0 % (p95 10.2 deg/s) |
 | D9 lit | 100 % of flights |
-| burnout before touchdown | 0.5 % |
-| dV spent on steering | 0.14 m/s (clamp waste 16.1 m/s) |
+| burnout before touchdown | 0.9 % |
+| dV spent on steering | 0.14 m/s (clamp waste 16.7 m/s) |
 
-Over the 3882 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
-**100.0 %** (p95 \|vh\| 0.21 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
+Over the 3999 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
+**100.0 %** (p95 \|vh\| 0.31 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
+
+Success by release altitude, with its 95 % interval on 600 flights each - monotone, as
+it should be, and the trend is only two intervals wide across the whole range:
+
+| release [m] | 140 | 150 | 160 | 170 | 180 |
+|---|---|---|---|---|---|
+| success [%] | 75.8 | **77.7** | 73.5 | 71.0 | **71.5** |
+| 95 % interval | 72-79 | 74-81 | 70-77 | 67-75 | 68-75 |
 
 > **Mass.** These are for the current default vehicle, **2.85 kg gross**. The tables
 > further down that compare configurations (fins on/off, brake modes, the D9 cant, the
@@ -886,6 +949,22 @@ The 1-D modes need no numba: their optimiser simulates the whole population at o
 numpy arrays.
 
 `matplotlib` is needed for the figures. Everything is in `requirements.txt`.
+
+**If the figures fail with `No module named matplotlib.backends.registry`** the
+matplotlib install is half-upgraded - new `.py` files over an old install. Clean it
+out rather than reinstalling over the top:
+
+```
+pip uninstall -y matplotlib
+pip uninstall -y matplotlib          # twice: old copies hide behind each other
+pip install --no-cache-dir matplotlib
+```
+
+A figure failure never costs a campaign: the numbers are printed either way, the exact
+reason is repeated at the point of failure (not only in the traceback further up), and
+`--save results.npz` lets the pictures be redrawn later with `--load results.npz`. The
+GUI also checks matplotlib at start-up and says so on the page rather than at the end
+of a fifteen-minute run.
 
 ---
 
