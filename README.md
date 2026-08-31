@@ -352,15 +352,24 @@ go sideways. Both `--booster-cant` and `--booster-azimuth` are settable.
 
 | | |
 |---|---|
-| success, all five gates | **63.3 %** |
-| \|vz\| < 3 m/s | 63.3 % (p95 11.4 m/s) |
-| \|vh\| < 0.75 m/s | 89.9 % (p95 1.01 m/s) |
+| success, all five gates | **71.9 %** |
+| \|vz\| < 3 m/s | 71.9 % (p95 10.1 m/s) |
+| \|vh\| < 0.75 m/s | 93.6 % (p95 0.83 m/s) |
 | tilt < 10 deg | 100.0 % (p95 5.4 deg) |
-| transverse rate < 60 deg/s | 100.0 % (p95 10.9 deg/s) |
+| transverse rate < 60 deg/s | 100.0 % (p95 10.3 deg/s) |
 | D9 lit | 100 % of flights |
+| burnout before touchdown | 0.5 % |
+| dV spent on steering | 0.14 m/s (clamp waste 16.1 m/s) |
 
-Over the 3418 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
-**100.0 %** (p95 \|vh\| 0.33 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
+Over the 3882 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
+**100.0 %** (p95 \|vh\| 0.21 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
+
+> **Mass.** These are for the current default vehicle, **2.85 kg gross**. The tables
+> further down that compare configurations (fins on/off, brake modes, the D9 cant, the
+> gain fit) were measured at the previous 3.2 kg default; their *comparisons* stand -
+> every row of each table flew the same vehicle - but their absolute percentages are
+> for the heavier rocket. Re-run any of them with one command if you need the numbers
+> for 2.85 kg.
 
 > The jump from 45 % came from a **plant/planner inconsistency**, not from tuning: the
 > projection assumed a terminal descent law that the plant was no longer flying, so the
@@ -892,17 +901,30 @@ Requires only `numpy`.
 
 ## GUI
 
+Three pages:
+
+* **Vehicle** - the rocket itself: motor, airframe, inertia and arms, both actuators,
+  the clamp range, the D9 mounting and the fins. Both simulations read this page, so
+  the vehicle is described once and the other two pages only describe the flight.
+* **1-D ignition window** - the scenario and the throttle-profile search.
+* **3-D / TVC Monte Carlo** - the entry grid, the dispersions, the controller gains and
+  the tuner, with a large simulation log: it prints the full run header (every vehicle
+  and controller number that went in), live progress with elapsed time and an ETA, and
+  the complete report at the end - the same text the command line prints.
+
+Figures land in a **timestamped folder per run** (`figures/run_<date>_<motor>_<n>flights/`)
+so campaigns do not overwrite each other, with a copy of the latest set refreshed at
+the top of `figures/`.
+
+
 ```
 python3 gui.py
 ```
 
-A minimal Tkinter window where you can edit the drop altitude, initial velocity,
-gross and propellant mass, diameter (or the reference area directly), Cd, air
-density, the soft-landing limit, the minimum throttle, the phase length, the
-integration step and the optimiser settings. It runs the search in a background
-thread (with a Stop button and a live progress log) and shows the two resulting
-ignition altitudes together with the speed at ignition and the touchdown speed,
-plus the throttle / thrust profile for each.
+Everything runs in a background thread with a Stop button and a live log. The 1-D page
+shows the two resulting ignition altitudes with the speed at ignition, the touchdown
+speed and the throttle / thrust profile for each; the 3-D page shows the gate table,
+the conditional gate table and the whole report.
 
 Tkinter ships with the standard Python installers on Windows and macOS; on Debian/
 Ubuntu install it with `sudo apt install python3-tk`.

@@ -94,7 +94,7 @@ MOTOR_TABLES = {
 MOTOR_TABLE = MOTOR_TABLE_LONG    # backwards-compatible default
 
 PROPELLANT_MASS = 0.277        # kg, consumed propellant
-GROSS_MASS = 3.2               # kg, lift-off / total mass incl. propellant
+GROSS_MASS = 2.85              # kg, lift-off / total mass incl. propellant
 DIAMETER = 0.105               # m
 CD = 0.35                      # [-]
 RHO = 1.225                    # kg/m3, sea-level air density

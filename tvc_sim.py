@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -1976,14 +1977,28 @@ def _style(ax, title=None, xlabel=None, ylabel=None):
         ax.set_ylabel(ylabel, color=INK2, fontsize=9)
 
 
-def make_figures(camp, outdir="figures", single=None):
-    """Write the campaign's figures. Returns the list of paths written."""
+def make_figures(camp, outdir="figures", single=None, subfolder=True, tag=""):
+    """Write the campaign's figures. Returns the list of paths written.
+
+    Each run gets its own timestamped folder under `outdir` so that campaigns do not
+    overwrite each other's pictures, and a copy of each figure is refreshed at the
+    top of `outdir` as the "latest" set (which is what the README shows).
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap
 
-    os.makedirs(outdir, exist_ok=True)
+    import shutil
+    root = outdir
+    os.makedirs(root, exist_ok=True)
+    if subfolder:
+        cfg0 = camp["cfg"]
+        name = (f"run_{time.strftime('%Y%m%d_%H%M%S')}_{cfg0.motor}"
+                f"_{camp['out'][:, :, :, 0].size}flights"
+                + (f"_{tag}" if tag else ""))
+        outdir = os.path.join(root, name)
+        os.makedirs(outdir, exist_ok=True)
     s = summarise(camp)
     cfg = camp["cfg"]
     h_grid, vx_grid = camp["h_grid"], camp["vx_grid"]
@@ -2187,6 +2202,14 @@ def make_figures(camp, outdir="figures", single=None):
     fig.savefig(p, facecolor=fig.get_facecolor())
     plt.close(fig)
     paths.append(p)
+
+    if subfolder:
+        # refresh the "latest" copies at the top of the figure directory
+        for p in paths:
+            try:
+                shutil.copyfile(p, os.path.join(root, os.path.basename(p)))
+            except OSError:
+                pass
     return paths
 
 
