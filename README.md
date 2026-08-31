@@ -104,6 +104,10 @@ Touchdown must pass all five gates: |vz| < 3 m/s, |vh| < 0.75 m/s, tilt < 10 deg
 transverse rate < 60 deg/s, and actually be on the ground. The rate gate reads the
 **transverse** rate only: roll is uncontrollable by design and does not tip the vehicle.
 
+> **Writing the flight computer?** Everything the vehicle decides, when it decides it
+> and with which numbers is written up plainly in
+> [The flight algorithm, step by step](#flight-algorithm).
+
 ## Guidance
 
 * ZEV-style commanded thrust **direction** with drag credit and an altitude-dependent
@@ -400,6 +404,441 @@ vehicle is short of margin.
 ![A single flight](figures/fig3_single_flight.png)
 ![Ignition and booster use](figures/fig4_ignition_and_booster.png)
 ![Which gate binds](figures/fig5_gates.png)
+
+<a name="flight-algorithm"></a>
+
+## The flight algorithm, step by step
+
+*This section is written to be turned into flight-computer code. It says what the
+vehicle decides, when it decides it, and with which numbers - the intuition first, the
+formula second. Everything here is what `tvc_sim.py` actually flies; the constants are
+its current values.*
+
+### 0. The shape of it
+
+The vehicle is released nose-down at 140-180 m, falls, lights a motor it cannot
+throttle down (only spoil), and has to arrive under 3 m/s. Four things are being
+decided continuously:
+
+| decision | how often | what sets it |
+|---|---|---|
+| **where to point** (thrust direction) | 200 Hz | how fast it is falling and drifting |
+| **nozzle angle** (2 servos) | 200 Hz | the gap between where it points and where it should |
+| **fin angles** (4 servos) | 200 Hz | whatever the nozzle cannot do + roll + airbrake |
+| **clamp setting** (how much thrust to spoil) | 10 Hz | a forward simulation of the rest of the flight |
+
+Two decisions are one-shot: **when to light the main motor** and **whether to light the
+D9**.
+
+Three loop rates. 200 Hz for anything with a servo on the end of it, 10 Hz for the
+clamp planner (it runs a forward simulation, so it is the expensive one), and the state
+estimator as fast as the sensors allow. The simulation integrates its physics at 1 kHz;
+that number is a simulation detail, not a firmware requirement.
+
+### 1. What the flight computer has to know
+
+| symbol | meaning | where it comes from |
+|---|---|---|
+| `h` | altitude above the pad [m] | fused baro + LiDAR |
+| `v = (vx, vy, vz)` | velocity in world axes [m/s], `vz` negative while falling | fused |
+| `b` | unit vector along the thrust axis (points **up** out of the vehicle) | attitude estimate |
+| `g_ref` | a second unit vector, fixed in the airframe, perpendicular to `b` | attitude estimate |
+| `omega` | angular rate vector [rad/s] | gyro |
+| `m` | current mass [kg] | start mass minus burnt propellant (from the motor table) |
+| `T` | current real thrust [N] | motor table x clamp setting |
+| `t_burn` | seconds since thrust onset | detected by the accelerometer |
+
+**Why two attitude vectors and no Euler angles.** `b` alone says which way the vehicle
+points but not which way round it is - and the four fins and two gimbal servos are
+bolted to the airframe, so when it rolls, their axes roll with it. `g_ref` marks that
+roll orientation. From the two of them:
+
+```
+u1 = normalise(g_ref - (g_ref . b) b)      // first servo/fin axis
+u2 = b x u1                                 // second, perpendicular to both
+```
+
+`u1, u2` is the plane the nozzle deflects in and the plane the fins live in. A
+quaternion or rotation matrix gives you all of this: `b` is one column, `g_ref` another.
+No angle in the whole controller ever wraps, and there is no gimbal lock anywhere.
+
+### 2. Phases
+
+```
+   RELEASE  ──►  FREE FALL  ──►  APPROACH  ──►  IGNITION  ──►  BURN  ──►  TERMINAL  ──► DOWN
+                 fins = airbrake   + attitude   command sent   clamp planner  h < 3 m
+                 + roll damper     loop wakes   (thrust comes  runs at 10 Hz  and slow
+                 only              at h_cmd+40m  0-300 ms later)
+```
+
+**FREE FALL** - the airframe is stable and points itself into the airflow. The
+controller does **not** fight that: holding it dead vertical costs large fin
+deflections, and four fins deflected hard and unequally make a roll torque (measured:
+340 deg/s of spin before the motor was even lit). So in this phase the fins only
+(a) splay as airbrakes and (b) damp roll. The nozzle is parked at zero - with no
+thrust behind it, it makes no torque anyway.
+
+**APPROACH** - 40 m above the commanded ignition altitude the attitude loop wakes up,
+which gives it a couple of seconds to settle before it matters.
+
+**IGNITION** - at `h <= h_cmd` the igniter fires. Thrust arrives 0-300 ms later; that
+uncertainty is the single biggest thing this vehicle has to live with. The airbrake
+stows so the full fin travel belongs to the controller.
+
+**BURN** - the clamp planner takes over. The D9 rule is armed.
+
+**TERMINAL** - the last few metres, under a narrow condition (below).
+
+### 3. When to light the main motor
+
+**This is computed on the ground, not in flight.** The search below is far too heavy
+for 10 Hz, and it does not need to run in flight: it depends only on the release
+altitude and the entry drift, both known before the flight. Compute a small table on a
+PC - release altitude x horizontal speed -> `h_cmd` - and store it in the firmware.
+
+Three numbers decide it:
+
+1. **`h_min`, the floor.** The lowest altitude from which the vehicle can still stop at
+   all. Found by simulating the landing from a range of altitudes and taking the lowest
+   one that arrives softer than 2.3 m/s.
+2. **The igniter pad.** Between "fire the igniter" and "thrust appears" the vehicle
+   falls. Sized on the **worst case** delay, not the average, because the asymmetry is
+   brutal: igniting too high is recoverable (throttle down), igniting too low is not
+   recoverable at all.
+   ```
+   pad = |vz at h_min| * t_delay_max  +  0.5 * 9.81 * t_delay_max^2
+   ```
+   With `t_delay_max = 0.30 s` and ~44 m/s, that is about **13.5 m**.
+3. **`h_max`, the ceiling.** The grain burns for its fixed 2.6 s whatever the clamp
+   does, so igniting too high means burning out with altitude left and falling the rest
+   of the way. Found the same way as `h_min`, from above.
+
+```
+h_cmd = min(h_min + pad, h_max)
+```
+
+On this vehicle the usable band `h_max - h_min` is about 14 m and the igniter spread is
+13.5 m of it, so `h_cmd` usually lands on `h_max`. That is deliberate: when the spread
+is wider than the band, putting the command at the **top** and letting the spread hang
+down through it is what maximises the overlap. Anything lower throws away the
+short-delay flights as well as the long-delay ones.
+
+For the default vehicle the answer is **≈ 56 m** from a 150 m release, and a hand sweep
+of the commanded altitude confirms the optimum is 56-58 m.
+
+### 4. Where to point - the guidance law (200 Hz)
+
+The question "which way should the thrust point" is answered as a **direction vector**,
+never as two angles.
+
+```
+t_go   = clamp(2 * h / max(|vz|, 0.5), 0.25, inf)     // rough time left to the pad
+a_req  = ( -vx / t_go + bias_x ,  -vy / t_go + bias_y ,  |vz| / t_go + 9.81 )
+```
+
+`bias_x, bias_y` is a known horizontal input fed forward - on this vehicle the side
+force of the canted D9 once it is lit (section 9). It is where a wind-trim integrator
+would also go; this simulation models no wind, so its gain is zero.
+
+*In words:* `t_go` is how long the vehicle has left if it keeps decelerating at a
+constant rate - `2h/|vz|` is exactly that. `-v/t_go` is the acceleration that kills the
+current velocity in that time, and it is the minimum-effort answer for a
+"arrive with zero velocity, land wherever" problem. The vertical term adds gravity,
+which the thrust must carry before it does anything else.
+
+**Credit the drag.** The air is already decelerating the vehicle, so asking thrust for
+the whole job over-tilts and over-throttles:
+
+```
+drag = 0.5 * 1.225 * A * Cd * |v|^2
+a_req += drag * v / (|v| * m)          // component-wise, all three axes
+```
+
+**Limit the tilt.** Tilting away from vertical costs vertical thrust
+(`cos` of the tilt) - the one thing this vehicle cannot spare. So the horizontal part
+is clamped into a cone that is wide up high and tight near the pad:
+
+```
+tilt_max = clamp(1.5 [deg/m] * h + 4 [deg], 0, 20 [deg])
+if |a_req_horizontal| > tan(tilt_max) * a_req_vertical:  scale the horizontal part down
+u = normalise(a_req)                     // THE COMMANDED THRUST DIRECTION
+```
+
+### 5. Nozzle angle - the attitude loop (200 Hz)
+
+**Step 1 - how far off are we?** As a rotation vector, not an angle pair:
+
+```
+c     = b x u
+angle = asin(min(|c|, 1))
+if (b . u) < 0:  angle = pi - angle        // more than 90 deg off
+e     = c * (angle / |c|)                  // length = the angle, direction = the axis
+```
+
+`e` points along the axis you must turn about, and its length is the angle. No wrap, no
+gimbal lock, and because it is perpendicular to `b` by construction the loop can never
+ask for a roll the nozzle cannot make.
+
+**Step 2 - split off the roll.** The nozzle makes no torque about the body axis, so
+feeding the roll rate into the loop asks for the impossible:
+
+```
+w_roll = omega . b
+w_t    = omega - w_roll * b                // the part the nozzle can reach
+```
+
+**Step 3 - two nested proportional loops** (outer on angle, inner on rate), written
+with the two numbers that mean something physically - bandwidth and damping:
+
+```
+wn_eff = wn * clamp( (T / 100 N) ^ sched_tvc , 0.35, 2.0 )    // see "scheduling"
+k_th   = wn_eff / (2 * zeta)               // outer: angle -> rate command
+k_rate = 2 * zeta * wn_eff                 // inner: rate error -> angular acceleration
+alpha_req = k_rate * (k_th * e - w_t)
+tau_req   = I_t * alpha_req
+```
+
+**Step 4 - cancel what the air is already doing.** The fins and body make a
+weathercock torque; the controller knows it, so it subtracts it instead of discovering
+it through the error:
+
+```
+tau_req -= q * A * CN_alpha * L_cp * (b x a_hat)      // a_hat = -v/|v|,  q = 0.5*rho*|v|^2
+```
+
+**Step 5 - cancel the spin coupling.** A spinning body responds at 90 degrees to where
+it was pushed. For an axisymmetric body that cross term is exactly:
+
+```
+tau_req += (I_t - I_a) * w_roll * (b x w_t)
+```
+
+**Step 6 - dynamic inversion: torque -> nozzle angle.** This is the step that makes one
+gain set valid across the whole burn. The torque a deflection produces is proportional
+to thrust, and thrust runs from 120 N down to 12 N along the curve times a 0.1-1.0
+clamp - a 100:1 sweep in loop gain if you map controller output straight to a servo
+angle. Because the deflection vector `s` is perpendicular to `b`, the relation inverts
+**exactly**:
+
+```
+s = (b x tau_req) / (T * L_gimbal)        // T = REAL post-clamp thrust, floor it at 8 N
+servo1 = asin(clamp(s . u1, -0.999, 0.999)) * servo_ratio     // [deg]
+servo2 = asin(clamp(s . u2, -0.999, 0.999)) * servo_ratio
+```
+
+Then clamp to +/-10 deg, round to the 0.15 deg command step, and - **while the motor is
+unlit, command zero**: a gimbal with no thrust behind it only chatters.
+
+### 6. Fin angles (200 Hz)
+
+The fins do three jobs at once and the mixer keeps them separate:
+
+```
+delta_i = roll_term + A*cos(phi_i) + B*sin(phi_i) + crossflow_i  +  brake * (+1,-1,+1,-1)
+          \________________ control ___________________________/    \___ pure drag ___/
+```
+`phi_i = i * 90 deg` is where fin *i* sits around the body.
+
+**a) Steering - only what the nozzle could not do.** Compute the torque the nozzle will
+actually deliver with the command from step 6 above, and hand the fins the remainder:
+
+```
+tau_gimbal = -L_gimbal * T * (b x s_commanded)        // zero while the motor is unlit
+tau_fin    = tau_req - tau_gimbal
+k_t = 2 * fin_arm * q * S_fin * CL_alpha_fin          // torque per radian of deflection
+A = -(tau_fin . u1) / k_t         // NOTE THE MINUS: the fins are AFT of the CG, so for
+B = -(tau_fin . u2) / k_t         // the same force they make the opposite torque
+```
+
+**b) Roll - the only actuator that can.** Rate damping towards zero, deliberately slow:
+
+```
+tau_roll = I_a * roll_gain * (0 - w_roll)
+k_r = n_fins * roll_arm * q * S_fin * CL_alpha_fin
+roll_term = clamp(tau_roll / k_r, -2 deg, +2 deg)
+```
+Why so gentle: the roll inertia is only ~0.004 kg m2, so **one degree of fin is worth
+about 800 deg/s2**. A loop sized by how much authority there is, rather than by how
+little inertia there is, asks for more than a 333 deg/s actuator can track and the roll
+axis limit-cycles at hundreds of deg/s.
+
+**c) Cancel each fin's own crossflow.** An all-moving fin's *angle of attack* is its
+deflection **minus** the sideways airflow it already sees. Different fins see different
+crossflow, so equal deflections are not equal angles:
+
+```
+n_i = b x r_i                        // r_i = the fin's spanwise direction
+crossflow_i = degrees( (v . n_i) / max(-(v . b), 3 m/s) )
+```
+This is the same dynamic inversion the nozzle gets, done in the fin's own variable.
+Without it the fins fight their own weathercock moment through the loop and end up in a
+limit cycle with the gimbal.
+
+**d) Airbrake.** Splayed alternately (+,-,+,-) the four fins cancel each other's lift
+and roll torque and leave pure drag - **1.66x the vehicle's bare drag**, deployed for
+the whole free fall, stowed at ignition. Two rules matter:
+
+* **control first, brake with what is left**, and
+* **the brake magnitude is the same on all four fins** - take the tightest fin's
+  remaining travel and give that much to all of them.
+
+That second rule is not cosmetic. Squeezing each fin into whatever travel it happens to
+have left makes their angles unequal again, and unequal angles on a splayed brake is a
+roll torque: measured, 0.02 N m at 2 degrees of sideslip and 0.65 N m at 30. Equalised,
+the residual is 0.005 N m.
+
+**e) Two authority gates.** Below **8 m/s** of airspeed the fins do nothing for control
+(the `1/q` in `k_t` runs away and every channel saturates on a demand it cannot meet),
+and above `h_cmd + 40 m` the attitude channels stay off entirely (phase FREE FALL).
+The roll damper and the airbrake run the whole way down.
+
+**f) Actuator.** +/-15 deg, 90 ms end stop to end stop = **333 deg/s**, rate-limited.
+
+### 7. Scheduling: aggressiveness follows authority
+
+Both actuators are already dynamically inverted, so the loop gain is nominally
+independent of throttle and airspeed. What inversion cannot undo is the **authority
+limit**: at 12 N of clamped thrust the nozzle can make one tenth of the torque it makes
+at 120 N, and a loop demanding the same bandwidth simply saturates. So:
+
+```
+motor lit:    wn_eff = wn_tvc * clamp( (T_real / 100 N)  ^ sched_tvc, 0.35, 2.0 )
+motor unlit:  wn_eff = wn_fin * clamp( (q / 700 Pa)      ^ sched_fin, 0.35, 2.0 )
+```
+
+The exponents were **fitted, not guessed** (see *Fitting the gains*), and they came out
+clearly non-zero: `sched_tvc = +0.60`, `sched_fin = +0.47`. Gentle when the actuator is
+weak, aggressive when it is strong.
+
+### 8. How much thrust to spoil - the clamp planner (10 Hz)
+
+**The plan is one number**: *the constant clamp level which, applied from now on, puts
+me on the pad at 0.5 m/s.* Re-solved ten times a second, that one number is adaptive -
+it comes down through the burn exactly as much as the flight so far turned out to need.
+
+**The forward simulation.** One dimension, vertical only, from the current `h, vz` and
+the current point on the motor curve to the ground, in ~20 ms steps:
+
+```
+loop until h <= 0:
+    T_nom = motor_table(t)                        // the tabulated curve
+    m     = dry + propellant_left(t)              // the clamp does NOT slow the grain
+    k     = (t - t_plan < 0.30 s) ? k_candidate : k_max      // <-- see below
+    if terminal_gate(h, vz, T_nom, m):  k = terminal_law(h, vz, m, T_nom)
+    thrust = T_nom * k  (+ D9 if lit)
+    a  = (thrust - 0.5*rho*A*Cd*vz*|vz|) / m - 9.81
+    vz += a*dt ;  h += vz*dt ;  t += dt
+return vz                                         // the touchdown speed it predicts
+```
+
+Note the **`PLAN_HOLD = 0.30 s`**: the candidate level is held only for 0.3 s and the
+projection then assumes **full clamp** for the rest of the burn. That is what makes one
+knob enough. The honest question at any instant is *"how much do I waste right now,
+given that I can still use everything later"*; a family that assumed the level was held
+to burnout cannot express "coast now, brake later" and burns too much too early.
+
+**Solving it.** The predicted touchdown speed is **not monotone** in the clamp level -
+too little thrust crashes, enough lands, and **too much stops the vehicle in mid-air
+with a spent grain and drops it from there**. A plain bisection is therefore invalid; it
+happily converges onto the over-braking branch. Instead:
+
+1. scan 10 levels from `k_min` to `k_max`, evaluating the projection at each;
+2. take the **first** crossing from below and bisect inside that bracket (10 steps);
+3. if nothing reaches the target, ternary-search the **peak** and use that - the
+   gentlest arrival available.
+
+Taking the lowest level that meets the target is also the fuel-optimal choice and leaves
+the most room for the replan a tenth of a second later.
+
+**Cost:** about 20 projections x ~250 steps x ~15 flops = **under 100 kflop per solve**,
+ten times a second. An RP2350 with its FPU does that in a fraction of a millisecond.
+
+**The terminal law** - the last few metres, and a *narrow* gate:
+
+```
+gate:  h < 3 m  AND  vz > -3 m/s  AND  T_nom > 1.6 * m * 9.81
+vz_ref = -clamp( sqrt(2 * 8.0 * h), 0.8, 2.5 )        // slow down as the pad approaches
+a_cmd  = min( 9.81 + 3.0 * (vz_ref - vz), 70 )
+k      = clamp( m * a_cmd / T_nom, k_min, k_max )
+```
+
+The gate is the important part. A terminal law that engages on altitude alone takes over
+while the vehicle is still doing 15 m/s and flies it into the ground with propellant
+left; one that engages when the motor can no longer support the profile eases to 1 m/s
+at 3 m, burns out up there and drops the rest. **Both failures were measured in this
+simulation.** And the plant must fly exactly the law the projection assumes - when they
+disagreed, burnout-before-touchdown was 30 % and success 45 %; making them the same law
+took those to 1 % and 63 %.
+
+### 9. When to light the D9
+
+The booster is a one-way door: it cannot be throttled, stopped or relit. So the rule is
+conservative and it is checked at every planner tick, once the ignition command has been
+sent:
+
+```
+if (D9 available) and (not yet lit) and (best achievable projected touchdown < -1.5 m/s):
+        light it
+```
+
+"Best achievable" is exactly the number the clamp solver already returns - the peak of
+its search. In other words: **light the D9 the moment the plan says the main motor
+cannot close this landing even at full thrust.** If that never happens, it is never
+lit. In the default campaign it is lit on 100 % of flights, which says more about how
+marginal the main motor is than about the rule.
+
+The D9 is canted 15 deg through the CG: it makes no torque, but 26 % of its thrust goes
+sideways and only 97 % of its impulse goes up. The flight computer knows it lit the
+booster and knows which way the airframe points, so that side force is fed forward into
+the guidance law as a known input rather than discovered later as a drift.
+
+### 10. Every number in one place
+
+| what | value | where |
+|---|---|---|
+| control loop | 200 Hz | all servo channels |
+| clamp planner | 10 Hz | forward simulation |
+| ignition delay assumed | 0.30 s worst case | ignition-altitude pad |
+| tilt cone | `1.5 deg/m * h + 4 deg`, capped 20 deg | guidance |
+| plan target touchdown | -0.5 m/s | clamp planner |
+| plan hold | 0.30 s, then full clamp | clamp planner |
+| terminal gate | `h<3 m`, `vz>-3 m/s`, `T>1.6*m*g` | terminal law |
+| terminal profile | `vz_ref = -clamp(sqrt(16*h), 0.8, 2.5)`, `Kp = 3.0`, cap 70 m/s2 | terminal law |
+| D9 trigger | projected touchdown worse than -1.5 m/s | booster rule |
+| TVC bandwidth / damping | **7.89 rad/s / 0.60**, schedule `(T/100N)^0.60` | fitted |
+| fin bandwidth / damping | **9.21 rad/s / 1.48**, schedule `(q/700Pa)^0.47` | fitted |
+| roll damper | **0.30 rad/s**, max 2 deg of fin | fitted |
+| nozzle | +/-5 deg (+/-10 deg servo, 2:1), 500 deg/s, 0.15 deg step | actuator |
+| fins | +/-15 deg, 90 ms end-to-end (333 deg/s) | actuator |
+| fin control cut-off | below 8 m/s airspeed | authority gate |
+| attitude loop wakes | 40 m above `h_cmd` | phase logic |
+| clamp | 0.10-1.00, 12.84 /s slew | actuator |
+
+The fitted gains live in `tvc_gains.json` and are re-fitted by `--tune`; if you change
+the vehicle, re-fit them before you trust them.
+
+### 11. Notes for the firmware
+
+* **Compute on the ground:** the ignition-altitude table (section 3) and the gain fit.
+  Store both as constants.
+* **Compute in flight:** the guidance direction, both attitude loops, the fin mixer
+  (all 200 Hz, all a few hundred flops) and the clamp planner (10 Hz, under 100 kflop).
+  Nothing here needs a matrix inversion, a trig table beyond `sin/cos/asin/atan2`, or
+  dynamic memory.
+* **Keep the motor curve as a lookup table** of thrust and cumulative impulse against
+  time; the mass at any instant is `dry + propellant * (1 - impulse_so_far/total)`.
+  The clamp does **not** slow the grain - that is the single most important property of
+  this propulsion system and it is what makes burn duration a hard deadline.
+* **Detect thrust onset from the accelerometer**, not from the igniter command. The
+  0-300 ms delay is the dominant uncertainty and everything downstream is timed from
+  the real onset.
+* **Sanity-clamp everything** that divides: `t_go`, `1/T`, `1/q`, the axial airspeed in
+  the crossflow term. Every one of them blows up somewhere in a real flight.
+* **What this simulation does NOT model**, and your firmware will meet: sensor noise and
+  fusion lag, wind and gusts, thrust axis misalignment, ground effect, and any failure
+  of the motor to follow its curve beyond the +/-15 % scatter. The reference project's
+  measurements say the derivative term is where noise hurts first - take rates from the
+  gyro, never by differentiating an attitude estimate.
 
 ## Running it
 
