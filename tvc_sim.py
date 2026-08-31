@@ -146,6 +146,16 @@ FIN_CTRL_LEAD = 40.0      # m above the commanded ignition altitude at which the
                           # settle before the motor lights, late enough that the long
                           # free fall is flown at trim
 
+# ---------------------------------------------------------------------------
+# The vehicle and its actuators are passed to the compiled kernels as ONE float
+# array rather than read from the constants above, so every number below is a
+# simulation input the GUI and the command line can change - the constants are only
+# the defaults. Indices into that array:
+(V_AREA, V_IT, V_IA, V_LGIMB, V_LCP, V_CNA,
+ V_SRV_MAX, V_SRV_RATIO, V_SRV_SPEED, V_SRV_ACCEL, V_SRV_QUANT,
+ V_THR_SPEED, V_THR_ACCEL, V_KMIN, V_KMAX) = range(15)
+N_VEH = 15
+
 # Rates
 DT_PHYS = 0.001           # plant step [s]
 CTRL_DIV = 5              # -> 200 Hz control
@@ -218,7 +228,7 @@ class Fins:
     def __init__(self, count=FIN_COUNT, root=FIN_ROOT, tip=FIN_TIP, span=FIN_SPAN,
                  arm=FIN_ARM, max_deflect=FIN_MAX_DEFLECT,
                  travel_time=FIN_TRAVEL_TIME, body_diameter=DIAMETER,
-                 enabled=True):
+                 body_area=AREA, enabled=True):
         self.count = int(count)
         self.enabled = bool(enabled) and self.count > 0
         self.area = 0.5 * (root + tip) * span              # m2, one fin
@@ -233,6 +243,7 @@ class Fins:
         self.cl_alpha = 2.0 * math.pi * ar / (2.0 + math.sqrt(ar * ar + 4.0))
         # spanwise centre of pressure -> the roll arm
         self.roll_arm = 0.5 * body_diameter + 0.4 * span
+        self.body_area = body_area
 
     def cd_extra(self, deflect_deg=0.0):
         """Fin drag expressed as an addition to the BODY drag coefficient, so the
@@ -240,7 +251,7 @@ class Fins:
         a = math.radians(min(abs(deflect_deg), FIN_ALPHA_STALL))
         cl = min(self.cl_alpha * a, FIN_CL_MAX)  # same cap as fin_cl
         cd = FIN_CD0 + cl * cl / (math.pi * self.aspect * 0.85)
-        return self.count * self.area * cd / AREA
+        return self.count * self.area * cd / self.body_area
 
     def describe(self):
         return (f"{self.count} fins, {self.area * 1e4:.1f} cm2 each, AR {self.aspect:.2f}, "
@@ -390,7 +401,7 @@ def clampf(v, lo, hi):
 
 
 @njit(cache=True, inline='always')
-def guidance_dir(h, vx, vy, vz, mass, cd, ax_bias, ay_bias):
+def guidance_dir(h, vx, vy, vz, mass, cd, ax_bias, ay_bias, area):
     """Commanded thrust direction as a unit vector, plus t_go.
 
     A direction rather than a pair of angles: the two horizontal channels enter
@@ -411,7 +422,7 @@ def guidance_dir(h, vx, vy, vz, mass, cd, ax_bias, ay_bias):
 
     v = math.sqrt(vx * vx + vy * vy + vz * vz)
     if v > 0.01:
-        df = 0.5 * RHO * AREA * cd * v * v
+        df = 0.5 * RHO * area * cd * v * v
         req_ax += df * vx / v / mass
         req_ay += df * vy / v / mass
         req_az += df * vz / v / mass
@@ -450,7 +461,7 @@ def gimbal_basis(bx, by, bz, gx, gy, gz):
 
 
 @njit(cache=True, inline='always')
-def terminal_throttle(h, vz, mass, thrust_avail):
+def terminal_throttle(h, vz, mass, thrust_avail, k_min, k_max):
     """Track vz_ref = -sqrt(2*a*h) for the last few metres.
 
     The caller only ever takes max(plan, terminal): a terminal law that REPLACES
@@ -463,8 +474,8 @@ def terminal_throttle(h, vz, mass, thrust_avail):
     if a_cmd > A_TERM_MAX:
         a_cmd = A_TERM_MAX
     if thrust_avail < 1.0:
-        return K_MIN
-    return clampf(mass * a_cmd / thrust_avail, K_MIN, K_MAX)
+        return k_min
+    return clampf(mass * a_cmd / thrust_avail, k_min, k_max)
 
 
 @njit(cache=True, inline='always')
@@ -488,7 +499,7 @@ PLAN_HOLD = 0.30          # s the planned level is held before the projection
 
 
 @njit(cache=True, inline='always')
-def k_from_plan(k_level, t_since_plan, h, vz, mass, thrust_avail):
+def k_from_plan(k_level, t_since_plan, h, vz, mass, thrust_avail, k_min, k_max):
     """The commanded clamp level.
 
     THE PLAN IS ONE NUMBER. The reference vehicle carries a four-segment throttle
@@ -514,9 +525,9 @@ def k_from_plan(k_level, t_since_plan, h, vz, mass, thrust_avail):
     problem is too much thrust, not too little.
     """
     if terminal_active(h, vz, thrust_avail, mass):
-        return terminal_throttle(h, vz, mass, thrust_avail)
+        return terminal_throttle(h, vz, mass, thrust_avail, k_min, k_max)
     if t_since_plan > PLAN_HOLD:
-        return K_MAX
+        return k_max
     return k_level
 
 
@@ -524,7 +535,7 @@ def k_from_plan(k_level, t_since_plan, h, vz, mass, thrust_avail):
 # --- PLANNER PROJECTION ----------------------------------------------
 @njit(cache=True)
 def project_vz(h0, vz0, t0, mass_extra, k_level,
-               mt, mf, mc, prop_mass, i_total, cd,
+               mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
                bt, bf, bb, b_prop, b_t_ign, dt):
     """Forward-integrate the vertical channel under a candidate plan.
 
@@ -538,7 +549,7 @@ def project_vz(h0, vz0, t0, mass_extra, k_level,
     """
     h, vz, t = h0, vz0, t0
     dry = mass_extra
-    kd = 0.5 * RHO * AREA * cd
+    kd = 0.5 * RHO * area * cd
     n = 0
     n_max = int(30.0 / dt)
     while h > 0.0 and n < n_max:
@@ -546,7 +557,7 @@ def project_vz(h0, vz0, t0, mass_extra, k_level,
         mass = dry + (prop_mass - main_burned(t, mt, mc, prop_mass, i_total))
         if b_t_ign < 1.0e5:
             mass -= boost_burned(t - b_t_ign, bt, bb, b_prop)
-        k = k_from_plan(k_level, t - t0, h, vz, mass, tn)
+        k = k_from_plan(k_level, t - t0, h, vz, mass, tn, k_min, k_max)
         thrust = tn * k
         if b_t_ign < 1.0e5:
             thrust += boost_thrust(t - b_t_ign, bt, bf)
@@ -560,8 +571,8 @@ def project_vz(h0, vz0, t0, mass_extra, k_level,
 
 
 @njit(cache=True)
-def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd,
-               bt, bf, bb, b_prop, b_t_ign, dt, target):
+def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area,
+               k_min, k_max, bt, bf, bb, b_prop, b_t_ign, dt, target):
     """Pick the clamp level whose projected touchdown speed reaches `target`.
 
     The outcome is NOT monotone in the level: too little thrust crashes, enough
@@ -577,23 +588,23 @@ def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd,
     reads to decide that the main motor alone cannot close this landing.
     """
     n_scan = 10
-    best_k = K_MIN
+    best_k = k_min
     best_f = -1.0e9
     prev_k = K_MIN
     prev_f = 0.0
     lo = -1.0
     hi = -1.0
     for i in range(n_scan):
-        k = K_MIN + (K_MAX - K_MIN) * i / (n_scan - 1)
+        k = k_min + (k_max - k_min) * i / (n_scan - 1)
         f = project_vz(h, vz, t, mass_extra, k,
-                       mt, mf, mc, prop_mass, i_total, cd,
+                       mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
                        bt, bf, bb, b_prop, b_t_ign, dt) - target
         if f > best_f:
             best_f = f
             best_k = k
         if f >= 0.0:
             if i == 0:
-                return K_MIN, f
+                return k_min, f
             lo, hi = prev_k, k
             break
         prev_k, prev_f = k, f
@@ -602,20 +613,20 @@ def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd,
         # the grid step, so refine the PEAK by ternary search instead of giving up:
         # f(k) rises to a maximum and falls again, and the maximum is both the best
         # achievable landing and the honest input to the booster rule.
-        a = best_k - (K_MAX - K_MIN) / (n_scan - 1)
-        c = best_k + (K_MAX - K_MIN) / (n_scan - 1)
-        if a < K_MIN:
-            a = K_MIN
-        if c > K_MAX:
-            c = K_MAX
+        a = best_k - (k_max - k_min) / (n_scan - 1)
+        c = best_k + (k_max - k_min) / (n_scan - 1)
+        if a < k_min:
+            a = k_min
+        if c > k_max:
+            c = k_max
         for _ in range(12):
             m1 = a + (c - a) / 3.0
             m2 = c - (c - a) / 3.0
             f1 = project_vz(h, vz, t, mass_extra, m1,
-                            mt, mf, mc, prop_mass, i_total, cd,
+                            mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
                             bt, bf, bb, b_prop, b_t_ign, dt) - target
             f2 = project_vz(h, vz, t, mass_extra, m2,
-                            mt, mf, mc, prop_mass, i_total, cd,
+                            mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
                             bt, bf, bb, b_prop, b_t_ign, dt) - target
             if f1 > best_f:
                 best_f, best_k = f1, m1
@@ -629,7 +640,7 @@ def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd,
     for _ in range(10):
         mid = 0.5 * (lo + hi)
         f = project_vz(h, vz, t, mass_extra, mid,
-                       mt, mf, mc, prop_mass, i_total, cd,
+                       mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
                        bt, bf, bb, b_prop, b_t_ign, dt) - target
         if f >= 0.0:
             hi = mid
@@ -639,8 +650,8 @@ def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd,
 
 
 @njit(cache=True)
-def project_rh(h0, vz0, t0, mass_extra, mt, mf, mc, prop_mass, i_total, cd,
-               bt, bf, bb, b_prop, b_t_ign, target):
+def project_rh(h0, vz0, t0, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area,
+               k_min, k_max, bt, bf, bb, b_prop, b_t_ign, target):
     """Projection that RE-SOLVES the clamp level as it goes - the pre-flight model
     of what the flight computer will actually do.
 
@@ -654,22 +665,23 @@ def project_rh(h0, vz0, t0, mass_extra, mt, mf, mc, prop_mass, i_total, cd,
     """
     dt = 0.01
     h, vz, t = h0, vz0, t0
-    kd = 0.5 * RHO * AREA * cd
-    k_level = K_MAX
+    kd = 0.5 * RHO * area * cd
+    k_level = k_max
     n = 0
     n_max = 4000
     since = 1.0e9
     while h > 0.0 and n < n_max:
         if since >= 0.1:
             k_level, _ = solve_plan(h, vz, t, mass_extra,
-                                    mt, mf, mc, prop_mass, i_total, cd,
-                                    bt, bf, bb, b_prop, b_t_ign, 0.03, target)
+                                    mt, mf, mc, prop_mass, i_total, cd, area,
+                                    k_min, k_max, bt, bf, bb, b_prop, b_t_ign,
+                                    0.03, target)
             since = 0.0
         tn = main_thrust(t, mt, mf)
         mass = mass_extra + (prop_mass - main_burned(t, mt, mc, prop_mass, i_total))
         if b_t_ign < 1.0e5:
             mass -= boost_burned(t - b_t_ign, bt, bb, b_prop)
-        k = k_from_plan(k_level, since, h, vz, mass, tn)
+        k = k_from_plan(k_level, since, h, vz, mass, tn, k_min, k_max)
         thrust = tn * k
         if b_t_ign < 1.0e5:
             thrust += boost_thrust(t - b_t_ign, bt, bf)
@@ -684,11 +696,11 @@ def project_rh(h0, vz0, t0, mass_extra, mt, mf, mc, prop_mass, i_total, cd,
 
 
 @njit(cache=True)
-def freefall_to(h_start, h_target, vx0, vz0, cd, mass, dt):
+def freefall_to(h_start, h_target, vx0, vz0, cd, area, mass, dt):
     """Coupled 2-D drag free fall - the horizontal speed enters the drag magnitude,
     so a decoupled 1-D propagation over-predicts vx at ignition."""
     h, vx, vz, t = h_start, vx0, vz0, 0.0
-    kd = 0.5 * RHO * AREA * cd / mass
+    kd = 0.5 * RHO * area * cd / mass
     while h > h_target and t < 30.0:
         v = math.sqrt(vx * vx + vz * vz)
         ax = -kd * v * vx
@@ -703,7 +715,8 @@ def freefall_to(h_start, h_target, vx0, vz0, cd, mass, dt):
 
 
 @njit(cache=True)
-def find_ignition(h_start, vx0, vz0, cd, cd_free, mass0, delay_pad, boost_ready,
+def find_ignition(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
+                  delay_pad, boost_ready,
                   mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop):
     """Commanded ignition altitude and the matching command time.
 
@@ -737,9 +750,9 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, mass0, delay_pad, boost_ready,
     step = (h_start - 5.0) / (n - 1)
     for i in range(n):
         hh = 5.0 + i * step
-        _, vzi, _ = freefall_to(h_start, hh, vx0, vz0, cd_free, mass0, 0.005)
+        _, vzi, _ = freefall_to(h_start, hh, vx0, vz0, cd_free, area, mass0, 0.005)
         vz_td = project_rh(hh, vzi, 0.0, mass0 - prop_mass,
-                           mt, mf, mc, prop_mass, i_total, cd,
+                           mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
                            bt, bf, bb, b_prop, b_ign, PLAN_TARGET_VZ)
         if vz_td > vz_best:
             vz_best = vz_td
@@ -759,9 +772,9 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, mass0, delay_pad, boost_ready,
     lo, hi = max(5.0, h_lo_ok - step), h_lo_ok
     for _ in range(8):
         mid = 0.5 * (lo + hi)
-        _, vzi, _ = freefall_to(h_start, mid, vx0, vz0, cd_free, mass0, 0.005)
+        _, vzi, _ = freefall_to(h_start, mid, vx0, vz0, cd_free, area, mass0, 0.005)
         vz_td = project_rh(mid, vzi, 0.0, mass0 - prop_mass,
-                           mt, mf, mc, prop_mass, i_total, cd,
+                           mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
                            bt, bf, bb, b_prop, b_ign, PLAN_TARGET_VZ)
         if vz_td >= FEASIBLE_VZ:
             hi = mid
@@ -771,9 +784,9 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, mass0, delay_pad, boost_ready,
     lo, hi = h_hi_ok, min(h_start - 1.0, h_hi_ok + step)
     for _ in range(8):
         mid = 0.5 * (lo + hi)
-        _, vzi, _ = freefall_to(h_start, mid, vx0, vz0, cd_free, mass0, 0.005)
+        _, vzi, _ = freefall_to(h_start, mid, vx0, vz0, cd_free, area, mass0, 0.005)
         vz_td = project_rh(mid, vzi, 0.0, mass0 - prop_mass,
-                           mt, mf, mc, prop_mass, i_total, cd,
+                           mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
                            bt, bf, bb, b_prop, b_ign, PLAN_TARGET_VZ)
         if vz_td >= FEASIBLE_VZ:
             lo = mid
@@ -781,7 +794,7 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, mass0, delay_pad, boost_ready,
             hi = mid
     h_max = lo
 
-    _, vz_at, _ = freefall_to(h_start, h_min, vx0, vz0, cd_free, mass0, 0.005)
+    _, vz_at, _ = freefall_to(h_start, h_min, vx0, vz0, cd_free, area, mass0, 0.005)
     pad = abs(vz_at) * delay_pad + 0.5 * G * delay_pad * delay_pad
     h_cmd = h_min + pad
     if h_cmd > h_max:
@@ -795,7 +808,7 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, mass0, delay_pad, boost_ready,
         h_cmd = h_max
     if h_cmd > h_start - 1.0:
         h_cmd = h_start - 1.0
-    _, _, t_cmd = freefall_to(h_start, h_cmd, vx0, vz0, cd_free, mass0, 0.005)
+    _, _, t_cmd = freefall_to(h_start, h_cmd, vx0, vz0, cd_free, area, mass0, 0.005)
     return h_cmd, t_cmd, h_min
 
 
@@ -811,11 +824,30 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
         n_boost, use_boost_rule, roll_max, ign_delay_max, delay_pad,
         thr_scatter, thr_tau, gyro_ff,
         n_fin, fin_area, fin_arm, fin_roll_arm, fin_cl_alpha, fin_aspect,
-        fin_max, fin_rate, fin_brake_mode, fin_drift, cd_free, b_cant, b_azim,
+        fin_max, fin_rate, fin_brake_mode, fin_drift, cd_free, b_cant, b_azim, veh,
         mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop, b_total,
         tel, n_tel, h_cmd_in):
     np.random.seed(seed)
     out = np.zeros(N_OUT, dtype=np.float64)
+
+    # ---- vehicle and actuators ----
+    # Read from the array rather than from module constants, so every one of them is
+    # a simulation input the GUI and the command line can change.
+    area = veh[V_AREA]
+    it_coef = veh[V_IT]          # transverse MMOI per kg of CURRENT mass
+    ia_coef = veh[V_IA]          # roll MMOI per kg
+    l_gimb = veh[V_LGIMB]
+    l_cp = veh[V_LCP]
+    cna = veh[V_CNA]
+    srv_max = veh[V_SRV_MAX]
+    srv_ratio = veh[V_SRV_RATIO]
+    srv_speed = veh[V_SRV_SPEED]
+    srv_accel = veh[V_SRV_ACCEL]
+    srv_quant = veh[V_SRV_QUANT]
+    thr_speed = veh[V_THR_SPEED]
+    thr_accel = veh[V_THR_ACCEL]
+    k_min = veh[V_KMIN]
+    k_max = veh[V_KMAX]
 
     # ---- per-flight draws ------------------------------------------------
     ign_delay = np.random.uniform(0.0, ign_delay_max)
@@ -842,9 +874,10 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
     if h_cmd_in > 0.0:
         h_cmd = h_cmd_in
     else:
-        h_cmd, _, _ = find_ignition(h_start, vx0, vz0, cd, cd_free, mass0,
-                                    delay_pad, boost_ready, mt, mf, mc,
-                                    prop_mass, i_total, bt, bf_ax, bb, b_prop)
+        h_cmd, _, _ = find_ignition(h_start, vx0, vz0, cd, cd_free, area,
+                                    k_min, k_max, mass0, delay_pad, boost_ready,
+                                    mt, mf, mc, prop_mass, i_total,
+                                    bt, bf_ax, bb, b_prop)
 
     # ---- state -----------------------------------------------------------
     x, y, h = 0.0, 0.0, h_start
@@ -888,9 +921,9 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
     srv1 = srv2 = 0.0            # servo angles [deg]
     sr1 = sr2 = 0.0              # servo rates [deg/s]
     cmd1 = cmd2 = 0.0
-    k_act, k_rate_act = K_MIN, 0.0
-    k_cmd = K_MIN
-    k_level = K_MAX
+    k_act, k_rate_act = k_min, 0.0
+    k_cmd = k_min
+    k_level = k_max
 
     t = 0.0
     t_ign_cmd = -1.0
@@ -938,9 +971,9 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
         if step % PLAN_DIV == 0 and t_ign_cmd >= 0.0 and h > 0.05:
             tb_p = tb if tb >= 0.0 else 0.0
             k_level, resid = solve_plan(h, vz, tb_p, dry,
-                                        mt, mf, mc, prop_mass, i_total, cd,
-                                        bt, bf_ax, bb, b_prop, b_t_ign, 0.02,
-                                        PLAN_TARGET_VZ)
+                                        mt, mf, mc, prop_mass, i_total, cd, area,
+                                        k_min, k_max, bt, bf_ax, bb, b_prop,
+                                        b_t_ign, 0.02, PLAN_TARGET_VZ)
             # ---- the booster rule ----
             # A D9 is a one-way door: it cannot be throttled, stopped or relit. So it
             # is lit only once the plan says the main motor CANNOT close the landing
@@ -951,7 +984,10 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
                 b_t_ign = tb_p
                 boost_used = 1.0
         if engine_on or (t_burn0 < 0.0 and t_ign_cmd >= 0.0):
-            k_cmd = k_level
+            # The plant flies the SAME clamp law the projection assumed, terminal
+            # phase included. Anything else and the planner is solving for a vehicle
+            # that does not exist.
+            k_cmd = k_from_plan(k_level, 0.0, h, vz, mass, t_nom, k_min, k_max)
 
         # ---------------- controller, 200 Hz ----------------
         if step % CTRL_DIV == 0:
@@ -972,7 +1008,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
                 bxf = -thr_boost * (-sb * mfx) / mass
                 byf = -thr_boost * (-sb * mfy) / mass
             ux, uy, uz, t_go = guidance_dir(h, vx, vy, vz, mass, cd,
-                                            ax_bias + bxf, ay_bias + byf)
+                                            ax_bias + bxf, ay_bias + byf, area)
             # ---- aerodynamic drift nulling, before the motor is lit ----
             # The body's own normal force is a free horizontal actuator while the
             # vehicle is still falling: tilting the thrust axis TOWARDS the drift
@@ -1022,8 +1058,8 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
             w_roll = wx * bx + wy * by + wz * bz
             gtx, gty, gtz = wx - w_roll * bx, wy - w_roll * by, wz - w_roll * bz
 
-            I_t = mass * (L_BODY * L_BODY / 12.0)
-            I_a = mass * I_AXIAL_COEF
+            I_t = mass * it_coef
+            I_a = mass * ia_coef
 
             # aero feedforward: tau = L_CP * (b x F_normal)
             rvx, rvy, rvz = vx, vy, vz
@@ -1034,7 +1070,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
                 vr = math.sqrt(v2)
                 ahx, ahy, ahz = -rvx / vr, -rvy / vr, -rvz / vr
                 ca = ahx * bx + ahy * by + ahz * bz
-                ffk = q * AREA * C_N_ALPHA * L_CP
+                ffk = q * area * cna * l_cp
                 tafx = ffk * (by * ahz - bz * ahy)
                 tafy = ffk * (bz * ahx - bx * ahz)
                 tafz = ffk * (bx * ahy - by * ahx)
@@ -1075,18 +1111,19 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
             # dynamic inversion. tau = -L*T*(b x s) inverts EXACTLY to
             # s = (b x tau)/(L*T) because s is perpendicular to b. Without it the
             # loop gain would sweep by 100x as the thrust runs down the curve.
-            inv = 1.0 / (t_est * L_GIMBAL)
+            inv = 1.0 / (t_est * l_gimb)
             sqx = (by * trz - bz * try_) * inv
             sqy = (bz * trx - bx * trz) * inv
             sqz = (bx * try_ - by * trx) * inv
             sd1 = clampf(sqx * c1x + sqy * c1y + sqz * c1z, -0.999, 0.999)
             sd2 = clampf(sqx * c2x + sqy * c2y + sqz * c2z, -0.999, 0.999)
-            cmd1 = math.degrees(math.asin(sd1)) * TVC_RATIO
-            cmd2 = math.degrees(math.asin(sd2)) * TVC_RATIO
-            cmd1 = clampf(cmd1, -TVC_SERVO_MAX, TVC_SERVO_MAX)
-            cmd2 = clampf(cmd2, -TVC_SERVO_MAX, TVC_SERVO_MAX)
-            cmd1 = math.floor(cmd1 / SERVO_QUANT + 0.5) * SERVO_QUANT
-            cmd2 = math.floor(cmd2 / SERVO_QUANT + 0.5) * SERVO_QUANT
+            cmd1 = math.degrees(math.asin(sd1)) * srv_ratio
+            cmd2 = math.degrees(math.asin(sd2)) * srv_ratio
+            cmd1 = clampf(cmd1, -srv_max, srv_max)
+            cmd2 = clampf(cmd2, -srv_max, srv_max)
+            if srv_quant > 0.0:
+                cmd1 = math.floor(cmd1 / srv_quant + 0.5) * srv_quant
+                cmd2 = math.floor(cmd2 / srv_quant + 0.5) * srv_quant
             if not engine_on:
                 # A gimbal with no thrust behind it makes no torque, so there is
                 # nothing to steer with during the free fall - the airframe simply
@@ -1101,14 +1138,14 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
             # the roll axis, which the gimbal cannot touch at all.
             if n_fin > 0.5:
                 # torque the gimbal will actually deliver with the command above
-                s1c = math.sin(math.radians(cmd1 / TVC_RATIO))
-                s2c = math.sin(math.radians(cmd2 / TVC_RATIO))
+                s1c = math.sin(math.radians(cmd1 / srv_ratio))
+                s2c = math.sin(math.radians(cmd2 / srv_ratio))
                 gsx = s1c * c1x + s2c * c2x
                 gsy = s1c * c1y + s2c * c2y
                 gsz = s1c * c1z + s2c * c2z
-                tgx = -L_GIMBAL * t_est * (by * gsz - bz * gsy)
-                tgy = -L_GIMBAL * t_est * (bz * gsx - bx * gsz)
-                tgz = -L_GIMBAL * t_est * (bx * gsy - by * gsx)
+                tgx = -l_gimb * t_est * (by * gsz - bz * gsy)
+                tgy = -l_gimb * t_est * (bz * gsx - bx * gsz)
+                tgz = -l_gimb * t_est * (bx * gsy - by * gsx)
                 if not engine_on:
                     tgx = tgy = tgz = 0.0
                 rfx = trx - tgx
@@ -1218,17 +1255,17 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
         # into the dominant instability.
         e_s = cmd1 - srv1
         d_s = 1.0 if e_s > 0.0 else (-1.0 if e_s < 0.0 else 0.0)
-        v_t = d_s * min(TVC_MAX_SPEED, math.sqrt(2.0 * TVC_MAX_ACCEL * abs(e_s)))
-        dv_max = TVC_MAX_ACCEL * DT_PHYS
+        v_t = d_s * min(srv_speed, math.sqrt(2.0 * srv_accel * abs(e_s)))
+        dv_max = srv_accel * DT_PHYS
         sr1 += clampf(v_t - sr1, -dv_max, dv_max)
         srv1 += sr1 * DT_PHYS
         e_s = cmd2 - srv2
         d_s = 1.0 if e_s > 0.0 else (-1.0 if e_s < 0.0 else 0.0)
-        v_t = d_s * min(TVC_MAX_SPEED, math.sqrt(2.0 * TVC_MAX_ACCEL * abs(e_s)))
+        v_t = d_s * min(srv_speed, math.sqrt(2.0 * srv_accel * abs(e_s)))
         sr2 += clampf(v_t - sr2, -dv_max, dv_max)
         srv2 += sr2 * DT_PHYS
-        srv1 = clampf(srv1, -TVC_SERVO_MAX, TVC_SERVO_MAX)
-        srv2 = clampf(srv2, -TVC_SERVO_MAX, TVC_SERVO_MAX)
+        srv1 = clampf(srv1, -srv_max, srv_max)
+        srv2 = clampf(srv2, -srv_max, srv_max)
 
         # ---------------- fin actuators ----------------
         # Same deceleration-aware rate limit as the gimbal servos. The quoted 90 ms
@@ -1244,15 +1281,14 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
                     defl[_i] = defl_cmd[_i]
 
         # ---------------- throttle actuator ----------------
-        kd_des = clampf((k_cmd - k_act) / DT_PHYS, -THROTTLE_SPEED, THROTTLE_SPEED)
-        dk = clampf(kd_des - k_rate_act, -THROTTLE_ACCEL * DT_PHYS,
-                    THROTTLE_ACCEL * DT_PHYS)
+        kd_des = clampf((k_cmd - k_act) / DT_PHYS, -thr_speed, thr_speed)
+        dk = clampf(kd_des - k_rate_act, -thr_accel * DT_PHYS, thr_accel * DT_PHYS)
         k_rate_act += dk
-        k_act = clampf(k_act + k_rate_act * DT_PHYS, K_MIN, K_MAX)
+        k_act = clampf(k_act + k_rate_act * DT_PHYS, k_min, k_max)
 
         # ---------------- forces ----------------
-        n1 = math.radians(srv1 / TVC_RATIO)
-        n2 = math.radians(srv2 / TVC_RATIO)
+        n1 = math.radians(srv1 / srv_ratio)
+        n2 = math.radians(srv2 / srv_ratio)
         c1x, c1y, c1z, c2x, c2y, c2z = gimbal_basis(bx, by, bz, gx, gy, gz)
         s1, s2 = math.sin(n1), math.sin(n2)
         s_perp = math.sqrt(s1 * s1 + s2 * s2)
@@ -1289,19 +1325,19 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
         if v_rel > 0.05:
             ahx, ahy, ahz = -rvx / v_rel, -rvy / v_rel, -rvz / v_rel
             ca = ahx * bx + ahy * by + ahz * bz
-            f_axial = q * AREA * cd * ca
-            fnk = q * AREA * C_N_ALPHA
+            f_axial = q * area * cd * ca
+            fnk = q * area * cna
             f_ax = f_axial * bx + fnk * (ahx - ca * bx)
             f_ay = f_axial * by + fnk * (ahy - ca * by)
             f_az = f_axial * bz + fnk * (ahz - ca * bz)
             # aero damping acts on the TRANSVERSE rate only: an uncanted airframe
             # has almost no roll damping, and applying this coefficient to the spin
             # would quietly brake it and flatter the controller
-            c_damp = 0.5 * RHO * v_rel * AREA * C_N_ALPHA * L_CP * L_CP
+            c_damp = 0.5 * RHO * v_rel * area * cna * l_cp * l_cp
             wr_t = wx * bx + wy * by + wz * bz
-            tax = L_CP * fnk * (by * ahz - bz * ahy) - c_damp * (wx - wr_t * bx)
-            tay = L_CP * fnk * (bz * ahx - bx * ahz) - c_damp * (wy - wr_t * by)
-            taz = L_CP * fnk * (bx * ahy - by * ahx) - c_damp * (wz - wr_t * bz)
+            tax = l_cp * fnk * (by * ahz - bz * ahy) - c_damp * (wx - wr_t * bx)
+            tay = l_cp * fnk * (bz * ahx - bx * ahz) - c_damp * (wy - wr_t * by)
+            taz = l_cp * fnk * (bx * ahy - by * ahx) - c_damp * (wz - wr_t * bz)
 
         if n_fin > 0.5:
             ffx, ffy, ffz, ftx, fty, ftz = fin_forces(
@@ -1334,12 +1370,12 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
         # gimbal moment = (-L*b) x F: perpendicular to b, so no roll torque exists
         # the booster is aimed through the CG, so only the main motor's nozzle
         # produces a moment
-        ttx = -L_GIMBAL * thrust_main * (by * sz - bz * sy)
-        tty = -L_GIMBAL * thrust_main * (bz * sx - bx * sz)
-        ttz = -L_GIMBAL * thrust_main * (bx * sy - by * sx)
+        ttx = -l_gimb * thrust_main * (by * sz - bz * sy)
+        tty = -l_gimb * thrust_main * (bz * sx - bx * sz)
+        ttz = -l_gimb * thrust_main * (bx * sy - by * sx)
 
-        I_t = mass * (L_BODY * L_BODY / 12.0)
-        I_a = mass * I_AXIAL_COEF
+        I_t = mass * it_coef
+        I_a = mass * ia_coef
         ax = (f_tx + f_ax) / mass
         ay = (f_ty + f_ay) / mass
         az = (f_tz + f_az) / mass - G
@@ -1452,12 +1488,37 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, wn, zeta, wn_fin, zeta_fin,
 # --- CONFIGURATION / MONTE CARLO --------------------------------------
 @dataclass
 class TvcConfig:
-    """Everything the 3-D campaign needs. Defaults are the test plan asked for."""
+    """Everything the 3-D campaign needs. Defaults are the test plan asked for.
+
+    Every geometric, inertial and actuator number is here rather than in a module
+    constant, so the GUI and the command line can change the vehicle rather than
+    only the scenario.
+    """
     motor: str = "long"
     gross_mass: float = landsim.GROSS_MASS
     propellant: float = landsim.PROPELLANT_MASS
+    diameter: float = DIAMETER
     cd: float = CD_AXIAL
     thrust_mult: float = 1.0
+    # --- airframe ---
+    # MMOI is given directly, at the GROSS mass; it is scaled with the current mass
+    # during the burn. The defaults are the slender-rod and solid-cylinder values for
+    # a 1.40 m x 105 mm airframe: 3.2*1.4^2/12 and 3.2*0.5*0.0525^2.
+    mmoi_transverse: float = landsim.GROSS_MASS * L_BODY * L_BODY / 12.0
+    mmoi_roll: float = landsim.GROSS_MASS * I_AXIAL_COEF
+    l_gimbal: float = L_GIMBAL       # CG -> nozzle pivot [m]
+    l_cp: float = L_CP               # CG -> centre of pressure, aft [m]
+    cn_alpha: float = C_N_ALPHA      # body normal-force slope [1/rad]
+    # --- actuators ---
+    servo_max: float = TVC_SERVO_MAX      # deg of servo travel
+    servo_ratio: float = TVC_RATIO        # servo deg per nozzle deg
+    servo_speed: float = TVC_MAX_SPEED    # deg/s
+    servo_accel: float = TVC_MAX_ACCEL    # deg/s^2
+    servo_quant: float = SERVO_QUANT      # deg
+    throttle_speed: float = THROTTLE_SPEED   # clamp travel per second
+    throttle_accel: float = THROTTLE_ACCEL
+    k_min: float = K_MIN                  # clamp range
+    k_max: float = K_MAX
     n_boosters: int = 1
     use_booster_rule: bool = True
     booster_cant: float = D9_CANT
@@ -1513,6 +1574,30 @@ class TvcConfig:
         b = Booster()
         return m, b
 
+    @property
+    def area(self) -> float:
+        return math.pi * (self.diameter / 2.0) ** 2
+
+    def vehicle(self) -> np.ndarray:
+        """The vehicle/actuator array the compiled kernels read."""
+        v = np.zeros(N_VEH)
+        v[V_AREA] = self.area
+        v[V_IT] = self.mmoi_transverse / self.gross_mass
+        v[V_IA] = self.mmoi_roll / self.gross_mass
+        v[V_LGIMB] = self.l_gimbal
+        v[V_LCP] = self.l_cp
+        v[V_CNA] = self.cn_alpha
+        v[V_SRV_MAX] = self.servo_max
+        v[V_SRV_RATIO] = self.servo_ratio
+        v[V_SRV_SPEED] = self.servo_speed
+        v[V_SRV_ACCEL] = self.servo_accel
+        v[V_SRV_QUANT] = self.servo_quant
+        v[V_THR_SPEED] = self.throttle_speed
+        v[V_THR_ACCEL] = self.throttle_accel
+        v[V_KMIN] = self.k_min
+        v[V_KMAX] = self.k_max
+        return v
+
     def gains(self):
         """The seven numbers the tuner searches, in one place."""
         return (self.wn, self.zeta, self.wn_fin, self.zeta_fin, self.roll_gain,
@@ -1527,7 +1612,9 @@ class TvcConfig:
         return Fins(count=self.fin_count if self.fins else 0,
                     root=self.fin_root, tip=self.fin_tip, span=self.fin_span,
                     arm=self.fin_arm, max_deflect=self.fin_max_deflect,
-                    travel_time=self.fin_travel_time, enabled=self.fins)
+                    travel_time=self.fin_travel_time,
+                    body_diameter=self.diameter, body_area=self.area,
+                    enabled=self.fins)
 
     def fin_args(self):
         """(n, area, arm, roll arm, CL_alpha, AR, max, rate, brake mode) for the
@@ -1554,7 +1641,8 @@ def plan_ignition(cfg: TvcConfig, h0: float, vx0: float) -> float:
     ready = 1.0 if (cfg.n_boosters > 0 and cfg.use_booster_rule) else 0.0
     _, cd_free = cfg.fin_args()
     h_cmd, _, _ = find_ignition(float(h0), float(vx0), float(cfg.vz0), cfg.cd,
-                                cd_free, mass0, cfg.delay_pad, ready, mt, mf, mc,
+                                cd_free, cfg.area, cfg.k_min, cfg.k_max, mass0,
+                                cfg.delay_pad, ready, mt, mf, mc,
                                 m.propellant_mass, m.total_impulse,
                                 bt, bf * math.cos(math.radians(cfg.booster_cant)),
                                 bb, b.propellant_mass)
@@ -1579,7 +1667,7 @@ def fly_one(cfg: TvcConfig, seed: int, h0: float, vx0: float, n_tel: int = 0,
                  1.0 if cfg.gyro_ff else 0.0,
                  fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6], fa[7], fa[8],
                  fa[9], cd_free, math.radians(cfg.booster_cant),
-                 math.radians(cfg.booster_azimuth),
+                 math.radians(cfg.booster_azimuth), cfg.vehicle(),
                  mt, mf, mc, m.propellant_mass, m.total_impulse,
                  bt, bf, bb, b.propellant_mass, b.total_mass, tel, n_tel,
                  float(h_cmd))
@@ -1607,6 +1695,7 @@ def run_campaign(cfg: TvcConfig, on_progress=None, should_stop=None,
     bt, bf, bb = booster_arrays(b)
     h_grid, vx_grid = cfg.entry_grid()
     fa, cd_free = cfg.fin_args()
+    veh = cfg.vehicle()
     seeds = cfg.seed0 + np.arange(cfg.runs)
     res = np.zeros((len(h_grid), len(vx_grid), cfg.runs, N_OUT))
     tel = np.zeros((1, 15))
@@ -1629,7 +1718,7 @@ def run_campaign(cfg: TvcConfig, on_progress=None, should_stop=None,
                              fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6],
                              fa[7], fa[8], fa[9], cd_free,
                              math.radians(cfg.booster_cant),
-                             math.radians(cfg.booster_azimuth),
+                             math.radians(cfg.booster_azimuth), veh,
                              mt, mf, mc, m.propellant_mass, m.total_impulse,
                              bt, bf, bb, b.propellant_mass, b.total_mass, tel, 0,
                              h_cmd)
@@ -1731,73 +1820,114 @@ def gain_cost(camp):
     return float(miss + 0.06 * pen.mean()), float(1.0 - miss)
 
 
+def _tune_eval(job):
+    """One candidate, in a worker process."""
+    cfg, gains, h_cmd_grid = job
+    camp = run_campaign(cfg.with_gains(tuple(gains)), h_cmd_grid=h_cmd_grid)
+    return gain_cost(camp)
+
+
 def tune_gains(cfg: TvcConfig, budget=60, runs=12, cells=3, seed=1,
-               on_progress=None, should_stop=None):
+               on_progress=None, should_stop=None, workers=None):
     """Fit the seven controller gains on a reduced campaign.
 
     Returns (best gains tuple, report dict). `budget` is the number of candidate gain
-    sets flown; each one is a `cells x cells x runs` campaign.
+    sets flown; each one is a `cells x cells` campaign.
+
+    Two things keep it quick. Candidates are evaluated a GENERATION AT A TIME across
+    worker processes - the flights are independent, and the compiled kernel is on
+    disk, so a worker starts in about a second and then runs at full speed. And the
+    search itself flies a cheap `runs` per candidate, after which the best few are
+    RE-FLOWN on three times as many seeds; a gain set that only looked good because
+    of eight lucky flights does not survive that, and paying for the extra flights
+    only at the end is far cheaper than paying for them all the way through.
     """
     from dataclasses import replace
+    import concurrent.futures as cf
+
     rng = np.random.default_rng(seed)
-    # reduced but representative grid: the corners and the middle of the envelope
     step_h = max(1.0, (cfg.h_hi - cfg.h_lo) / max(cells - 1, 1))
-    small = replace(cfg, h_step=step_h, vx_step=max(cfg.vx_max / ((cells - 1) / 2.0
-                                                                 if cells > 1 else 1),
-                                                    0.5),
+    small = replace(cfg, h_step=step_h,
+                    vx_step=max(cfg.vx_max / ((cells - 1) / 2.0 if cells > 1 else 1),
+                                0.5),
                     runs=runs)
     h_cmd_grid = ignition_grid(small)
     n_cells = h_cmd_grid.size
+    if workers is None:
+        workers = max(1, min(os.cpu_count() or 1, 8))
 
     def report(msg):
         if on_progress is not None:
             on_progress(msg)
 
-    def evaluate(g):
+    def check_stop():
         if should_stop is not None and should_stop():
             raise landsim.Cancelled()
-        camp = run_campaign(small.with_gains(tuple(g)), h_cmd_grid=h_cmd_grid)
-        return gain_cost(camp)
-
-    report(f"tuning {len(GAIN_NAMES)} gains on {n_cells} entry states x {runs} runs "
-           f"= {n_cells * runs} flights per candidate, {budget} candidates")
 
     lo, hi = GAIN_BOUNDS[:, 0], GAIN_BOUNDS[:, 1]
     pop_size = min(12, max(6, budget // 5))
     pop = rng.uniform(lo, hi, size=(pop_size, len(lo)))
     pop[0] = np.array(cfg.gains())          # the shipped default is candidate zero
-    cost = np.empty(pop_size)
-    succ = np.empty(pop_size)
-    for i in range(pop_size):
-        cost[i], succ[i] = evaluate(pop[i])
-        report(f"  seed candidate {i + 1}/{pop_size}: cost {cost[i]:.4f}  "
-               f"success {succ[i] * 100:5.1f} %")
-    used = pop_size
 
-    # differential evolution, the same one the 1-D optimiser uses
-    while used < budget:
-        for i in range(pop_size):
-            if used >= budget:
-                break
-            a, b, c = pop[rng.choice(pop_size, 3, replace=False)]
-            f = rng.uniform(0.4, 0.9)
-            trial = np.clip(a + f * (b - c), lo, hi)
-            mask = rng.random(len(lo)) < 0.8
-            mask[rng.integers(len(lo))] = True
-            trial = np.where(mask, trial, pop[i])
-            t_cost, t_succ = evaluate(trial)
-            used += 1
-            if t_cost < cost[i]:
-                pop[i], cost[i], succ[i] = trial, t_cost, t_succ
-                report(f"  {used:3d}/{budget}  improved: cost {t_cost:.4f}  "
-                       f"success {t_succ * 100:5.1f} %  "
-                       + "  ".join(f"{n}={v:.2f}" for n, v in
-                                   zip(GAIN_NAMES, trial)))
-    best = int(np.argmin(cost))
-    g = tuple(float(x) for x in pop[best])
+    report(f"tuning {len(GAIN_NAMES)} gains on {n_cells} entry states x {runs} runs "
+           f"= {n_cells * runs} flights per candidate, {budget} candidates, "
+           f"{workers} worker process(es)")
+
+    pool = (cf.ProcessPoolExecutor(max_workers=workers) if workers > 1 else None)
+    try:
+        def evaluate_many(cands, conf=None):
+            check_stop()
+            conf = conf or small
+            jobs = [(conf, c, h_cmd_grid) for c in cands]
+            if pool is None:
+                return [_tune_eval(j) for j in jobs]
+            return list(pool.map(_tune_eval, jobs))
+
+        res = evaluate_many(pop)
+        cost = np.array([r[0] for r in res])
+        succ = np.array([r[1] for r in res])
+        used = pop_size
+        report(f"  {used:3d}/{budget}  seeded: best cost {cost.min():.4f}  "
+               f"success {succ[int(np.argmin(cost))] * 100:5.1f} %")
+
+        while used < budget:
+            trials = []
+            for i in range(pop_size):
+                a, b, c = pop[rng.choice(pop_size, 3, replace=False)]
+                f = rng.uniform(0.4, 0.9)
+                t = np.clip(a + f * (b - c), lo, hi)
+                mask = rng.random(len(lo)) < 0.8
+                mask[rng.integers(len(lo))] = True
+                trials.append(np.where(mask, t, pop[i]))
+            trials = trials[:max(1, budget - used)]
+            res = evaluate_many(trials)
+            used += len(trials)
+            for i, (t_cost, t_succ) in enumerate(res):
+                if t_cost < cost[i]:
+                    pop[i], cost[i], succ[i] = trials[i], t_cost, t_succ
+            b = int(np.argmin(cost))
+            report(f"  {used:3d}/{budget}  best cost {cost[b]:.4f}  "
+                   f"success {succ[b] * 100:5.1f} %  "
+                   + "  ".join(f"{n}={v:.2f}" for n, v in zip(GAIN_NAMES, pop[b])))
+
+        # ---- run-off: re-fly the best few on three times the seeds ----
+        n_final = min(5, pop_size)
+        finalists = pop[np.argsort(cost)[:n_final]]
+        big = replace(small, runs=runs * 3)
+        report(f"  run-off: {n_final} finalists re-flown on {runs * 3} runs per state")
+        res = evaluate_many(finalists, conf=big)
+        f_cost = np.array([r[0] for r in res])
+        f_succ = np.array([r[1] for r in res])
+        best = int(np.argmin(f_cost))
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    g = tuple(float(x) for x in finalists[best])
     report("  best: " + "  ".join(f"{n}={v:.3f}" for n, v in zip(GAIN_NAMES, g)))
-    return g, {"cost": float(cost[best]), "success": float(succ[best]),
-               "budget": budget, "runs": runs, "cells": n_cells}
+    return g, {"cost": float(f_cost[best]), "success": float(f_succ[best]),
+               "budget": budget, "runs": runs, "runoff_runs": runs * 3,
+               "cells": n_cells, "workers": workers}
 
 
 def save_gains(gains, report, path="tvc_gains.json"):
@@ -2099,6 +2229,18 @@ def print_report(camp):
               f"{math.cos(math.radians(cfg.booster_cant)) * 100:.1f} % of its thrust "
               f"axial, {math.sin(math.radians(cfg.booster_cant)) * 100:.1f} % sideways")
     print(f"  mass / Cd         : {cfg.gross_mass:.3f} kg + boosters / {cfg.cd}")
+    print(f"  diameter / area   : {cfg.diameter * 1000:.0f} mm / "
+          f"{cfg.area * 1e4:.1f} cm2")
+    print(f"  MMOI at gross     : {cfg.mmoi_transverse:.4f} kg m2 transverse, "
+          f"{cfg.mmoi_roll:.5f} roll  (scaled with mass through the burn)")
+    print(f"  arms              : gimbal {cfg.l_gimbal:.2f} m, CP {cfg.l_cp:.2f} m, "
+          f"CN_alpha {cfg.cn_alpha:.2f}")
+    print(f"  TVC servo         : +/-{cfg.servo_max:.1f} deg at {cfg.servo_ratio:.1f}:1"
+          f" ({cfg.servo_max / cfg.servo_ratio:.1f} deg of nozzle), "
+          f"{cfg.servo_speed:.0f} deg/s, {cfg.servo_accel:.0f} deg/s2, "
+          f"step {cfg.servo_quant:.2f} deg")
+    print(f"  clamp             : {cfg.k_min:.2f}-{cfg.k_max:.2f} at "
+          f"{cfg.throttle_speed:.1f} /s")
     f = cfg.fin_set()
     if f.enabled:
         print(f"  fins              : {f.describe()}")
@@ -2215,6 +2357,32 @@ def main():
     ap.add_argument("--motor", default="long", choices=sorted(landsim.MOTOR_TABLES))
     ap.add_argument("--mass", type=float, default=landsim.GROSS_MASS)
     ap.add_argument("--cd", type=float, default=CD_AXIAL)
+    ap.add_argument("--diameter", type=float, default=DIAMETER * 1000,
+                    help="body diameter [mm]")
+    ap.add_argument("--mmoi", type=float, default=None,
+                    help="transverse MMOI at the gross mass [kg m^2] "
+                         "(default: slender rod, m*L^2/12)")
+    ap.add_argument("--mmoi-roll", type=float, default=None,
+                    help="roll MMOI at the gross mass [kg m^2]")
+    ap.add_argument("--l-gimbal", type=float, default=L_GIMBAL,
+                    help="CG -> nozzle pivot [m]")
+    ap.add_argument("--l-cp", type=float, default=L_CP,
+                    help="CG -> centre of pressure, aft [m]")
+    ap.add_argument("--cn-alpha", type=float, default=C_N_ALPHA,
+                    help="body normal-force slope [1/rad]")
+    ap.add_argument("--servo-max", type=float, default=TVC_SERVO_MAX, help="deg")
+    ap.add_argument("--servo-ratio", type=float, default=TVC_RATIO,
+                    help="servo deg per nozzle deg")
+    ap.add_argument("--servo-speed", type=float, default=TVC_MAX_SPEED, help="deg/s")
+    ap.add_argument("--servo-accel", type=float, default=TVC_MAX_ACCEL,
+                    help="deg/s^2")
+    ap.add_argument("--servo-quant", type=float, default=SERVO_QUANT, help="deg")
+    ap.add_argument("--throttle-speed", type=float, default=THROTTLE_SPEED,
+                    help="clamp travel per second [1/s]")
+    ap.add_argument("--throttle-accel", type=float, default=THROTTLE_ACCEL)
+    ap.add_argument("--k-min", type=float, default=K_MIN,
+                    help="minimum clamp setting (0.1 = flaps block 90 %%)")
+    ap.add_argument("--k-max", type=float, default=K_MAX)
     ap.add_argument("--thrust-mult", type=float, default=1.0)
     ap.add_argument("--boosters", type=int, default=1)
     ap.add_argument("--ign-delay", type=float, default=IGN_DELAY_MAX,
@@ -2261,6 +2429,8 @@ def main():
                     help="candidate gain sets to fly while tuning")
     ap.add_argument("--tune-runs", type=int, default=12,
                     help="flights per entry state while tuning")
+    ap.add_argument("--tune-workers", type=int, default=0,
+                    help="worker processes for the tuner (0 = one per core)")
     ap.add_argument("--gains", default="tvc_gains.json",
                     help="gain file to load if it exists (and to write with --tune)")
     ap.add_argument("--no-gains", action="store_true",
@@ -2280,7 +2450,21 @@ def main():
         verify()
         return
 
-    cfg = TvcConfig(motor=args.motor, gross_mass=args.mass, cd=args.cd,
+    mass = args.mass
+    diam = args.diameter / 1000.0
+    cfg = TvcConfig(motor=args.motor, gross_mass=mass, cd=args.cd,
+                    diameter=diam,
+                    mmoi_transverse=(args.mmoi if args.mmoi is not None
+                                     else mass * L_BODY * L_BODY / 12.0),
+                    mmoi_roll=(args.mmoi_roll if args.mmoi_roll is not None
+                               else mass * 0.5 * (diam / 2.0) ** 2),
+                    l_gimbal=args.l_gimbal, l_cp=args.l_cp, cn_alpha=args.cn_alpha,
+                    servo_max=args.servo_max, servo_ratio=args.servo_ratio,
+                    servo_speed=args.servo_speed, servo_accel=args.servo_accel,
+                    servo_quant=args.servo_quant,
+                    throttle_speed=args.throttle_speed,
+                    throttle_accel=args.throttle_accel,
+                    k_min=args.k_min, k_max=args.k_max,
                     thrust_mult=args.thrust_mult, n_boosters=max(0, args.boosters),
                     h_lo=args.h_lo, h_hi=args.h_hi, h_step=args.h_step,
                     vx_max=args.vx_max, vx_step=args.vx_step, runs=args.runs,
@@ -2301,6 +2485,7 @@ def main():
                     gyro_ff=not args.no_gyro_ff)
     if args.tune:
         g, rep = tune_gains(cfg, budget=args.tune_budget, runs=args.tune_runs,
+                            workers=args.tune_workers or None,
                             on_progress=None if args.quiet else print)
         cfg = cfg.with_gains(g)
         save_gains(g, rep, args.gains)
@@ -2319,10 +2504,24 @@ def main():
         save_campaign(camp, args.save)
     print_report(camp)
     if not args.no_figures:
-        paths = make_figures(camp, args.figures)
-        print("\n  figures written:")
-        for p in paths:
-            print(f"    {p}")
+        try:
+            paths = make_figures(camp, args.figures)
+            print("\n  figures written:")
+            for p in paths:
+                print(f"    {p}")
+        except Exception as exc:                       # noqa: BLE001
+            # A campaign is fifteen minutes of flying; a plotting problem must not
+            # throw it away. Say exactly what broke and how to redraw it.
+            import traceback
+            print("\n  FIGURES FAILED - the campaign itself is fine.")
+            traceback.print_exc()
+            print(f"\n  {type(exc).__name__}: {exc}")
+            if args.save:
+                print(f"  the results are saved; redraw them later with:\n"
+                      f"    python3 tvc_sim.py --load {args.save}")
+            else:
+                print("  re-run with --save results.npz to keep the raw results, "
+                      "then redraw with --load results.npz")
 
 
 if __name__ == "__main__":

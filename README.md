@@ -181,6 +181,22 @@ That is why the attitude loop also stays asleep for most of the free fall - it w
 40 m above the commanded ignition altitude, far enough to settle, late enough that the
 long descent is flown at trim instead of at a fought-for attitude.
 
+### Everything about the vehicle is an input
+
+Nothing about the airframe is baked into the compiled kernel any more - it is handed
+in as one array, so the GUI and the command line can change the vehicle rather than
+only the scenario:
+
+| | |
+|---|---|
+| airframe | gross mass, propellant, diameter, Cd |
+| inertia | **transverse and roll MMOI**, given directly at the gross mass and scaled with mass through the burn (the GUI can fill them from the slender-rod and solid-cylinder formulas as a starting point) |
+| arms | CG to nozzle pivot, CG to centre of pressure, body CN_alpha |
+| TVC | servo travel, servo:nozzle ratio, speed, acceleration, command quantisation |
+| clamp | minimum and maximum setting, slew rate and acceleration |
+| fins | count, root/tip chord, span, arm, deflection limit, travel time |
+| booster | count, cant angle, mounting azimuth |
+
 ### Fitting the gains instead of guessing them
 
 Seven numbers in the controller are not fixed by any physics: the two bandwidths, the
@@ -188,6 +204,12 @@ two damping ratios, the roll-damper gain and the two schedule exponents. `--tune
 them on the ground against a reduced campaign (9 entry states x 12 flights per
 candidate, 60 candidates, differential evolution) and writes `tvc_gains.json`, which
 every later run loads automatically.
+
+It takes about a minute: candidates are evaluated a generation at a time across worker
+processes (`--tune-workers`, one per core by default), and the search flies a cheap
+`--tune-runs` per candidate after which the best five are **re-flown on three times as
+many seeds** - a gain set that only looked good because of eight lucky flights does not
+survive that, and the extra flights are paid for only at the end.
 
 Three things keep it honest and affordable:
 
@@ -326,13 +348,20 @@ go sideways. Both `--booster-cant` and `--booster-azimuth` are settable.
 
 | | |
 |---|---|
-| success, all five gates | **45.4 %** |
-| \|vz\| < 3 m/s | 45.4 % (p95 11.4 m/s) |
-| \|vh\| < 0.75 m/s | 89.7 % (p95 1.03 m/s) |
-| tilt < 10 deg | 100.0 % (p95 5.6 deg) |
-| transverse rate < 60 deg/s | 100.0 % (p95 7.3 deg/s) |
+| success, all five gates | **63.3 %** |
+| \|vz\| < 3 m/s | 63.3 % (p95 11.4 m/s) |
+| \|vh\| < 0.75 m/s | 89.9 % (p95 1.01 m/s) |
+| tilt < 10 deg | 100.0 % (p95 5.4 deg) |
+| transverse rate < 60 deg/s | 100.0 % (p95 10.9 deg/s) |
 | D9 lit | 100 % of flights |
-| dV spent on steering | 0.13 m/s (clamp waste 9.4 m/s) |
+
+Over the 3418 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
+**100.0 %** (p95 \|vh\| 0.33 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
+
+> The jump from 45 % came from a **plant/planner inconsistency**, not from tuning: the
+> projection assumed a terminal descent law that the plant was no longer flying, so the
+> planner was solving for a vehicle that did not exist. Flying the same clamp law it
+> solves for took burnout-before-touchdown from 30 % to 1 %.
 
 (with the tuned gains from `tvc_gains.json` - see *Fitting the gains* below)
 

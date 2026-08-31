@@ -69,7 +69,30 @@ TVC_FIELDS = [
     ("Roll damper gain",  "roll_gain", "1.5", "rad/s"),
     ("Tune candidates",   "tune_budget", "60", "gain sets"),
     ("Tune runs/cell",    "tune_runs", "12",  "flights"),
+    ("Tune workers",      "tune_workers", "0", "0 = per core"),
     ("Figure directory",  "figdir",    "figures", ""),
+]
+
+# Airframe and actuators - everything the compiled kernel reads about the vehicle.
+VEHICLE_FIELDS = [
+    ("Gross mass",       "v_mass",     "3.2",   "kg"),
+    ("Propellant",       "v_prop",     "0.277", "kg"),
+    ("Diameter",         "v_diam",     "105",   "mm"),
+    ("Cd (axial)",       "v_cd",       "0.35",  "-"),
+    ("MMOI transverse",  "v_mmoi",     "0.523", "kg m2"),
+    ("MMOI roll",        "v_mmoi_r",   "0.0044", "kg m2"),
+    ("Gimbal arm",       "v_lgimb",    "0.50",  "m"),
+    ("CP arm (aft)",     "v_lcp",      "0.35",  "m"),
+    ("Body CN_alpha",    "v_cna",      "2.0",   "1/rad"),
+    ("Servo travel",     "v_srvmax",   "10",    "deg +/-"),
+    ("Servo ratio",      "v_srvratio", "2.0",   "srv/nozzle"),
+    ("Servo speed",      "v_srvspd",   "500",   "deg/s"),
+    ("Servo accel",      "v_srvacc",   "2000",  "deg/s2"),
+    ("Servo step",       "v_srvq",     "0.15",  "deg"),
+    ("Clamp speed",      "v_thrspd",   "12.84", "1/s"),
+    ("Clamp accel",      "v_thracc",   "257",   "1/s2"),
+    ("Clamp min",        "v_kmin",     "0.10",  "-"),
+    ("Clamp max",        "v_kmax",     "1.00",  "-"),
 ]
 
 # The four all-moving fins. Deflection limit and travel time are the two numbers
@@ -234,9 +257,7 @@ class App:
         intro = ("Two translational axes plus a rolling airframe and two TVC "
                  "channels.\nEvery cell of the entry grid is flown N times with a "
                  "random igniter delay, thrust scatter and roll rate;\nthe on-board "
-                 "rule decides in flight whether to light the D9.\nMass, propellant, "
-                 "diameter/area, Cd, air density and the thrust multiplier are taken "
-                 "from the first tab.")
+                 "rule decides in flight whether to light the D9.")
         ttk.Label(tab, text=intro, foreground="#555").pack(anchor="w")
 
         # Speed matters here far more than in the 1-D modes: a campaign is thousands
@@ -279,6 +300,25 @@ class App:
                                                            sticky="w", pady=2)
             ttk.Label(inp, text=unit, foreground="#888", width=10).grid(
                 row=row, column=col + 2, sticky="w")
+
+        veh = ttk.LabelFrame(tab, text="Airframe and actuators", padding=8)
+        veh.pack(fill="x", pady=(6, 0))
+        for i, (label, key, default, unit) in enumerate(VEHICLE_FIELDS):
+            col, row = (i % 5) * 3, i // 5
+            ttk.Label(veh, text=label + ":").grid(row=row, column=col, sticky="e",
+                                                  padx=(6, 4), pady=2)
+            var = tk.StringVar(value=default)
+            self.tvars[key] = var
+            ttk.Entry(veh, textvariable=var, width=7).grid(row=row, column=col + 1,
+                                                           sticky="w", pady=2)
+            ttk.Label(veh, text=unit, foreground="#888", width=10).grid(
+                row=row, column=col + 2, sticky="w")
+        ttk.Button(veh, text="MMOI from a 1.40 m rod",
+                   command=self.mmoi_from_rod).grid(row=99, column=0, columnspan=3,
+                                                    sticky="w", pady=(6, 0))
+        ttk.Label(veh, text="(slender rod m*L^2/12 and solid cylinder m*R^2/2 - a "
+                            "starting point, not a substitute for a CAD number)",
+                  foreground="#888").grid(row=99, column=3, columnspan=12, sticky="w")
 
         fin = ttk.LabelFrame(tab, text="Fin control (NACA 0012, all-moving)",
                              padding=8)
@@ -356,13 +396,33 @@ class App:
             return
         self.fin_info.set(f.describe())
 
+    def mmoi_from_rod(self):
+        """Fill the two MMOI boxes from the simple geometric bodies, for a starting
+        point when there is no CAD number to hand."""
+        try:
+            m = float(self.tvars["v_mass"].get().replace(",", "."))
+            d = float(self.tvars["v_diam"].get().replace(",", ".")) / 1000.0
+        except ValueError:
+            return
+        length = 1.40
+        self.tvars["v_mmoi"].set(f"{m * length * length / 12.0:.4f}")
+        self.tvars["v_mmoi_r"].set(f"{m * 0.5 * (d / 2.0) ** 2:.5f}")
+
     def tvc_config(self):
         def num(key):
             return float(self.tvars[key].get().strip().replace(",", "."))
         return tvc_sim.TvcConfig(
             motor=self.motor_var.get(),
-            gross_mass=self.num("mass"), propellant=self.num("propellant"),
-            cd=self.num("cd"), thrust_mult=self.num("thrust_mult", 1.0),
+            gross_mass=num("v_mass"), propellant=num("v_prop"),
+            diameter=num("v_diam") / 1000.0, cd=num("v_cd"),
+            thrust_mult=self.num("thrust_mult", 1.0),
+            mmoi_transverse=num("v_mmoi"), mmoi_roll=num("v_mmoi_r"),
+            l_gimbal=num("v_lgimb"), l_cp=num("v_lcp"), cn_alpha=num("v_cna"),
+            servo_max=num("v_srvmax"), servo_ratio=num("v_srvratio"),
+            servo_speed=num("v_srvspd"), servo_accel=num("v_srvacc"),
+            servo_quant=num("v_srvq"), throttle_speed=num("v_thrspd"),
+            throttle_accel=num("v_thracc"),
+            k_min=num("v_kmin"), k_max=num("v_kmax"),
             n_boosters=int(num("boosters")),
             h_lo=num("h_lo"), h_hi=num("h_hi"), h_step=num("h_step"),
             vx_max=num("vx_max"), vx_step=num("vx_step"), runs=int(num("runs")),
@@ -412,6 +472,7 @@ class App:
             cfg = self.tvc_config()
             budget = int(self.num_t("tune_budget"))
             runs = int(self.num_t("tune_runs"))
+            workers = int(self.num_t("tune_workers")) or None
         except ValueError as exc:
             messagebox.showerror("Invalid input", str(exc))
             return
@@ -422,12 +483,13 @@ class App:
         self.tvc_stop.configure(state="normal")
         self.tvc_prog.start(12)
         self.worker = threading.Thread(target=self.tune_work,
-                                       args=(cfg, budget, runs), daemon=True)
+                                       args=(cfg, budget, runs, workers), daemon=True)
         self.worker.start()
 
-    def tune_work(self, cfg, budget, runs):
+    def tune_work(self, cfg, budget, runs, workers=None):
         try:
             g, rep = tvc_sim.tune_gains(cfg, budget=budget, runs=runs,
+                                        workers=workers,
                                         on_progress=lambda s: self.put("tlog", s),
                                         should_stop=self.stop_flag.is_set)
             tvc_sim.save_gains(g, rep)
@@ -456,8 +518,17 @@ class App:
             camp = tvc_sim.run_campaign(cfg, on_progress=lambda s: self.put("tlog", s),
                                         should_stop=self.stop_flag.is_set)
             self.put("tlog", "writing figures ...")
-            paths = tvc_sim.make_figures(camp, self.tvars["figdir"].get().strip()
-                                         or "figures")
+            # A campaign is minutes of flying. A plotting failure must not throw it
+            # away, so the figures are drawn in their own try and the numbers are
+            # delivered either way.
+            paths = []
+            try:
+                paths = tvc_sim.make_figures(camp, self.tvars["figdir"].get().strip()
+                                             or "figures")
+            except Exception as exc:                  # noqa: BLE001
+                import traceback
+                self.put("tlog", "FIGURES FAILED (the campaign itself is fine):\n"
+                                 + traceback.format_exc())
             self.put("tdone", (camp, paths))
         except Cancelled:
             self.put("tcancelled", None)
@@ -510,9 +581,13 @@ class App:
         self.tvc_log.insert("end", "success [%] by horizontal entry speed:\n")
         for vx, v in zip(camp["vx_grid"], s["by_vx"]):
             self.tvc_log.insert("end", f"  {vx:+5.1f} m/s : {v:5.1f}\n")
-        self.tvc_log.insert("end", "\nfigures:\n")
-        for p in paths:
-            self.tvc_log.insert("end", f"  {p}\n")
+        if paths:
+            self.tvc_log.insert("end", "\nfigures:\n")
+            for p in paths:
+                self.tvc_log.insert("end", f"  {p}\n")
+        else:
+            self.tvc_log.insert("end", "\nno figures were written - see the error "
+                                       "above; the numbers here are unaffected\n")
         self.tvc_log.see("end")
 
     def show_motor(self):
