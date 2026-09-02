@@ -123,6 +123,15 @@ CAMPAIGN_FIELDS = [
     ("Figure directory",  "figdir",       "figures", "",    "each run gets a subfolder"),
 ]
 
+# What the landing gear will survive. These decide pass/fail and nothing else - the
+# controller never sees them.
+GATE_FIELDS = [
+    ("Vertical limit",    "gate_vz",      "4.0",   "m/s",   "touchdown |vz|"),
+    ("Horizontal limit",  "gate_vh",      "0.5",   "m/s",   "touchdown |vh| - a scrape tips it over"),
+    ("Tilt limit",        "gate_tilt",    "4.0",   "deg",   "off vertical at touchdown"),
+    ("Rate limit",        "gate_rate",    "30",    "deg/s", "transverse rate (roll is not gated)"),
+]
+
 GAIN_FIELDS = [
     ("TVC bandwidth",     "wn",           "7.886", "rad/s", "motor lit"),
     ("TVC damping",       "zeta",         "0.600", "-",     ""),
@@ -131,13 +140,17 @@ GAIN_FIELDS = [
     ("Fin damping",       "zeta_fin",     "1.483", "-",     ""),
     ("Fin schedule",      "sched_fin",    "0.470", "exp",   "on (q / 700 Pa)"),
     ("Roll damper",       "roll_gain",    "0.300", "rad/s", ""),
+    ("Tilt cone at pad",  "tilt_min",     "1.5",   "deg",   "keep it WELL under the tilt gate"),
+    ("Tilt cone slope",   "tilt_slope",   "1.5",   "deg/m", "how fast the cone opens with altitude"),
+    ("Tilt cone cap",     "tilt_cap",     "20",    "deg",   "the widest it ever gets"),
     ("Tune candidates",   "tune_budget",  "60",    "sets",  ""),
     ("Tune runs/cell",    "tune_runs",    "12",    "flights", ""),
     ("Tune workers",      "tune_workers", "0",     "-",     "0 = one per core"),
 ]
 
 ALL_FIELDS = (AIRFRAME_FIELDS + INERTIA_FIELDS + ACTUATOR_FIELDS + MOTOR_FIELDS
-              + FIN_FIELDS + SCENARIO_1D_FIELDS + CAMPAIGN_FIELDS + GAIN_FIELDS)
+              + FIN_FIELDS + SCENARIO_1D_FIELDS + CAMPAIGN_FIELDS + GATE_FIELDS
+              + GAIN_FIELDS)
 
 
 MPL_HINT = ("  A 'No module named matplotlib.backends.registry' error means a HALF-"
@@ -512,6 +525,10 @@ class App:
         camp = ttk.LabelFrame(cols, text="Campaign and dispersions", padding=8)
         camp.pack(side="left", fill="both", expand=True)
         self._fields(camp, CAMPAIGN_FIELDS, columns=2)
+        gates = ttk.LabelFrame(cols, text="Touchdown gates (the landing gear)",
+                               padding=8)
+        gates.pack(side="left", fill="both", padx=(8, 0))
+        self._fields(gates, GATE_FIELDS, columns=1)
         gains = ttk.LabelFrame(cols, text="Controller gains", padding=8)
         gains.pack(side="left", fill="both", expand=True, padx=(8, 0))
         self._fields(gains, GAIN_FIELDS, columns=2)
@@ -726,6 +743,10 @@ class App:
             vx_max=n("vx_max"), vx_step=n("vx_step"), runs=int(n("runs")),
             ign_delay_max=n("ign_delay"), delay_pad=n("ign_delay"),
             thrust_scatter=n("scatter"), thrust_tau=n("tau"), roll_max=n("roll"),
+            gate_vz=n("gate_vz"), gate_vh=n("gate_vh"), gate_tilt=n("gate_tilt"),
+            gate_omega=n("gate_rate"),
+            tilt_min=n("tilt_min"), tilt_slope=n("tilt_slope"),
+            tilt_cap=n("tilt_cap"),
             wn=n("wn"), zeta=n("zeta"), wn_fin=n("wn_fin"), zeta_fin=n("zeta_fin"),
             roll_gain=n("roll_gain"), sched_tvc=n("sched_tvc"),
             sched_fin=n("sched_fin"),
@@ -1146,6 +1167,10 @@ class App:
             f"{'on' if cfg.fin_drift_null else 'off'}\n"
             f"  boosters     : {cfg.n_boosters} x D9, canted {cfg.booster_cant:.0f} deg "
             f"at azimuth {cfg.booster_azimuth:.0f} deg\n"
+            f"  tilt cone    : {cfg.tilt_min:g} deg at the pad + "
+            f"{cfg.tilt_slope:g} deg/m, capped {cfg.tilt_cap:g} deg\n"
+            f"  gates        : |vz|<{cfg.gate_vz:g} m/s, |vh|<{cfg.gate_vh:g} m/s, "
+            f"tilt<{cfg.gate_tilt:g} deg, rate<{cfg.gate_omega:g} deg/s\n"
             f"  gains        : TVC {cfg.wn:.2f}/{cfg.zeta:.2f} sched "
             f"{cfg.sched_tvc:+.2f}   fins {cfg.wn_fin:.2f}/{cfg.zeta_fin:.2f} sched "
             f"{cfg.sched_fin:+.2f}   roll {cfg.roll_gain:.2f}\n"
@@ -1244,6 +1269,7 @@ class App:
 
     def tvc_finish(self, camp, paths, fig_err=None):
         s = tvc_sim.summarise(camp)
+        cfg = camp["cfg"]
         self.camp = camp
         if HAVE_MPL:
             n = camp["out"][:, :, :, 0].size
@@ -1254,10 +1280,10 @@ class App:
                              f"({camp['out'][:, :, :, 0].size} flights in "
                              f"{time.time() - self.t_start:.0f} s)")
         self.tvc_gates.set(
-            f"|vz|<{tvc_sim.GATE_VZ} {s['gate_vz']:5.1f} %   "
-            f"|vh|<{tvc_sim.GATE_VH} {s['gate_vh']:5.1f} %   "
-            f"tilt<{tvc_sim.GATE_TILT} {s['gate_tilt']:5.1f} %   "
-            f"rate<{tvc_sim.GATE_OMEGA} {s['gate_om']:5.1f} %   "
+            f"|vz|<{cfg.gate_vz:g} {s['gate_vz']:5.1f} %   "
+            f"|vh|<{cfg.gate_vh:g} {s['gate_vh']:5.1f} %   "
+            f"tilt<{cfg.gate_tilt:g} {s['gate_tilt']:5.1f} %   "
+            f"rate<{cfg.gate_omega:g} {s['gate_om']:5.1f} %   "
             f"D9 used {s['boost_rate']:.0f} %\n"
             f"p95: vz {s['p95_vz']:.2f} m/s   vh {s['p95_vh']:.2f} m/s   "
             f"tilt {s['p95_tilt']:.1f} deg   rate {s['p95_om']:.1f} deg/s\n"

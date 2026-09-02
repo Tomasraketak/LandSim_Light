@@ -168,7 +168,10 @@ A_TERM = 8.00             # deceleration setting the terminal descent-rate profi
 A_TERM_MAX = 70.0         # cap on commanded specific force [m/s^2]
 KP_VZ = 3.00              # descent-rate tracking gain
 TILT_SLOPE = 1.5          # tilt cone opens with altitude [deg/m]
-TILT_MIN = 4.0            # ... from this floor at the pad [deg]
+TILT_MIN = 1.5            # ... from this floor at the pad [deg]. It must sit WELL
+                          # under the tilt gate: the cone is what the guidance is
+                          # allowed to ask for, so a floor equal to the gate
+                          # guarantees arriving exactly on the limit.
 TILT_CAP = 20.0           # ... up to this cap [deg]. Tighter than the reference's 45
                           # deg cone: this vehicle's vertical margin is thin enough
                           # that a wide cone spends more dV on steering than the
@@ -191,10 +194,14 @@ Q_SCHED_REF = 700.0       # Pa of dynamic pressure the fin bandwidth refers to
 SCHED_LO, SCHED_HI = 0.35, 2.0   # clamp on either schedule factor
 
 # Touchdown gates (the reference's five, read on magnitudes)
-GATE_VZ = 3.00            # m/s
-GATE_VH = 0.75            # m/s
-GATE_TILT = 10.0          # deg
-GATE_OMEGA = 60.0         # deg/s
+# Touchdown gates. These are the LANDING LEG's problem, not the controller's, so
+# they are inputs: what the structure will survive vertically, how much sideways
+# scrape the feet tolerate, and how far off vertical it can be before it tips over.
+GATE_VZ = 4.00            # m/s, vertical
+GATE_VH = 0.50            # m/s, horizontal - a scrape tips a lander over
+GATE_TILT = 4.0           # deg, off vertical
+GATE_OMEGA = 30.0         # deg/s, transverse rate (roll is not gated: no actuator
+                          # authority is needed to survive a spin about the long axis)
 GATE_H = 0.25             # m
 
 # The planner aims for -0.5 m/s at the pad and calls an altitude usable while the
@@ -405,7 +412,8 @@ def clampf(v, lo, hi):
 
 
 @njit(cache=True, inline='always')
-def guidance_dir(h, vx, vy, vz, mass, cd, ax_bias, ay_bias, area):
+def guidance_dir(h, vx, vy, vz, mass, cd, ax_bias, ay_bias, area,
+                 tilt_min=TILT_MIN, tilt_slope=TILT_SLOPE, tilt_cap=TILT_CAP):
     """Commanded thrust direction as a unit vector, plus t_go.
 
     A direction rather than a pair of angles: the two horizontal channels enter
@@ -434,7 +442,7 @@ def guidance_dir(h, vx, vy, vz, mass, cd, ax_bias, ay_bias, area):
     if req_az < 0.1:
         req_az = 0.1
     # tilt cone: wide up high, tight near the pad, identical in every azimuth
-    max_tilt = math.radians(clampf(h * TILT_SLOPE + TILT_MIN, 0.0, TILT_CAP))
+    max_tilt = math.radians(clampf(h * tilt_slope + tilt_min, 0.0, tilt_cap))
     tmax = math.tan(max_tilt)
     rh = math.sqrt(req_ax * req_ax + req_ay * req_ay)
     if rh > tmax * req_az and rh > 1e-12:
@@ -828,6 +836,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
         roll_gain, sched_tvc, sched_fin,
         n_boost, use_boost_rule, roll_max, ign_delay_max, delay_pad,
         thr_scatter, thr_tau, gyro_ff, use_t_est, plan_target,
+        tilt_min, tilt_slope, tilt_cap,
         n_fin, fin_area, fin_arm, fin_roll_arm, fin_cl_alpha, fin_aspect,
         fin_max, fin_rate, fin_brake_mode, fin_drift, cd_free, b_cant, b_azim, veh,
         mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop, b_total,
@@ -1023,7 +1032,8 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                 bxf = -thr_boost * (-sb * mfx) / mass
                 byf = -thr_boost * (-sb * mfy) / mass
             ux, uy, uz, t_go = guidance_dir(h, vx, vy, vz, mass, cd,
-                                            ax_bias + bxf, ay_bias + byf, area)
+                                            ax_bias + bxf, ay_bias + byf, area,
+                                            tilt_min, tilt_slope, tilt_cap)
             # ---- aerodynamic drift nulling, before the motor is lit ----
             # The body's own normal force is a free horizontal actuator while the
             # vehicle is still falling: tilting the thrust axis TOWARDS the drift
@@ -1584,7 +1594,15 @@ class TvcConfig:
     # dispersions
     ign_delay_max: float = IGN_DELAY_MAX
     delay_pad: float = IGN_DELAY_PLAN
+    # touchdown gates - see the constants above
+    gate_vz: float = GATE_VZ
+    gate_vh: float = GATE_VH
+    gate_tilt: float = GATE_TILT
+    gate_omega: float = GATE_OMEGA
     plan_target: float = PLAN_TARGET_VZ   # touchdown speed the planner aims for
+    tilt_min: float = TILT_MIN            # guidance tilt cone at the pad [deg]
+    tilt_slope: float = TILT_SLOPE        # ... opening with altitude [deg/m]
+    tilt_cap: float = TILT_CAP            # ... and its ceiling [deg]
     thrust_estimator: bool = True    # estimate the real thrust from the accelerometer
     thrust_scatter: float = THRUST_SCATTER
     thrust_tau: float = THRUST_TAU
@@ -1713,6 +1731,18 @@ def plan_ignition(cfg: TvcConfig, h0: float, vx0: float) -> float:
     return float(h_cmd)
 
 
+def score_flight(cfg: TvcConfig, out):
+    """Set the pass/fail flag from THIS configuration's gates.
+
+    The compiled kernel reports what the vehicle did; whether that counts as a
+    landing is a property of the landing gear, so it is decided out here where it can
+    be changed without recompiling anything.
+    """
+    out[0] = 1.0 if (out[1] < cfg.gate_vz and out[2] < cfg.gate_vh
+                     and out[3] < cfg.gate_tilt and out[4] < cfg.gate_omega) else 0.0
+    return out
+
+
 def fly_one(cfg: TvcConfig, seed: int, h0: float, vx0: float, n_tel: int = 0,
             h_cmd: float = -1.0):
     """One flight. Returns (result vector, telemetry array)."""
@@ -1730,13 +1760,14 @@ def fly_one(cfg: TvcConfig, seed: int, h0: float, vx0: float, n_tel: int = 0,
                  cfg.thrust_scatter, cfg.thrust_tau,
                  1.0 if cfg.gyro_ff else 0.0,
                  1.0 if cfg.thrust_estimator else 0.0, cfg.plan_target,
+                 cfg.tilt_min, cfg.tilt_slope, cfg.tilt_cap,
                  fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6], fa[7], fa[8],
                  fa[9], cd_free, math.radians(cfg.booster_cant),
                  math.radians(cfg.booster_azimuth), cfg.vehicle(),
                  mt, mf, mc, m.propellant_mass, m.total_impulse,
                  bt, bf, bb, b.propellant_mass, b.total_mass, tel, n_tel,
                  float(h_cmd))
-    return out, tel[:n]
+    return score_flight(cfg, out), tel[:n]
 
 
 def ignition_grid(cfg: TvcConfig):
@@ -1776,12 +1807,13 @@ def _campaign_cell(job):
                      cfg.thrust_scatter, cfg.thrust_tau,
                      1.0 if cfg.gyro_ff else 0.0,
                      1.0 if cfg.thrust_estimator else 0.0, cfg.plan_target,
+                     cfg.tilt_min, cfg.tilt_slope, cfg.tilt_cap,
                      fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6], fa[7], fa[8],
                      fa[9], cd_free, math.radians(cfg.booster_cant),
                      math.radians(cfg.booster_azimuth), veh,
                      mt, mf, mc, m.propellant_mass, m.total_impulse,
                      bt, bf, bb, b.propellant_mass, b.total_mass, tel, 0, h_cmd)
-        res[r] = out
+        res[r] = score_flight(cfg, out)
     return i, j, res
 
 
@@ -1861,12 +1893,22 @@ def wilson(k, n, z=1.96):
     return max(0.0, (c - h)) * 100.0, min(1.0, (c + h)) * 100.0
 
 
+def cfg_gates(camp):
+    """(vz, vh, tilt, omega) for this campaign - falls back to the defaults for a
+    campaign saved before the gates were configurable."""
+    cfg = camp.get("cfg")
+    return (getattr(cfg, "gate_vz", GATE_VZ), getattr(cfg, "gate_vh", GATE_VH),
+            getattr(cfg, "gate_tilt", GATE_TILT),
+            getattr(cfg, "gate_omega", GATE_OMEGA))
+
+
 def summarise(camp):
     """Success rates and the p95 metrics, in the shape the report and the plots want."""
     out = camp["out"]
     flat = out.reshape(-1, N_OUT)
     succ = flat[:, 0]
-    surv = flat[:, 1] < GATE_VZ          # survived the vertical gate
+    g_vz, g_vh, g_tilt, g_om = cfg_gates(camp)
+    surv = flat[:, 1] < g_vz             # survived the vertical gate
     n_s = int(surv.sum())
     grid = out[:, :, :, 0].mean(axis=2) * 100.0
     return {
@@ -1874,10 +1916,10 @@ def summarise(camp):
         "grid": grid,
         "by_h": out[:, :, :, 0].mean(axis=(1, 2)) * 100.0,
         "by_vx": out[:, :, :, 0].mean(axis=(0, 2)) * 100.0,
-        "gate_vz": (flat[:, 1] < GATE_VZ).mean() * 100.0,
-        "gate_vh": (flat[:, 2] < GATE_VH).mean() * 100.0,
-        "gate_tilt": (flat[:, 3] < GATE_TILT).mean() * 100.0,
-        "gate_om": (flat[:, 4] < GATE_OMEGA).mean() * 100.0,
+        "gate_vz": (flat[:, 1] < g_vz).mean() * 100.0,
+        "gate_vh": (flat[:, 2] < g_vh).mean() * 100.0,
+        "gate_tilt": (flat[:, 3] < g_tilt).mean() * 100.0,
+        "gate_om": (flat[:, 4] < g_om).mean() * 100.0,
         "p95_vz": float(np.percentile(flat[:, 1], 95)),
         "p95_vh": float(np.percentile(flat[:, 2], 95)),
         "p95_tilt": float(np.percentile(flat[:, 3], 95)),
@@ -1888,9 +1930,9 @@ def summarise(camp):
         # ground early, at 10 m/s, is scored on a correction that was still in
         # progress. Reading |vh|, tilt and rate over those flights measures the
         # propulsive failure a second time, not the controller.
-        "gate_vh_c": float((flat[surv, 2] < GATE_VH).mean() * 100.0) if n_s else 0.0,
-        "gate_tilt_c": float((flat[surv, 3] < GATE_TILT).mean() * 100.0) if n_s else 0.0,
-        "gate_om_c": float((flat[surv, 4] < GATE_OMEGA).mean() * 100.0) if n_s else 0.0,
+        "gate_vh_c": float((flat[surv, 2] < g_vh).mean() * 100.0) if n_s else 0.0,
+        "gate_tilt_c": float((flat[surv, 3] < g_tilt).mean() * 100.0) if n_s else 0.0,
+        "gate_om_c": float((flat[surv, 4] < g_om).mean() * 100.0) if n_s else 0.0,
         "p95_vh_c": float(np.percentile(flat[surv, 2], 95)) if n_s else 0.0,
         "n_surv": int(n_s),
         "boost_rate": flat[:, 8].mean() * 100.0,
@@ -1940,10 +1982,11 @@ def gain_cost(camp):
     """Lower is better. Miss fraction plus a bounded margin penalty."""
     flat = summarise(camp)["flat"]
     miss = 1.0 - flat[:, 0].mean()
-    pen = (np.minimum(flat[:, 1] / GATE_VZ, 3.0) ** 2 * 0.5
-           + np.minimum(flat[:, 2] / GATE_VH, 3.0) ** 2
-           + np.minimum(flat[:, 3] / GATE_TILT, 3.0) ** 2
-           + np.minimum(flat[:, 4] / GATE_OMEGA, 3.0) ** 2)
+    g_vz, g_vh, g_tilt, g_om = cfg_gates(camp)
+    pen = (np.minimum(flat[:, 1] / g_vz, 3.0) ** 2 * 0.5
+           + np.minimum(flat[:, 2] / g_vh, 3.0) ** 2
+           + np.minimum(flat[:, 3] / g_tilt, 3.0) ** 2
+           + np.minimum(flat[:, 4] / g_om, 3.0) ** 2)
     return float(miss + 0.06 * pen.mean()), float(1.0 - miss)
 
 
@@ -2117,6 +2160,7 @@ def draw_figure(name, fig, camp, single=None):
     cfg = camp["cfg"]
     h_grid, vx_grid = camp["h_grid"], camp["vx_grid"]
     flat = s["flat"]
+    g_vz, g_vh, g_tilt, g_om = cfg_gates(camp)
     fig.patch.set_facecolor("#fcfcfb")
     blues = LinearSegmentedColormap.from_list(
         "blues", ["#f2f6fb", "#cddff4", "#8fb9e8", "#4a90d9", "#2a78d6", "#17457c"])
@@ -2150,8 +2194,8 @@ def draw_figure(name, fig, camp, single=None):
                    label="failed")
         ax.scatter(flat[ok, 2], flat[ok, 1], s=14, c=GOOD, alpha=0.75, linewidths=0,
                    label="landed")
-        ax.axvline(GATE_VH, color=INK2, lw=1.2, ls="--")
-        ax.axhline(GATE_VZ, color=INK2, lw=1.2, ls="--")
+        ax.axvline(g_vh, color=INK2, lw=1.2, ls="--")
+        ax.axhline(g_vz, color=INK2, lw=1.2, ls="--")
         ax.set_yscale("symlog", linthresh=5)
         _style(ax, "Where the vehicle actually arrives",
                "horizontal speed at touchdown [m/s]", "vertical speed [m/s]")
@@ -2159,8 +2203,8 @@ def draw_figure(name, fig, camp, single=None):
         ax = axes[1]
         ax.scatter(flat[~ok, 3], flat[~ok, 4], s=14, c=BAD, alpha=0.55, linewidths=0)
         ax.scatter(flat[ok, 3], flat[ok, 4], s=14, c=GOOD, alpha=0.75, linewidths=0)
-        ax.axvline(GATE_TILT, color=INK2, lw=1.2, ls="--")
-        ax.axhline(GATE_OMEGA, color=INK2, lw=1.2, ls="--")
+        ax.axvline(g_tilt, color=INK2, lw=1.2, ls="--")
+        ax.axhline(g_om, color=INK2, lw=1.2, ls="--")
         _style(ax, "Attitude at touchdown  (dashed = gates)",
                "tilt from vertical [deg]", "transverse rate [deg/s]")
 
@@ -2248,7 +2292,8 @@ def draw_figure(name, fig, camp, single=None):
     elif name == "gates":
         axes = fig.subplots(1, 2)
         ax = axes[0]
-        names = ["|v_z| < 3", "|v_h| < 0.75", "tilt < 10", "rate < 60", "ALL"]
+        names = [f"|v_z| < {g_vz:g}", f"|v_h| < {g_vh:g}", f"tilt < {g_tilt:g}",
+                 f"rate < {g_om:g}", "ALL"]
         vals = [s["gate_vz"], s["gate_vh"], s["gate_tilt"], s["gate_om"], s["success"]]
         ax.barh(range(len(names)), vals, color=[SERIES[0]] * 4 + [SERIES[1]],
                 height=0.6)
@@ -2261,7 +2306,7 @@ def draw_figure(name, fig, camp, single=None):
         _style(ax, "Which gate is actually binding", "flights passing [%]", None)
         ax = axes[1]
         ax.hist(np.clip(flat[:, 1], 0, 25), bins=40, color=SERIES[0])
-        ax.axvline(GATE_VZ, color=BAD, lw=1.5, ls="--")
+        ax.axvline(g_vz, color=BAD, lw=1.5, ls="--")
         _style(ax, f"Vertical touchdown speed  (p95 = {s['p95_vz']:.1f} m/s)",
                "|v_z| at touchdown [m/s]", "flights")
     return fig
@@ -2391,22 +2436,23 @@ def print_report(camp):
     lo, hi = wilson(s["success"] / 100.0 * n_all, n_all)
     print(f"  SUCCESS (all five gates)   : {s['success']:5.1f} %"
           f"   [95 % interval {lo:.1f} - {hi:.1f} on {n_all} flights]")
-    print(f"    |v_z| < {GATE_VZ} m/s              : {s['gate_vz']:5.1f} %"
+    g_vz, g_vh, g_tilt, g_om = cfg_gates(camp)
+    print(f"    |v_z| < {g_vz:g} m/s              : {s['gate_vz']:5.1f} %"
           f"   p95 {s['p95_vz']:6.2f} m/s")
-    print(f"    |v_h| < {GATE_VH} m/s           : {s['gate_vh']:5.1f} %"
+    print(f"    |v_h| < {g_vh:g} m/s           : {s['gate_vh']:5.1f} %"
           f"   p95 {s['p95_vh']:6.2f} m/s")
-    print(f"    tilt  < {GATE_TILT} deg             : {s['gate_tilt']:5.1f} %"
+    print(f"    tilt  < {g_tilt:g} deg             : {s['gate_tilt']:5.1f} %"
           f"   p95 {s['p95_tilt']:6.2f} deg")
-    print(f"    rate  < {GATE_OMEGA} deg/s           : {s['gate_om']:5.1f} %"
+    print(f"    rate  < {g_om:g} deg/s           : {s['gate_om']:5.1f} %"
           f"   p95 {s['p95_om']:6.2f} deg/s")
     print()
     print(f"  ... and over the {s['n_surv']} flights that survived the VERTICAL gate,"
           f" i.e. where\n      the horizontal and attitude corrections actually ran"
           f" to touchdown:")
-    print(f"    |v_h| < {GATE_VH} m/s           : {s['gate_vh_c']:5.1f} %"
+    print(f"    |v_h| < {g_vh:g} m/s           : {s['gate_vh_c']:5.1f} %"
           f"   p95 {s['p95_vh_c']:6.2f} m/s")
-    print(f"    tilt  < {GATE_TILT} deg             : {s['gate_tilt_c']:5.1f} %")
-    print(f"    rate  < {GATE_OMEGA} deg/s           : {s['gate_om_c']:5.1f} %")
+    print(f"    tilt  < {g_tilt:g} deg             : {s['gate_tilt_c']:5.1f} %")
+    print(f"    rate  < {g_om:g} deg/s           : {s['gate_om_c']:5.1f} %")
     print()
     print(f"  D9 lit in                  : {s['boost_rate']:5.1f} % of flights")
     print(f"  burnout before touchdown   : {s['burnout_rate']:5.1f} %")
@@ -2576,6 +2622,19 @@ def main():
     ap.add_argument("--thrust-scatter", type=float, default=THRUST_SCATTER)
     ap.add_argument("--thrust-tau", type=float, default=THRUST_TAU)
     ap.add_argument("--roll-max", type=float, default=ROLL_RATE_MAX)
+    ap.add_argument("--gate-vz", type=float, default=GATE_VZ,
+                    help="vertical touchdown limit [m/s]")
+    ap.add_argument("--gate-vh", type=float, default=GATE_VH,
+                    help="horizontal touchdown limit [m/s]")
+    ap.add_argument("--gate-tilt", type=float, default=GATE_TILT,
+                    help="tilt limit at touchdown [deg]")
+    ap.add_argument("--gate-rate", type=float, default=GATE_OMEGA,
+                    help="transverse rate limit at touchdown [deg/s]")
+    ap.add_argument("--tilt-min", type=float, default=TILT_MIN,
+                    help="guidance tilt cone at the pad [deg] - keep it well under "
+                         "the tilt gate")
+    ap.add_argument("--tilt-slope", type=float, default=TILT_SLOPE, help="deg/m")
+    ap.add_argument("--tilt-cap", type=float, default=TILT_CAP, help="deg")
     ap.add_argument("--no-fins", action="store_true",
                     help="fly without fin control (gimbal only, roll uncontrolled)")
     ap.add_argument("--fin-count", type=int, default=FIN_COUNT)
@@ -2659,7 +2718,12 @@ def main():
                     vx_max=args.vx_max, vx_step=args.vx_step, runs=args.runs,
                     ign_delay_max=args.ign_delay, delay_pad=args.ign_delay,
                     thrust_scatter=args.thrust_scatter, thrust_tau=args.thrust_tau,
-                    roll_max=args.roll_max, wn=args.wn, zeta=args.zeta,
+                    roll_max=args.roll_max,
+                    gate_vz=args.gate_vz, gate_vh=args.gate_vh,
+                    gate_tilt=args.gate_tilt, gate_omega=args.gate_rate,
+                    tilt_min=args.tilt_min, tilt_slope=args.tilt_slope,
+                    tilt_cap=args.tilt_cap,
+                    wn=args.wn, zeta=args.zeta,
                     wn_fin=args.wn_fin, zeta_fin=args.zeta_fin,
                     roll_gain=args.roll_gain, sched_tvc=args.sched_tvc,
                     sched_fin=args.sched_fin,

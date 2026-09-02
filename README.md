@@ -100,9 +100,13 @@ the motor, the throttle clamp and the D9 booster are this project's.
   (release 140-180 m in 5 m steps, vx 0 to +/-7 m/s in 1 m/s steps). Avionics sensor
   noise is deliberately **not** modelled - the controller sees the true state.
 
-Touchdown must pass all five gates: |vz| < 3 m/s, |vh| < 0.75 m/s, tilt < 10 deg,
-transverse rate < 60 deg/s, and actually be on the ground. The rate gate reads the
-**transverse** rate only: roll is uncontrollable by design and does not tip the vehicle.
+Touchdown must pass all five gates - and they are **inputs**, because they describe the
+landing gear rather than the controller: **|vz| < 4 m/s, |vh| < 0.5 m/s, tilt < 4 deg,
+transverse rate < 30 deg/s**, and actually be on the ground. All four are settable
+(`--gate-vz --gate-vh --gate-tilt --gate-rate`, or the *Touchdown gates* box in the
+GUI); the flight is scored outside the compiled kernel, so changing them re-scores
+without re-flying anything. The rate gate reads the **transverse** rate only: roll is
+uncontrollable by design and does not tip the vehicle over.
 
 > **Writing the flight computer?** Everything the vehicle decides, when it decides it
 > and with which numbers is written up plainly in
@@ -258,6 +262,45 @@ costing anything at all - every flight now lands inside the tilt and rate gates,
 touchdown rate drops by a factor of six, and the burn gives away a third as much of its
 thrust to steering. Success once again equals the |vz| gate exactly: the controller is
 no longer part of the problem.
+
+### What the gates cost, and the one guidance change they forced
+
+The gates moved from |vz| < 3 / |vh| < 0.75 / tilt < 10 / rate < 60 to
+**|vz| < 4 / |vh| < 0.5 / tilt < 4 / rate < 30**. Scoring the *same* 5400 flights both
+ways separates the requirement change from everything else:
+
+| | old gates | new gates, same controller |
+|---|---|---|
+| success | 74.0 % | **54.1 %** |
+| \|vz\| | 74.0 % | 77.9 % *(4 m/s is easier)* |
+| \|vh\| | 94.0 % | 88.8 % |
+| tilt | 100.0 % | **66.9 %** |
+| rate | 100.0 % | 100.0 % *(p95 is 6.6 deg/s - 30 was never in danger)* |
+
+The rate gate was free and the vertical gate got easier; **the whole cost is tilt**.
+And the cause was sitting in the guidance law: the tilt cone the vehicle is allowed to
+command is `1.5 deg/m * h + TILT_MIN`, and `TILT_MIN` was **4 deg** - exactly the new
+gate. The guidance was authorised to arrive on the limit, so of course it sometimes
+did.
+
+Lowering that floor is the fix, and it is a real trade rather than a free win - a
+tighter cone protects the tilt gate and starves the horizontal channel:
+
+| tilt cone at the pad | success | tilt gate | p95 tilt | \|vh\| gate |
+|---|---|---|---|---|
+| 4.0 deg (as it was) | 62.9 % | 76.7 % | 5.16 deg | 89.5 % |
+| 2.5 deg | 75.7 % | 90.3 % | 4.54 deg | 89.2 % |
+| **1.5 deg** (now) | 75.6 % | 95.1 % | **3.99 deg** | 87.3 % |
+| 0.8 deg | 72.5 % | 97.5 % | 3.58 deg | 84.0 % |
+
+1.5 deg is chosen over 2.5 not for its mean but for its margin: at 2.5 deg the p95 tilt
+is 4.54 deg, i.e. the 95th percentile sits *outside* a 4 deg gate. `--tilt-min`,
+`--tilt-slope` and `--tilt-cap` are all settable.
+
+**After re-tuning the gains for the new gates: 75.0 % [73.8 - 76.2]** - back above where
+it was under the old, looser set, with tilt passing 88.7 % and the rate gate untouched
+at 100 %. The tuner's cost normalises each gate by its own limit, so tightening a gate
+automatically buys that channel more attention.
 
 ### What the flight computer is allowed to know
 
@@ -461,11 +504,11 @@ go sideways. Both `--booster-cant` and `--booster-azimuth` are settable.
 
 | | |
 |---|---|
-| success, all five gates | **74.0 %**  [95 % interval 72.9 - 75.2] |
-| \|vz\| < 3 m/s | 74.0 % (p95 9.8 m/s) |
-| \|vh\| < 0.75 m/s | 94.0 % (p95 0.82 m/s) |
-| tilt < 10 deg | 100.0 % (p95 5.5 deg) |
-| transverse rate < 60 deg/s | 100.0 % (p95 6.6 deg/s) |
+| success, all five gates | **75.0 %**  [95 % interval 73.8 - 76.2] |
+| \|vz\| < 4 m/s | 77.9 % (p95 9.8 m/s) |
+| \|vh\| < 0.5 m/s | 89.2 % (p95 0.81 m/s) |
+| tilt < 4 deg | 88.7 % (p95 4.9 deg) |
+| transverse rate < 30 deg/s | 100.0 % (p95 7.4 deg/s) |
 | D9 lit | 100 % of flights |
 | burnout before touchdown | 0.9 % |
 | dV spent on steering | 0.13 m/s (clamp waste 16.7 m/s) |

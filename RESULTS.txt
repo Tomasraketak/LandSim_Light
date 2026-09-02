@@ -1,40 +1,40 @@
 tuning 7 gains on 9 entry states x 12 runs = 108 flights per candidate, 60 candidates, 4 worker process(es)
-   12/60  seeded: best cost 0.4784  success  64.8 %
-   24/60  best cost 0.4393  success  66.7 %  wn=6.58  zeta=1.07  wn_fin=8.94  zeta_fin=1.44  roll_gain=5.44  sched_tvc=0.51  sched_fin=-0.08
-   36/60  best cost 0.4393  success  66.7 %  wn=6.58  zeta=1.07  wn_fin=8.94  zeta_fin=1.44  roll_gain=5.44  sched_tvc=0.51  sched_fin=-0.08
-   48/60  best cost 0.4393  success  66.7 %  wn=6.58  zeta=1.07  wn_fin=8.94  zeta_fin=1.44  roll_gain=5.44  sched_tvc=0.51  sched_fin=-0.08
-   60/60  best cost 0.4393  success  66.7 %  wn=6.58  zeta=1.07  wn_fin=8.94  zeta_fin=1.44  roll_gain=5.44  sched_tvc=0.51  sched_fin=-0.08
+   12/60  seeded: best cost 0.6916  success  50.9 %
+   24/60  best cost 0.5210  success  63.0 %  wn=5.93  zeta=0.72  wn_fin=6.54  zeta_fin=1.59  roll_gain=1.86  sched_tvc=0.33  sched_fin=0.02
+   36/60  best cost 0.5210  success  63.0 %  wn=5.93  zeta=0.72  wn_fin=6.54  zeta_fin=1.59  roll_gain=1.86  sched_tvc=0.33  sched_fin=0.02
+   48/60  best cost 0.5210  success  63.0 %  wn=5.93  zeta=0.72  wn_fin=6.54  zeta_fin=1.59  roll_gain=1.86  sched_tvc=0.33  sched_fin=0.02
+   60/60  best cost 0.5210  success  63.0 %  wn=5.93  zeta=0.72  wn_fin=6.54  zeta_fin=1.59  roll_gain=1.86  sched_tvc=0.33  sched_fin=0.02
   run-off: 5 finalists re-flown on 36 runs per state
-  best: wn=6.582  zeta=1.073  wn_fin=8.940  zeta_fin=1.438  roll_gain=5.435  sched_tvc=0.511  sched_fin=-0.084
+  best: wn=4.000  zeta=0.600  wn_fin=9.538  zeta_fin=1.600  roll_gain=4.291  sched_tvc=0.113  sched_fin=-0.568
   gains written to tvc_gains.json
 
      5/135  h=140.0 m  vx=-3 m/s   success  75.0 %
     10/135  h=140.0 m  vx=+2 m/s   success  80.0 %
-    15/135  h=145.0 m  vx=-7 m/s   success  62.5 %
-    20/135  h=145.0 m  vx=-3 m/s   success  77.5 %
-    25/135  h=145.0 m  vx=+2 m/s   success  70.0 %
-    30/135  h=145.0 m  vx=+7 m/s   success  87.5 %
-    35/135  h=150.0 m  vx=-2 m/s   success  75.0 %
-    40/135  h=150.0 m  vx=+1 m/s   success  85.0 %
-    45/135  h=150.0 m  vx=+7 m/s   success  75.0 %
-    50/135  h=155.0 m  vx=-3 m/s   success  70.0 %
-    55/135  h=155.0 m  vx=+2 m/s   success  77.5 %
-    60/135  h=155.0 m  vx=+7 m/s   success  67.5 %
-    65/135  h=160.0 m  vx=-3 m/s   success  72.5 %
-    70/135  h=160.0 m  vx=+1 m/s   success  80.0 %
-    75/135  h=160.0 m  vx=+7 m/s   success  85.0 %
-    80/135  h=165.0 m  vx=-3 m/s   success  57.5 %
-    85/135  h=165.0 m  vx=+3 m/s   success  85.0 %
+    15/135  h=140.0 m  vx=+6 m/s   success  80.0 %
+    20/135  h=145.0 m  vx=-4 m/s   success  77.5 %
+    25/135  h=145.0 m  vx=+2 m/s   success  72.5 %
+    30/135  h=145.0 m  vx=+6 m/s   success  90.0 %
+    35/135  h=150.0 m  vx=-2 m/s   success  77.5 %
+    40/135  h=150.0 m  vx=+2 m/s   success  80.0 %
+    45/135  h=150.0 m  vx=+7 m/s   success  72.5 %
+    50/135  h=155.0 m  vx=-3 m/s   success  77.5 %
+    55/135  h=155.0 m  vx=+2 m/s   success  82.5 %
+    60/135  h=155.0 m  vx=+7 m/s   success  65.0 %
+    65/135  h=160.0 m  vx=-3 m/s   success  75.0 %
+    70/135  h=160.0 m  vx=+1 m/s   success  87.5 %
+    75/135  h=160.0 m  vx=+7 m/s   success  82.5 %
+    80/135  h=165.0 m  vx=-3 m/s   success  65.0 %
+    85/135  h=165.0 m  vx=+2 m/s   success  77.5 %
     90/135  h=165.0 m  vx=+7 m/s   success  72.5 %
-    95/135  h=170.0 m  vx=-3 m/s   success  80.0 %
-   100/135  h=170.0 m  vx=+2 m/s   success  65.0 %
-   105/135  h=170.0 m  vx=+7 m/s   success  80.0 %
-   110/135  h=175.0 m  vx=-3 m/s   success  72.5 %
-   115/135  h=175.0 m  vx=+2 m/s   success  57.5 %
-   120/135  h=175.0 m  vx=+7 m/s   success  80.0 %
-   125/135  h=180.0 m  vx=-3 m/s   success  70.0 %
-   130/135  h=180.0 m  vx=+2 m/s   success  75.0 %
-   135/135  h=180.0 m  vx=+7 m/s   success  70.0 %
+    95/135  h=170.0 m  vx=-3 m/s   success  82.5 %
+   100/135  h=170.0 m  vx=+2 m/s   success  70.0 %
+   105/135  h=170.0 m  vx=+7 m/s   success  77.5 %
+   110/135  h=175.0 m  vx=-3 m/s   success  77.5 %
+   115/135  h=175.0 m  vx=+2 m/s   success  67.5 %
+   120/135  h=175.0 m  vx=+7 m/s   success  77.5 %
+   125/135  h=180.0 m  vx=-3 m/s   success  77.5 %
+   130/135  h=180.0 m  vx=+2 m/s   success  80.0 %
+   135/135  h=180.0 m  vx=+7 m/s   success  72.5 %
 ==============================================================================
 LandSim Light - 3-D / TVC Monte Carlo
 ==============================================================================
@@ -50,58 +50,58 @@ LandSim Light - 3-D / TVC Monte Carlo
   fins              : 4 fins, 64.0 cm2 each, AR 1.53, CL_alpha 2.13 /rad, +/-15 deg in 90 ms (333 deg/s), arm 0.50 m, roll arm 80 mm; airbrake adds dCd 0.231
   airbrake mode     : auto  (free-fall Cd 0.581 against 0.350 bare)
   entry grid        : 140-180 m step 5, vx 0 +/-7 m/s step 1
-  gains             : wn 6.58 / zeta 1.07 (TVC, schedule +0.51), wn 8.94 / zeta 1.44 (fins, schedule -0.08), roll 5.44
+  gains             : wn 4.00 / zeta 0.60 (TVC, schedule +0.11), wn 9.54 / zeta 1.60 (fins, schedule -0.57), roll 4.29
   dispersions       : igniter U(0, 300) ms, thrust +/-15 % over 700 ms, roll U(0, 90) deg/s
   flights           : 135 cells x 40 = 5400
 
-  SUCCESS (all five gates)   :  74.0 %   [95 % interval 72.9 - 75.2 on 5400 flights]
-    |v_z| < 3.0 m/s              :  74.0 %   p95   9.84 m/s
-    |v_h| < 0.75 m/s           :  94.0 %   p95   0.82 m/s
-    tilt  < 10.0 deg             : 100.0 %   p95   5.54 deg
-    rate  < 60.0 deg/s           : 100.0 %   p95   6.59 deg/s
+  SUCCESS (all five gates)   :  75.0 %   [95 % interval 73.8 - 76.2 on 5400 flights]
+    |v_z| < 4 m/s              :  77.9 %   p95   9.81 m/s
+    |v_h| < 0.5 m/s           :  89.2 %   p95   0.81 m/s
+    tilt  < 4 deg             :  88.7 %   p95   4.87 deg
+    rate  < 30 deg/s           : 100.0 %   p95   7.44 deg/s
 
-  ... and over the 3998 flights that survived the VERTICAL gate, i.e. where
+  ... and over the 4205 flights that survived the VERTICAL gate, i.e. where
       the horizontal and attitude corrections actually ran to touchdown:
-    |v_h| < 0.75 m/s           : 100.0 %   p95   0.20 m/s
-    tilt  < 10.0 deg             : 100.0 %
-    rate  < 60.0 deg/s           : 100.0 %
+    |v_h| < 0.5 m/s           :  99.7 %   p95   0.30 m/s
+    tilt  < 4 deg             :  96.4 %
+    rate  < 30 deg/s           : 100.0 %
 
   D9 lit in                  : 100.0 % of flights
-  burnout before touchdown   :   0.9 %
+  burnout before touchdown   :   1.0 %
   mean commanded ignition    :  53.2 m, mean clamp 0.72
   dV spent on steering       :  0.13 m/s (clamp waste  16.7 m/s)
 
   success [%] by release altitude   (95 % interval, 600 flights each)
      - a wiggle inside these brackets is sampling, not physics:
-     140.0 m :  76.5   [ 72.9 -  79.7]
-     145.0 m :  76.8   [ 73.3 -  80.0]
-     150.0 m :  77.5   [ 74.0 -  80.7]
-     155.0 m :  73.2   [ 69.5 -  76.6]
-     160.0 m :  74.0   [ 70.3 -  77.3]
-     165.0 m :  72.7   [ 69.0 -  76.1]
-     170.0 m :  72.0   [ 68.3 -  75.4]
-     175.0 m :  73.2   [ 69.5 -  76.6]
-     180.0 m :  70.5   [ 66.7 -  74.0]
+     140.0 m :  75.5   [ 71.9 -  78.8]
+     145.0 m :  76.3   [ 72.8 -  79.6]
+     150.0 m :  78.7   [ 75.2 -  81.8]
+     155.0 m :  75.8   [ 72.3 -  79.1]
+     160.0 m :  74.3   [ 70.7 -  77.7]
+     165.0 m :  73.2   [ 69.5 -  76.6]
+     170.0 m :  74.0   [ 70.3 -  77.3]
+     175.0 m :  74.3   [ 70.7 -  77.7]
+     180.0 m :  73.0   [ 69.3 -  76.4]
   success [%] by horizontal entry speed   (360 flights each)
-     -7.0 m/s :  70.3   [ 65.4 -  74.8]
-     -6.0 m/s :  71.9   [ 67.1 -  76.3]
-     -5.0 m/s :  70.6   [ 65.7 -  75.0]
-     -4.0 m/s :  68.6   [ 63.6 -  73.2]
-     -3.0 m/s :  73.1   [ 68.2 -  77.4]
-     -2.0 m/s :  74.7   [ 70.0 -  78.9]
-     -1.0 m/s :  71.4   [ 66.5 -  75.8]
-     +0.0 m/s :  77.8   [ 73.2 -  81.8]
-     +1.0 m/s :  77.5   [ 72.9 -  81.5]
-     +2.0 m/s :  72.2   [ 67.4 -  76.6]
-     +3.0 m/s :  76.4   [ 71.7 -  80.5]
-     +4.0 m/s :  78.1   [ 73.5 -  82.0]
-     +5.0 m/s :  73.9   [ 69.1 -  78.2]
-     +6.0 m/s :  77.2   [ 72.6 -  81.3]
-     +7.0 m/s :  76.9   [ 72.3 -  81.0]
+     -7.0 m/s :  63.6   [ 58.5 -  68.4]
+     -6.0 m/s :  63.9   [ 58.8 -  68.7]
+     -5.0 m/s :  65.8   [ 60.8 -  70.5]
+     -4.0 m/s :  71.4   [ 66.5 -  75.8]
+     -3.0 m/s :  77.2   [ 72.6 -  81.3]
+     -2.0 m/s :  78.1   [ 73.5 -  82.0]
+     -1.0 m/s :  75.3   [ 70.6 -  79.5]
+     +0.0 m/s :  83.1   [ 78.8 -  86.6]
+     +1.0 m/s :  80.6   [ 76.2 -  84.3]
+     +2.0 m/s :  75.8   [ 71.2 -  80.0]
+     +3.0 m/s :  78.6   [ 74.1 -  82.5]
+     +4.0 m/s :  81.9   [ 77.6 -  85.6]
+     +5.0 m/s :  77.2   [ 72.6 -  81.3]
+     +6.0 m/s :  78.1   [ 73.5 -  82.0]
+     +7.0 m/s :  74.7   [ 70.0 -  78.9]
 
   figures written:
-    figures/run_20260902_083436_long_5400flights/fig1_success_envelope.png
-    figures/run_20260902_083436_long_5400flights/fig2_touchdown_dispersion.png
-    figures/run_20260902_083436_long_5400flights/fig3_single_flight.png
-    figures/run_20260902_083436_long_5400flights/fig4_ignition_and_booster.png
-    figures/run_20260902_083436_long_5400flights/fig5_gates.png
+    figures/run_20260902_085631_long_5400flights/fig1_success_envelope.png
+    figures/run_20260902_085631_long_5400flights/fig2_touchdown_dispersion.png
+    figures/run_20260902_085631_long_5400flights/fig3_single_flight.png
+    figures/run_20260902_085631_long_5400flights/fig4_ignition_and_booster.png
+    figures/run_20260902_085631_long_5400flights/fig5_gates.png
