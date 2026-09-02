@@ -210,7 +210,10 @@ THRUST_TAU = 0.70         # s, correlation window of that scatter
 ROLL_RATE_MAX = 90.0      # deg/s, U(0, max) with a random sign
 SIG_ALIGN = 0.25          # deg, initial attitude alignment error (physical)
 
-N_OUT = 17                # length of the per-flight result vector
+N_OUT = 18                # length of the per-flight result vector
+N_TEL = 19                # telemetry columns:
+#  0 t   1 h   2 vz   3 x   4 vx   5 tilt   6 thrust   7 clamp   8 servo1  9 servo2
+# 10 |w| 11 D9 thrust  12 fin1  13 fin2  14 roll rate  15 y   16-18 thrust axis b
 
 
 # ======================================================================
@@ -537,7 +540,7 @@ def k_from_plan(k_level, t_since_plan, h, vz, mass, thrust_avail, k_min, k_max):
 @njit(cache=True)
 def project_vz(h0, vz0, t0, mass_extra, k_level,
                mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
-               bt, bf, bb, b_prop, b_t_ign, dt):
+               bt, bf, bb, b_prop, b_t_ign, dt, t_scale):
     """Forward-integrate the vertical channel under a candidate plan.
 
     Returns the vertical speed at ground contact (negative = descending).
@@ -573,7 +576,7 @@ def project_vz(h0, vz0, t0, mass_extra, k_level,
 
 @njit(cache=True)
 def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area,
-               k_min, k_max, bt, bf, bb, b_prop, b_t_ign, dt, target):
+               k_min, k_max, bt, bf, bb, b_prop, b_t_ign, dt, target, t_scale):
     """Pick the clamp level whose projected touchdown speed reaches `target`.
 
     The outcome is NOT monotone in the level: too little thrust crashes, enough
@@ -599,7 +602,7 @@ def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area,
         k = k_min + (k_max - k_min) * i / (n_scan - 1)
         f = project_vz(h, vz, t, mass_extra, k,
                        mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
-                       bt, bf, bb, b_prop, b_t_ign, dt) - target
+                       bt, bf, bb, b_prop, b_t_ign, dt, t_scale) - target
         if f > best_f:
             best_f = f
             best_k = k
@@ -625,10 +628,10 @@ def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area,
             m2 = c - (c - a) / 3.0
             f1 = project_vz(h, vz, t, mass_extra, m1,
                             mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
-                            bt, bf, bb, b_prop, b_t_ign, dt) - target
+                            bt, bf, bb, b_prop, b_t_ign, dt, t_scale) - target
             f2 = project_vz(h, vz, t, mass_extra, m2,
                             mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
-                            bt, bf, bb, b_prop, b_t_ign, dt) - target
+                            bt, bf, bb, b_prop, b_t_ign, dt, t_scale) - target
             if f1 > best_f:
                 best_f, best_k = f1, m1
             if f2 > best_f:
@@ -642,7 +645,7 @@ def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area,
         mid = 0.5 * (lo + hi)
         f = project_vz(h, vz, t, mass_extra, mid,
                        mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
-                       bt, bf, bb, b_prop, b_t_ign, dt) - target
+                       bt, bf, bb, b_prop, b_t_ign, dt, t_scale) - target
         if f >= 0.0:
             hi = mid
         else:
@@ -652,7 +655,7 @@ def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area,
 
 @njit(cache=True)
 def project_rh(h0, vz0, t0, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area,
-               k_min, k_max, bt, bf, bb, b_prop, b_t_ign, target):
+               k_min, k_max, bt, bf, bb, b_prop, b_t_ign, target, t_scale=1.0):
     """Projection that RE-SOLVES the clamp level as it goes - the pre-flight model
     of what the flight computer will actually do.
 
@@ -676,16 +679,16 @@ def project_rh(h0, vz0, t0, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area
             k_level, _ = solve_plan(h, vz, t, mass_extra,
                                     mt, mf, mc, prop_mass, i_total, cd, area,
                                     k_min, k_max, bt, bf, bb, b_prop, b_t_ign,
-                                    0.03, target)
+                                    0.03, target, t_scale)
             since = 0.0
-        tn = main_thrust(t, mt, mf)
+        tn = main_thrust(t, mt, mf) * t_scale
         mass = mass_extra + (prop_mass - main_burned(t, mt, mc, prop_mass, i_total))
         if b_t_ign < 1.0e5:
             mass -= boost_burned(t - b_t_ign, bt, bb, b_prop)
         k = k_from_plan(k_level, since, h, vz, mass, tn, k_min, k_max)
         thrust = tn * k
         if b_t_ign < 1.0e5:
-            thrust += boost_thrust(t - b_t_ign, bt, bf)
+            thrust += boost_thrust(t - b_t_ign, bt, bf) * t_scale
         a = (thrust - kd * vz * abs(vz)) / mass - G
         vz_new = vz + a * dt
         h += 0.5 * (vz + vz_new) * dt
@@ -718,7 +721,8 @@ def freefall_to(h_start, h_target, vx0, vz0, cd, area, mass, dt):
 @njit(cache=True)
 def find_ignition(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
                   delay_pad, boost_ready,
-                  mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop):
+                  mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop,
+                  plan_target=PLAN_TARGET_VZ):
     """Commanded ignition altitude and the matching command time.
 
     Three numbers decide it:
@@ -754,7 +758,7 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
         _, vzi, _ = freefall_to(h_start, hh, vx0, vz0, cd_free, area, mass0, 0.005)
         vz_td = project_rh(hh, vzi, 0.0, mass0 - prop_mass,
                            mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
-                           bt, bf, bb, b_prop, b_ign, PLAN_TARGET_VZ)
+                           bt, bf, bb, b_prop, b_ign, plan_target)
         if vz_td > vz_best:
             vz_best = vz_td
             h_best = hh
@@ -776,7 +780,7 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
         _, vzi, _ = freefall_to(h_start, mid, vx0, vz0, cd_free, area, mass0, 0.005)
         vz_td = project_rh(mid, vzi, 0.0, mass0 - prop_mass,
                            mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
-                           bt, bf, bb, b_prop, b_ign, PLAN_TARGET_VZ)
+                           bt, bf, bb, b_prop, b_ign, plan_target)
         if vz_td >= FEASIBLE_VZ:
             hi = mid
         else:
@@ -788,7 +792,7 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
         _, vzi, _ = freefall_to(h_start, mid, vx0, vz0, cd_free, area, mass0, 0.005)
         vz_td = project_rh(mid, vzi, 0.0, mass0 - prop_mass,
                            mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
-                           bt, bf, bb, b_prop, b_ign, PLAN_TARGET_VZ)
+                           bt, bf, bb, b_prop, b_ign, plan_target)
         if vz_td >= FEASIBLE_VZ:
             lo = mid
         else:
@@ -823,7 +827,7 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
 def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fin,
         roll_gain, sched_tvc, sched_fin,
         n_boost, use_boost_rule, roll_max, ign_delay_max, delay_pad,
-        thr_scatter, thr_tau, gyro_ff,
+        thr_scatter, thr_tau, gyro_ff, use_t_est, plan_target,
         n_fin, fin_area, fin_arm, fin_roll_arm, fin_cl_alpha, fin_aspect,
         fin_max, fin_rate, fin_brake_mode, fin_drift, cd_free, b_cant, b_azim, veh,
         mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop, b_total,
@@ -858,6 +862,14 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
     align = math.radians(np.random.normal() * SIG_ALIGN)
     align_az = np.random.uniform(0.0, 2.0 * math.pi)
     s_thr = 0.0                                  # instantaneous thrust deviation
+    # What the FLIGHT COMPUTER believes the motor is doing, as a multiple of the
+    # tabulated curve. It starts at 1.0 (it has only the table) and is corrected from
+    # the accelerometer once the motor lights. This is the single most valuable
+    # measurement on the vehicle: the +/-15 % thrust scatter is the dominant
+    # dispersion, and an accelerometer turns it from an unknown into a known.
+    t_scale = 1.0
+    a_axial_meas = 0.0        # what a body-axial accelerometer reads [m/s2]
+    f_ax_aero = 0.0           # the aerodynamic part of it, which the computer models
 
     mass0 = m_gross + n_boost * b_total          # carried boosters are dead weight
     dry = mass0 - prop_mass
@@ -878,7 +890,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
         h_cmd, _, _ = find_ignition(h_start, vx0, vz0, cd_burn, cd_free, area,
                                     k_min, k_max, mass0, delay_pad, boost_ready,
                                     mt, mf, mc, prop_mass, i_total,
-                                    bt, bf_ax, bb, b_prop)
+                                    bt, bf_ax, bb, b_prop, plan_target)
 
     # ---- state -----------------------------------------------------------
     x, y, h = 0.0, 0.0, h_start
@@ -936,6 +948,8 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
     max_tilt = 0.0
     dv_clamp = 0.0
     dv_tilt = 0.0
+    s_thr_sum = 0.0
+    s_thr_n = 0.0
     k_sum = 0.0
     k_n = 0.0
     h_ign_real = 0.0
@@ -974,7 +988,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             k_level, resid = solve_plan(h, vz, tb_p, dry,
                                         mt, mf, mc, prop_mass, i_total, cd_burn, area,
                                         k_min, k_max, bt, bf_ax, bb, b_prop,
-                                        b_t_ign, 0.02, PLAN_TARGET_VZ)
+                                        b_t_ign, 0.02, plan_target, t_scale)
             # ---- the booster rule ----
             # A D9 is a one-way door: it cannot be throttled, stopped or relit. So it
             # is lit only once the plan says the main motor CANNOT close the landing
@@ -1076,8 +1090,29 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                 tafy = ffk * (bz * ahx - bx * ahz)
                 tafz = ffk * (bx * ahy - by * ahx)
 
-            # real, post-clamp thrust - the nozzle's actual authority
-            t_est = t_nom * k_act
+            # ---- thrust-scale estimator ----
+            # A strapdown accelerometer along the body axis measures the specific
+            # force the vehicle is actually getting. Subtract the aerodynamic part
+            # (which the computer models anyway) and what is left is the real thrust;
+            # divide by the tabulated thrust and the answer is how strong THIS motor
+            # turned out to be. One filtered scalar, a handful of flops, and it feeds
+            # the planner a truth it otherwise has to guess.
+            if use_t_est > 0.5 and engine_on and tb > 0.05:
+                t_table = main_thrust(tb, mt, mf)
+                if b_t_ign < 1.0e5:
+                    t_table += boost_thrust(tb - b_t_ign, bt, bf) / max(k_act, 1e-3)
+                t_meas = a_axial_meas * mass - f_ax_aero
+                denom = t_table * k_act
+                if denom > 15.0 and t_meas > 0.0:
+                    raw = clampf(t_meas / denom, 0.6, 1.4)
+                    # first-order filter, ~0.25 s: the scatter itself wanders over
+                    # 0.7 s, so tracking it is worth doing but chasing noise is not
+                    t_scale += (raw - t_scale) * clampf(dt_c / 0.25, 0.0, 1.0)
+                    t_scale = clampf(t_scale, 0.7, 1.3)
+
+            # real, post-clamp thrust - the nozzle's actual authority. The computer
+            # gets it from the table times its own estimate, never from the truth.
+            t_est = main_thrust(tb, mt, mf) * t_scale * k_act if tb >= 0.0 else 0.0
             if t_est < 8.0:
                 t_est = 8.0
 
@@ -1316,6 +1351,8 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             dv_tilt += thrust * (1.0 - tdz) / mass * DT_PHYS
             k_sum += k_act
             k_n += 1.0
+            s_thr_sum += s_thr
+            s_thr_n += 1.0
 
         rvx, rvy, rvz = vx, vy, vz
         v2 = rvx * rvx + rvy * rvy + rvz * rvz
@@ -1375,6 +1412,13 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
         tty = -l_gimb * thrust_main * (bz * sx - bx * sz)
         ttz = -l_gimb * thrust_main * (bx * sy - by * sx)
 
+        # What a strapdown accelerometer bolted to the body axis would read this
+        # step, and the aerodynamic share of it. The estimator above uses these two
+        # numbers and nothing else - no knowledge of the dispersion.
+        a_axial_meas = ((f_tx + f_ax) * bx + (f_ty + f_ay) * by
+                        + (f_tz + f_az) * bz) / mass
+        f_ax_aero = f_ax * bx + f_ay * by + f_az * bz
+
         I_t = mass * it_coef
         I_a = mass * ia_coef
         ax = (f_tx + f_ax) / mass
@@ -1409,6 +1453,10 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             tel[tel_i, 12] = defl[0]
             tel[tel_i, 13] = defl[1]
             tel[tel_i, 14] = math.degrees(wx * bx + wy * by + wz * bz)
+            tel[tel_i, 15] = y
+            tel[tel_i, 16] = bx      # the thrust axis, for the 3-D viewer
+            tel[tel_i, 17] = by
+            tel[tel_i, 18] = bz
             tel_i += 1
 
         # ---------------- integrate ----------------
@@ -1482,6 +1530,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
     out[14] = t
     out[15] = math.degrees(abs(w_r))
     out[16] = dv_tilt
+    out[17] = s_thr_sum / s_thr_n if s_thr_n > 0.0 else 0.0   # mean thrust deviation
     return out, tel_i
 
 
@@ -1535,6 +1584,8 @@ class TvcConfig:
     # dispersions
     ign_delay_max: float = IGN_DELAY_MAX
     delay_pad: float = IGN_DELAY_PLAN
+    plan_target: float = PLAN_TARGET_VZ   # touchdown speed the planner aims for
+    thrust_estimator: bool = True    # estimate the real thrust from the accelerometer
     thrust_scatter: float = THRUST_SCATTER
     thrust_tau: float = THRUST_TAU
     roll_max: float = ROLL_RATE_MAX
@@ -1658,7 +1709,7 @@ def plan_ignition(cfg: TvcConfig, h0: float, vx0: float) -> float:
                                 cfg.delay_pad, ready, mt, mf, mc,
                                 m.propellant_mass, m.total_impulse,
                                 bt, bf * math.cos(math.radians(cfg.booster_cant)),
-                                bb, b.propellant_mass)
+                                bb, b.propellant_mass, cfg.plan_target)
     return float(h_cmd)
 
 
@@ -1668,7 +1719,7 @@ def fly_one(cfg: TvcConfig, seed: int, h0: float, vx0: float, n_tel: int = 0,
     m, b = cfg.tables()
     mt, mf, mc = motor_arrays(m)
     bt, bf, bb = booster_arrays(b)
-    tel = np.zeros((max(n_tel, 1), 15))
+    tel = np.zeros((max(n_tel, 1), N_TEL))
     fa, cd_free = cfg.fin_args()
     out, n = fly(seed, float(h0), float(vx0), float(cfg.vz0),
                  cfg.gross_mass, cfg.cd, cfg.cd_burn, cfg.wn, cfg.zeta,
@@ -1678,6 +1729,7 @@ def fly_one(cfg: TvcConfig, seed: int, h0: float, vx0: float, n_tel: int = 0,
                  cfg.roll_max, cfg.ign_delay_max, cfg.delay_pad,
                  cfg.thrust_scatter, cfg.thrust_tau,
                  1.0 if cfg.gyro_ff else 0.0,
+                 1.0 if cfg.thrust_estimator else 0.0, cfg.plan_target,
                  fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6], fa[7], fa[8],
                  fa[9], cd_free, math.radians(cfg.booster_cant),
                  math.radians(cfg.booster_azimuth), cfg.vehicle(),
@@ -1696,63 +1748,100 @@ def ignition_grid(cfg: TvcConfig):
                      for h0 in h_grid])
 
 
-def run_campaign(cfg: TvcConfig, on_progress=None, should_stop=None,
-                 h_cmd_grid=None):
-    """Monte Carlo over the entry grid under COMMON RANDOM NUMBERS.
+def _campaign_cell(job):
+    """One entry state: its ignition altitude and every flight from it.
 
-    Every cell flies the same list of seeds, so a difference between two
-    configurations is a real difference and not sampling noise.
+    A whole cell per task is the right granularity - the ignition search costs more
+    than the flights do, so it must not be repeated, and 135 tasks keep every core
+    busy without the queue becoming the bottleneck.
     """
+    cfg, i, j, h0, vx0, seeds, cell_offset, h_cmd = job
     m, b = cfg.tables()
     mt, mf, mc = motor_arrays(m)
     bt, bf, bb = booster_arrays(b)
-    h_grid, vx_grid = cfg.entry_grid()
     fa, cd_free = cfg.fin_args()
     veh = cfg.vehicle()
-    # Common random numbers ACROSS CONFIGURATIONS, independent BETWEEN CELLS.
-    #
-    # Using one seed list for every cell (which is what this did) makes each cell see
-    # the identical igniter delays, so neighbouring release altitudes fail on the same
-    # draws and the by-altitude curve wanders by ten points on 40 flights - it looks
-    # like physics and it is sampling. Offsetting the seeds per cell keeps the
-    # comparison between two CONFIGURATIONS exact (a given cell and run index always
-    # gets the same seed) while making the cells independent of each other.
+    tel = np.zeros((1, N_TEL))
+    if h_cmd is None:
+        h_cmd = plan_ignition(cfg, h0, vx0)
+    res = np.zeros((len(seeds), N_OUT))
+    for r, sd in enumerate(seeds):
+        out, _ = fly(int(sd) + cell_offset, float(h0), float(vx0), float(cfg.vz0),
+                     cfg.gross_mass, cfg.cd, cfg.cd_burn, cfg.wn, cfg.zeta,
+                     cfg.wn_fin, cfg.zeta_fin, cfg.roll_gain,
+                     cfg.sched_tvc, cfg.sched_fin,
+                     float(cfg.n_boosters),
+                     1.0 if cfg.use_booster_rule else 0.0,
+                     cfg.roll_max, cfg.ign_delay_max, cfg.delay_pad,
+                     cfg.thrust_scatter, cfg.thrust_tau,
+                     1.0 if cfg.gyro_ff else 0.0,
+                     1.0 if cfg.thrust_estimator else 0.0, cfg.plan_target,
+                     fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6], fa[7], fa[8],
+                     fa[9], cd_free, math.radians(cfg.booster_cant),
+                     math.radians(cfg.booster_azimuth), veh,
+                     mt, mf, mc, m.propellant_mass, m.total_impulse,
+                     bt, bf, bb, b.propellant_mass, b.total_mass, tel, 0, h_cmd)
+        res[r] = out
+    return i, j, res
+
+
+def run_campaign(cfg: TvcConfig, on_progress=None, should_stop=None,
+                 h_cmd_grid=None, workers=None):
+    """Monte Carlo over the entry grid under COMMON RANDOM NUMBERS.
+
+    Every cell flies the same list of seeds (offset per cell, so the cells are
+    independent of each other but a given cell and run index gets the same seed in
+    every configuration), which is what makes a difference between two
+    configurations a real difference rather than sampling noise.
+
+    Cells are independent, so they are spread over worker processes - `workers=None`
+    uses one per core, `workers=1` keeps everything in this process.
+    """
+    import concurrent.futures as cf
+
+    h_grid, vx_grid = cfg.entry_grid()
     seeds = cfg.seed0 + np.arange(cfg.runs)
     res = np.zeros((len(h_grid), len(vx_grid), cfg.runs, N_OUT))
-    tel = np.zeros((1, 15))
     total = len(h_grid) * len(vx_grid)
-    done = 0
+    if workers is None:
+        workers = max(1, min(os.cpu_count() or 1, 16))
+
+    jobs = []
     for i, h0 in enumerate(h_grid):
         for j, vx0 in enumerate(vx_grid):
-            h_cmd = (float(h_cmd_grid[i, j]) if h_cmd_grid is not None
-                     else plan_ignition(cfg, float(h0), float(vx0)))
-            cell_offset = 7919 * (i * len(vx_grid) + j)
-            for r, sd in enumerate(seeds):
-                out, _ = fly(int(sd) + cell_offset,
-                             float(h0), float(vx0), float(cfg.vz0),
-                             cfg.gross_mass, cfg.cd, cfg.cd_burn, cfg.wn, cfg.zeta,
-                             cfg.wn_fin, cfg.zeta_fin, cfg.roll_gain,
-                             cfg.sched_tvc, cfg.sched_fin,
-                             float(cfg.n_boosters),
-                             1.0 if cfg.use_booster_rule else 0.0,
-                             cfg.roll_max, cfg.ign_delay_max, cfg.delay_pad,
-                             cfg.thrust_scatter, cfg.thrust_tau,
-                             1.0 if cfg.gyro_ff else 0.0,
-                             fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6],
-                             fa[7], fa[8], fa[9], cd_free,
-                             math.radians(cfg.booster_cant),
-                             math.radians(cfg.booster_azimuth), veh,
-                             mt, mf, mc, m.propellant_mass, m.total_impulse,
-                             bt, bf, bb, b.propellant_mass, b.total_mass, tel, 0,
-                             h_cmd)
-                res[i, j, r] = out
-            done += 1
-            if on_progress is not None and (done % 5 == 0 or done == total):
-                sr = res[i, j, :, 0].mean() * 100.0
-                on_progress(f"  {done:4d}/{total}  h={h0:5.1f} m  vx={vx0:+.0f} m/s"
-                            f"   success {sr:5.1f} %")
+            jobs.append((cfg, i, j, float(h0), float(vx0), seeds,
+                         7919 * (i * len(vx_grid) + j),
+                         None if h_cmd_grid is None else float(h_cmd_grid[i, j])))
+
+    done = 0
+
+    def deliver(result):
+        nonlocal done
+        i, j, cell = result
+        res[i, j] = cell
+        done += 1
+        if on_progress is not None and (done % 5 == 0 or done == total):
+            on_progress(f"  {done:4d}/{total}  h={h_grid[i]:5.1f} m  "
+                        f"vx={vx_grid[j]:+.0f} m/s   success {cell[:, 0].mean() * 100:5.1f} %")
+
+    if workers <= 1:
+        for job in jobs:
+            deliver(_campaign_cell(job))
             if should_stop is not None and should_stop():
                 raise landsim.Cancelled()
+    else:
+        with cf.ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_campaign_cell, job) for job in jobs]
+            try:
+                for fut in cf.as_completed(futures):
+                    deliver(fut.result())
+                    if should_stop is not None and should_stop():
+                        for f in futures:
+                            f.cancel()
+                        raise landsim.Cancelled()
+            except landsim.Cancelled:
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
     return {"h_grid": h_grid, "vx_grid": vx_grid, "seeds": seeds, "out": res,
             "cfg": cfg}
 
@@ -2014,6 +2103,170 @@ def _style(ax, title=None, xlabel=None, ylabel=None):
         ax.set_ylabel(ylabel, color=INK2, fontsize=9)
 
 
+FIGURES = ("envelope", "dispersion", "single flight", "ignition", "gates")
+
+
+def draw_figure(name, fig, camp, single=None):
+    """Draw one of the campaign's figures into an existing matplotlib Figure.
+
+    Split out so the GUI can draw the same pictures into an embedded canvas rather
+    than looking at PNGs on disk - one implementation, two destinations.
+    """
+    from matplotlib.colors import LinearSegmentedColormap
+    s = summarise(camp)
+    cfg = camp["cfg"]
+    h_grid, vx_grid = camp["h_grid"], camp["vx_grid"]
+    flat = s["flat"]
+    fig.patch.set_facecolor("#fcfcfb")
+    blues = LinearSegmentedColormap.from_list(
+        "blues", ["#f2f6fb", "#cddff4", "#8fb9e8", "#4a90d9", "#2a78d6", "#17457c"])
+
+    if name == "envelope":
+        ax = fig.add_subplot(111)
+        im = ax.imshow(s["grid"], origin="lower", cmap=blues, vmin=0, vmax=100,
+                       aspect="auto")
+        ax.set_xticks(range(len(vx_grid)))
+        ax.set_xticklabels([f"{v:+.0f}" for v in vx_grid])
+        ax.set_yticks(range(len(h_grid)))
+        ax.set_yticklabels([f"{h:.0f}" for h in h_grid])
+        for i in range(len(h_grid)):
+            for j in range(len(vx_grid)):
+                v = s["grid"][i, j]
+                ax.text(j, i, f"{v:.0f}", ha="center", va="center", fontsize=8,
+                        color="#ffffff" if v > 55 else INK)
+        _style(ax, f"Landing success across the entry envelope  -  {cfg.runs} flights "
+                   f"per cell, {s['success']:.1f} % overall",
+               "horizontal entry speed vx [m/s]", "release altitude [m]")
+        ax.grid(False)
+        cb = fig.colorbar(im, ax=ax, pad=0.02)
+        cb.set_label("flights inside every gate [%]", color=INK2, fontsize=9)
+        cb.ax.tick_params(colors=INK2, labelsize=8)
+
+    elif name == "dispersion":
+        axes = fig.subplots(1, 2)
+        ok = flat[:, 0] > 0.5
+        ax = axes[0]
+        ax.scatter(flat[~ok, 2], flat[~ok, 1], s=14, c=BAD, alpha=0.55, linewidths=0,
+                   label="failed")
+        ax.scatter(flat[ok, 2], flat[ok, 1], s=14, c=GOOD, alpha=0.75, linewidths=0,
+                   label="landed")
+        ax.axvline(GATE_VH, color=INK2, lw=1.2, ls="--")
+        ax.axhline(GATE_VZ, color=INK2, lw=1.2, ls="--")
+        ax.set_yscale("symlog", linthresh=5)
+        _style(ax, "Where the vehicle actually arrives",
+               "horizontal speed at touchdown [m/s]", "vertical speed [m/s]")
+        ax.legend(frameon=False, fontsize=8, loc="lower right")
+        ax = axes[1]
+        ax.scatter(flat[~ok, 3], flat[~ok, 4], s=14, c=BAD, alpha=0.55, linewidths=0)
+        ax.scatter(flat[ok, 3], flat[ok, 4], s=14, c=GOOD, alpha=0.75, linewidths=0)
+        ax.axvline(GATE_TILT, color=INK2, lw=1.2, ls="--")
+        ax.axhline(GATE_OMEGA, color=INK2, lw=1.2, ls="--")
+        _style(ax, "Attitude at touchdown  (dashed = gates)",
+               "tilt from vertical [deg]", "transverse rate [deg/s]")
+
+    elif name == "single flight":
+        if single is None:
+            mid_h = float(h_grid[len(h_grid) // 2])
+            single = fly_one(cfg, int(camp["seeds"][0]), mid_h, float(vx_grid[-1]),
+                             n_tel=4000)
+        out, tel = single
+        axes = fig.subplots(3, 2)
+        t = tel[:, 0]
+        ax = axes[0][0]
+        ax.plot(t, tel[:, 1], color=SERIES[0], lw=2)
+        ax.axhline(0, color=INK2, lw=0.8)
+        burn = tel[tel[:, 6] > 0.5]
+        if len(burn):
+            ax.axvspan(burn[0, 0], burn[-1, 0], color="#2a78d6", alpha=0.07)
+        _style(ax, "Altitude", "time [s]", "h [m]")
+        ax = axes[0][1]
+        ax.plot(t, tel[:, 2], color=SERIES[0], lw=2, label="vertical")
+        ax.plot(t, tel[:, 4], color=SERIES[1], lw=2, label="horizontal")
+        ax.axhline(0, color=INK2, lw=0.8)
+        _style(ax, f"Velocity  (touchdown {out[1]:.2f} m/s down, {out[2]:.2f} across)",
+               "time [s]", "v [m/s]")
+        ax.legend(frameon=False, fontsize=8)
+        ax = axes[1][0]
+        ax.plot(t, tel[:, 6], color=SERIES[0], lw=2, label="total thrust")
+        ax.plot(t, tel[:, 11], color=SERIES[2], lw=1.6, label="D9 booster")
+        ax.plot(t, tel[:, 7] * 100.0, color=SERIES[1], lw=1.6, label="clamp [%]")
+        _style(ax, "Thrust and clamp", "time [s]", "N   /   clamp %")
+        ax.legend(frameon=False, fontsize=8)
+        ax = axes[1][1]
+        ax.plot(t, tel[:, 5], color=SERIES[0], lw=2, label="tilt [deg]")
+        ax.plot(t, tel[:, 8], color=SERIES[1], lw=1.2, label="servo 1 [deg]")
+        ax.plot(t, tel[:, 9], color=SERIES[2], lw=1.2, label="servo 2 [deg]")
+        _style(ax, "Attitude and both gimbal channels", "time [s]", "deg")
+        ax.legend(frameon=False, fontsize=8)
+        ax = axes[2][0]
+        ax.plot(t, tel[:, 12], color=SERIES[0], lw=1.6, label="fin 1")
+        ax.plot(t, tel[:, 13], color=SERIES[1], lw=1.6, label="fin 2")
+        lim = cfg.fin_max_deflect
+        ax.axhline(lim, color=INK2, lw=0.8, ls="--")
+        ax.axhline(-lim, color=INK2, lw=0.8, ls="--")
+        _style(ax, "Fin deflection  (opposed = airbrake, differential = steering)",
+               "time [s]", "deg")
+        ax.legend(frameon=False, fontsize=8)
+        ax = axes[2][1]
+        ax.plot(t, tel[:, 14], color=SERIES[2], lw=2)
+        ax.axhline(0, color=INK2, lw=0.8)
+        _style(ax, f"Roll rate  ({out[15]:.1f} deg/s at touchdown)", "time [s]",
+               "deg/s")
+        fig.suptitle(f"One flight - release {tel[0, 1]:.0f} m, ignition commanded at "
+                     f"{out[5]:.1f} m, lit at {out[6]:.1f} m after "
+                     f"{out[7] * 1000:.0f} ms, D9 "
+                     f"{'used' if out[8] > 0.5 else 'not used'}",
+                     color=INK, fontsize=11, x=0.01, ha="left")
+
+    elif name == "ignition":
+        axes = fig.subplots(1, 2)
+        ax = axes[0]
+        out4 = camp["out"]
+        for i, h0 in enumerate(h_grid):
+            cell = out4[i].reshape(-1, N_OUT)
+            okc = cell[:, 0] > 0.5
+            ax.scatter(np.full(okc.sum(), h0), cell[okc, 6], s=12, c=GOOD, alpha=0.6,
+                       linewidths=0)
+            ax.scatter(np.full((~okc).sum(), h0), cell[~okc, 6], s=12, c=BAD,
+                       alpha=0.5, linewidths=0)
+            ax.scatter([h0], [cell[0, 5]], s=30, c=INK, marker="_")
+        ax.plot([], [], marker="_", color=INK, lw=0, label="commanded altitude")
+        ax.plot([], [], marker="o", color=GOOD, lw=0, label="lit - landed")
+        ax.plot([], [], marker="o", color=BAD, lw=0, label="lit - failed")
+        _style(ax, "Where the motor actually lit  (spread = igniter delay)",
+               "release altitude [m]", "ignition altitude [m]")
+        ax.legend(frameon=False, fontsize=8, loc="lower right")
+        ax = axes[1]
+        xs = np.arange(len(vx_grid))
+        ax.bar(xs, s["boost_grid"].mean(axis=0), color=SERIES[2], width=0.6)
+        ax.set_xticks(xs)
+        ax.set_xticklabels([f"{v:+.0f}" for v in vx_grid])
+        ax.set_ylim(0, 108)
+        _style(ax, "How often the on-board rule lit the D9",
+               "horizontal entry speed vx [m/s]", "flights using the booster [%]")
+
+    elif name == "gates":
+        axes = fig.subplots(1, 2)
+        ax = axes[0]
+        names = ["|v_z| < 3", "|v_h| < 0.75", "tilt < 10", "rate < 60", "ALL"]
+        vals = [s["gate_vz"], s["gate_vh"], s["gate_tilt"], s["gate_om"], s["success"]]
+        ax.barh(range(len(names)), vals, color=[SERIES[0]] * 4 + [SERIES[1]],
+                height=0.6)
+        ax.set_yticks(range(len(names)))
+        ax.set_yticklabels(names)
+        for i, v in enumerate(vals):
+            ax.text(v + 1, i, f"{v:.1f} %", va="center", fontsize=8, color=INK2)
+        ax.set_xlim(0, 112)
+        ax.invert_yaxis()
+        _style(ax, "Which gate is actually binding", "flights passing [%]", None)
+        ax = axes[1]
+        ax.hist(np.clip(flat[:, 1], 0, 25), bins=40, color=SERIES[0])
+        ax.axvline(GATE_VZ, color=BAD, lw=1.5, ls="--")
+        _style(ax, f"Vertical touchdown speed  (p95 = {s['p95_vz']:.1f} m/s)",
+               "|v_z| at touchdown [m/s]", "flights")
+    return fig
+
+
 def make_figures(camp, outdir="figures", single=None, subfolder=True, tag=""):
     """Write the campaign's figures. Returns the list of paths written.
 
@@ -2024,9 +2277,8 @@ def make_figures(camp, outdir="figures", single=None, subfolder=True, tag=""):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.colors import LinearSegmentedColormap
-
     import shutil
+
     root = outdir
     os.makedirs(root, exist_ok=True)
     if subfolder:
@@ -2036,212 +2288,27 @@ def make_figures(camp, outdir="figures", single=None, subfolder=True, tag=""):
                 + (f"_{tag}" if tag else ""))
         outdir = os.path.join(root, name)
         os.makedirs(outdir, exist_ok=True)
-    s = summarise(camp)
-    cfg = camp["cfg"]
-    h_grid, vx_grid = camp["h_grid"], camp["vx_grid"]
-    flat = s["flat"]
+
+    sizes = {"envelope": (1.1 * len(camp["vx_grid"]) + 3.2,
+                          0.52 * len(camp["h_grid"]) + 2.6),
+             "dispersion": (11, 4.2), "single flight": (11.5, 10.0),
+             "ignition": (11, 4.2), "gates": (11, 4.0)}
+    files = {"envelope": "fig1_success_envelope.png",
+             "dispersion": "fig2_touchdown_dispersion.png",
+             "single flight": "fig3_single_flight.png",
+             "ignition": "fig4_ignition_and_booster.png",
+             "gates": "fig5_gates.png"}
     paths = []
-    blues = LinearSegmentedColormap.from_list(
-        "blues", ["#f2f6fb", "#cddff4", "#8fb9e8", "#4a90d9", "#2a78d6", "#17457c"])
-
-    # --- 1. success envelope ------------------------------------------
-    fig, ax = plt.subplots(figsize=(1.1 * len(vx_grid) + 3.2,
-                                    0.52 * len(h_grid) + 2.6), dpi=140)
-    fig.patch.set_facecolor("#fcfcfb")
-    im = ax.imshow(s["grid"], origin="lower", cmap=blues, vmin=0, vmax=100,
-                   aspect="auto")
-    ax.set_xticks(range(len(vx_grid)))
-    ax.set_xticklabels([f"{v:+.0f}" for v in vx_grid])
-    ax.set_yticks(range(len(h_grid)))
-    ax.set_yticklabels([f"{h:.0f}" for h in h_grid])
-    for i in range(len(h_grid)):
-        for j in range(len(vx_grid)):
-            v = s["grid"][i, j]
-            ax.text(j, i, f"{v:.0f}", ha="center", va="center", fontsize=8,
-                    color="#ffffff" if v > 55 else INK)
-    _style(ax, f"Landing success across the entry envelope  -  "
-               f"{cfg.runs} flights per cell, {int(s['success'] * len(flat) / 100)}"
-               f"/{len(flat)} overall ({s['success']:.1f} %)",
-           "horizontal entry speed vx [m/s]", "release altitude [m]")
-    ax.grid(False)
-    cb = fig.colorbar(im, ax=ax, pad=0.02)
-    cb.set_label("flights inside every gate [%]", color=INK2, fontsize=9)
-    cb.ax.tick_params(colors=INK2, labelsize=8)
-    fig.tight_layout()
-    p = os.path.join(outdir, "fig1_success_envelope.png")
-    fig.savefig(p, facecolor=fig.get_facecolor())
-    plt.close(fig)
-    paths.append(p)
-
-    # --- 2. touchdown dispersion --------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), dpi=140)
-    fig.patch.set_facecolor("#fcfcfb")
-    ok = flat[:, 0] > 0.5
-    ax = axes[0]
-    ax.scatter(flat[~ok, 2], flat[~ok, 1], s=14, c=BAD, alpha=0.55,
-               linewidths=0, label="failed")
-    ax.scatter(flat[ok, 2], flat[ok, 1], s=14, c=GOOD, alpha=0.75,
-               linewidths=0, label="landed")
-    ax.axvline(GATE_VH, color=INK2, lw=1.2, ls="--")
-    ax.axhline(GATE_VZ, color=INK2, lw=1.2, ls="--")
-    ax.text(GATE_VH, ax.get_ylim()[1] * 0.97, f" |v_h| gate {GATE_VH} m/s",
-            fontsize=8, color=INK2, va="top")
-    ax.text(ax.get_xlim()[1] * 0.98, GATE_VZ, f"|v_z| gate {GATE_VZ} m/s ",
-            fontsize=8, color=INK2, ha="right", va="bottom")
-    ax.set_yscale("symlog", linthresh=5)
-    _style(ax, "Where the vehicle actually arrives",
-           "horizontal speed at touchdown [m/s]", "vertical speed [m/s]")
-    ax.legend(frameon=False, fontsize=8, labelcolor=INK2, loc="lower right")
-
-    ax = axes[1]
-    ax.scatter(flat[~ok, 3], flat[~ok, 4], s=14, c=BAD, alpha=0.55, linewidths=0)
-    ax.scatter(flat[ok, 3], flat[ok, 4], s=14, c=GOOD, alpha=0.75, linewidths=0)
-    ax.axvline(GATE_TILT, color=INK2, lw=1.2, ls="--")
-    ax.axhline(GATE_OMEGA, color=INK2, lw=1.2, ls="--")
-    _style(ax, "Attitude at touchdown  (dashed = gates)",
-           "tilt from vertical [deg]", "transverse rate [deg/s]")
-    fig.tight_layout()
-    p = os.path.join(outdir, "fig2_touchdown_dispersion.png")
-    fig.savefig(p, facecolor=fig.get_facecolor())
-    plt.close(fig)
-    paths.append(p)
-
-    # --- 3. a single flight -------------------------------------------
-    if single is None:
-        mid_h = float(h_grid[len(h_grid) // 2])
-        single = fly_one(cfg, int(camp["seeds"][0]), mid_h,
-                         float(vx_grid[-1]), n_tel=4000)
-    out, tel = single
-    fig, axes = plt.subplots(3, 2, figsize=(11.5, 10.0), dpi=140)
-    fig.patch.set_facecolor("#fcfcfb")
-    t = tel[:, 0]
-    ax = axes[0][0]
-    ax.plot(t, tel[:, 1], color=SERIES[0], lw=2)
-    ax.axhline(0, color=INK2, lw=0.8)
-    burn = tel[tel[:, 6] > 0.5]
-    if len(burn):
-        ax.axvspan(burn[0, 0], burn[-1, 0], color="#2a78d6", alpha=0.07)
-        ax.text(burn[0, 0], ax.get_ylim()[1] * 0.9, " burn", fontsize=8,
-                color=INK2)
-    _style(ax, "Altitude", "time [s]", "h [m]")
-
-    ax = axes[0][1]
-    ax.plot(t, tel[:, 2], color=SERIES[0], lw=2, label="vertical")
-    ax.plot(t, tel[:, 4], color=SERIES[1], lw=2, label="horizontal")
-    ax.axhline(0, color=INK2, lw=0.8)
-    _style(ax, f"Velocity  (touchdown {out[1]:.2f} m/s down, {out[2]:.2f} m/s across)",
-           "time [s]", "v [m/s]")
-    ax.legend(frameon=False, fontsize=8, labelcolor=INK2)
-
-    ax = axes[1][0]
-    ax.plot(t, tel[:, 6], color=SERIES[0], lw=2, label="total thrust")
-    ax.plot(t, tel[:, 11], color=SERIES[2], lw=1.6, label="D9 booster")
-    ax.plot(t, tel[:, 7] * 100.0, color=SERIES[1], lw=1.6, label="clamp [%]")
-    _style(ax, "Thrust and clamp", "time [s]", "N   /   clamp %")
-    ax.legend(frameon=False, fontsize=8, labelcolor=INK2)
-
-    ax = axes[1][1]
-    ax.plot(t, tel[:, 5], color=SERIES[0], lw=2, label="tilt [deg]")
-    ax.plot(t, tel[:, 8], color=SERIES[1], lw=1.2, label="servo 1 [deg]")
-    ax.plot(t, tel[:, 9], color=SERIES[2], lw=1.2, label="servo 2 [deg]")
-    _style(ax, "Attitude and both gimbal channels", "time [s]", "deg")
-    ax.legend(frameon=False, fontsize=8, labelcolor=INK2)
-
-    ax = axes[2][0]
-    ax.plot(t, tel[:, 12], color=SERIES[0], lw=1.6, label="fin 1")
-    ax.plot(t, tel[:, 13], color=SERIES[1], lw=1.6, label="fin 2")
-    lim = cfg.fin_max_deflect
-    ax.axhline(lim, color=INK2, lw=0.8, ls="--")
-    ax.axhline(-lim, color=INK2, lw=0.8, ls="--")
-    ax.text(t[0], lim, " deflection limit", fontsize=8, color=INK2, va="bottom")
-    _style(ax, "Fin deflection  (opposed = airbrake, differential = steering)",
-           "time [s]", "deg")
-    ax.legend(frameon=False, fontsize=8, labelcolor=INK2)
-
-    ax = axes[2][1]
-    ax.plot(t, tel[:, 14], color=SERIES[2], lw=2)
-    ax.axhline(0, color=INK2, lw=0.8)
-    _style(ax, f"Roll rate - the fins null the spin the vehicle arrived with "
-               f"({out[15]:.1f} deg/s at touchdown)", "time [s]", "deg/s")
-    fig.suptitle(f"One flight - release {single[1][0, 1]:.0f} m, "
-                 f"ignition commanded at {out[5]:.1f} m, lit at {out[6]:.1f} m "
-                 f"after {out[7] * 1000:.0f} ms, "
-                 f"D9 {'used' if out[8] > 0.5 else 'not used'}",
-                 color=INK, fontsize=11, x=0.01, ha="left")
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
-    p = os.path.join(outdir, "fig3_single_flight.png")
-    fig.savefig(p, facecolor=fig.get_facecolor())
-    plt.close(fig)
-    paths.append(p)
-
-    # --- 4. ignition window -------------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), dpi=140)
-    fig.patch.set_facecolor("#fcfcfb")
-    ax = axes[0]
-    out4 = camp["out"]
-    for i, h0 in enumerate(h_grid):
-        cell = out4[i].reshape(-1, N_OUT)
-        okc = cell[:, 0] > 0.5
-        ax.scatter(np.full(okc.sum(), h0), cell[okc, 6], s=12, c=GOOD,
-                   alpha=0.6, linewidths=0)
-        ax.scatter(np.full((~okc).sum(), h0), cell[~okc, 6], s=12, c=BAD,
-                   alpha=0.5, linewidths=0)
-        ax.scatter([h0], [cell[0, 5]], s=30, c=INK, marker="_")
-    ax.plot([], [], marker="_", color=INK, lw=0, label="commanded altitude")
-    ax.plot([], [], marker="o", color=GOOD, lw=0, label="lit - landed")
-    ax.plot([], [], marker="o", color=BAD, lw=0, label="lit - failed")
-    _style(ax, "Where the motor actually lit  (spread = igniter delay)",
-           "release altitude [m]", "ignition altitude [m]")
-    ax.legend(frameon=False, fontsize=8, labelcolor=INK2, loc="lower right")
-
-    ax = axes[1]
-    xs = np.arange(len(vx_grid))
-    ax.bar(xs, s["boost_grid"].mean(axis=0), color=SERIES[2], width=0.6)
-    ax.set_xticks(xs)
-    ax.set_xticklabels([f"{v:+.0f}" for v in vx_grid])
-    for x, v in zip(xs, s["boost_grid"].mean(axis=0)):
-        ax.text(x, v + 1.5, f"{v:.0f}", ha="center", fontsize=8, color=INK2)
-    ax.set_ylim(0, 108)
-    _style(ax, "How often the on-board rule lit the D9",
-           "horizontal entry speed vx [m/s]", "flights using the booster [%]")
-    fig.tight_layout()
-    p = os.path.join(outdir, "fig4_ignition_and_booster.png")
-    fig.savefig(p, facecolor=fig.get_facecolor())
-    plt.close(fig)
-    paths.append(p)
-
-    # --- 5. gates ------------------------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.0), dpi=140)
-    fig.patch.set_facecolor("#fcfcfb")
-    ax = axes[0]
-    names = ["|v_z| < 3", "|v_h| < 0.75", "tilt < 10", "rate < 60", "ALL"]
-    vals = [s["gate_vz"], s["gate_vh"], s["gate_tilt"], s["gate_om"],
-            s["success"]]
-    cols = [SERIES[0]] * 4 + [SERIES[1]]
-    ax.barh(range(len(names)), vals, color=cols, height=0.6)
-    ax.set_yticks(range(len(names)))
-    ax.set_yticklabels(names)
-    for i, v in enumerate(vals):
-        ax.text(v + 1, i, f"{v:.1f} %", va="center", fontsize=8, color=INK2)
-    ax.set_xlim(0, 112)
-    ax.invert_yaxis()
-    _style(ax, "Which gate is actually binding", "flights passing [%]", None)
-
-    ax = axes[1]
-    ax.hist(np.clip(flat[:, 1], 0, 25), bins=40, color=SERIES[0])
-    ax.axvline(GATE_VZ, color=BAD, lw=1.5, ls="--")
-    ax.text(GATE_VZ + 0.3, ax.get_ylim()[1] * 0.9, f"gate {GATE_VZ} m/s",
-            fontsize=8, color=INK2)
-    _style(ax, f"Vertical touchdown speed  (p95 = {s['p95_vz']:.1f} m/s)",
-           "|v_z| at touchdown [m/s]", "flights")
-    fig.tight_layout()
-    p = os.path.join(outdir, "fig5_gates.png")
-    fig.savefig(p, facecolor=fig.get_facecolor())
-    plt.close(fig)
-    paths.append(p)
+    for key in FIGURES:
+        fig = plt.figure(figsize=sizes[key], dpi=140)
+        draw_figure(key, fig, camp, single=single)
+        fig.tight_layout(rect=(0, 0, 1, 0.96) if key == "single flight" else None)
+        p = os.path.join(outdir, files[key])
+        fig.savefig(p, facecolor=fig.get_facecolor())
+        plt.close(fig)
+        paths.append(p)
 
     if subfolder:
-        # refresh the "latest" copies at the top of the figure directory
         for p in paths:
             try:
                 shutil.copyfile(p, os.path.join(root, os.path.basename(p)))
@@ -2555,6 +2622,9 @@ def main():
     ap.add_argument("--no-gains", action="store_true",
                     help="ignore the gain file and use the built-in defaults")
     ap.add_argument("--no-gyro-ff", action="store_true")
+    ap.add_argument("--no-thrust-estimator", action="store_true",
+                    help="fly the planner on the tabulated thrust curve instead of "
+                         "the accelerometer's estimate of the real one")
     ap.add_argument("--figures", default="figures", help="output directory")
     ap.add_argument("--no-figures", action="store_true")
     ap.add_argument("--save", default="", help="write the raw results to an .npz")

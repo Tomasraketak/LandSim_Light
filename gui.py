@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import io
 import math
+import os
+import numpy as np
 import contextlib
 import queue
 import threading
@@ -26,6 +28,18 @@ from tkinter import ttk, messagebox
 
 import landsim
 import tvc_sim
+import orkimport
+
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
+                                                   NavigationToolbar2Tk)
+    from matplotlib.figure import Figure
+    from mpl_toolkits.mplot3d import Axes3D             # noqa: F401
+    HAVE_MPL, MPL_ERR = True, ""
+except Exception as _exc:                                # noqa: BLE001
+    HAVE_MPL, MPL_ERR = False, f"{type(_exc).__name__}: {_exc}"
 from landsim import (Config, Motor, Booster, MOTOR_TABLES, NEVER, Cancelled,
                      find_window, ascent, G)
 
@@ -137,6 +151,36 @@ MPL_HINT = ("  A 'No module named matplotlib.backends.registry' error means a HA
             "run with\n      python tvc_sim.py --load results.npz\n")
 
 
+# One palette for the whole window, so the pages look like one program.
+INK, INK2, ACCENT = "#12232e", "#5a6b73", "#2a78d6"
+GOOD, BAD, SURFACE = "#1baf7a", "#e34948", "#f4f5f6"
+
+
+def style_app(root):
+    """A calmer, denser look than the Tk defaults."""
+    st = ttk.Style(root)
+    for theme in ("clam", "vista", "default"):
+        if theme in st.theme_names():
+            st.theme_use(theme)
+            break
+    root.configure(background=SURFACE)
+    st.configure(".", background=SURFACE, foreground=INK, fieldbackground="#ffffff")
+    st.configure("TLabelframe", background=SURFACE, borderwidth=1, relief="solid")
+    st.configure("TLabelframe.Label", background=SURFACE, foreground=ACCENT,
+                 font=("TkDefaultFont", 9, "bold"))
+    st.configure("TNotebook", background=SURFACE, borderwidth=0)
+    st.configure("TNotebook.Tab", padding=(14, 7))
+    st.configure("TButton", padding=(10, 4))
+    st.configure("Run.TButton", padding=(14, 6), font=("TkDefaultFont", 9, "bold"))
+    st.configure("Hint.TLabel", foreground=INK2, background=SURFACE)
+    st.configure("Head.TLabel", font=("TkDefaultFont", 11, "bold"), foreground=INK,
+                 background=SURFACE)
+    st.configure("Good.TLabel", font=("TkDefaultFont", 11, "bold"), foreground=GOOD,
+                 background=SURFACE)
+    st.configure("TProgressbar", background=ACCENT)
+    return st
+
+
 class Tooltip:
     """Minimal hover tooltip.
 
@@ -187,7 +231,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("LandSim Light")
-        root.minsize(1120, 760)
+        root.minsize(1160, 780)
+        style_app(root)
 
         self.queue: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -211,10 +256,16 @@ class App:
         nb.add(oned_tab, text="1-D ignition window")
         tvc_tab = ttk.Frame(nb, padding=10)
         nb.add(tvc_tab, text="3-D / TVC Monte Carlo")
+        view_tab = ttk.Frame(nb, padding=10)
+        nb.add(view_tab, text="Flight viewer")
+        chart_tab = ttk.Frame(nb, padding=10)
+        nb.add(chart_tab, text="Campaign charts")
 
         self.build_vehicle_tab(veh_tab)
         self.build_1d_tab(oned_tab)
         self.build_tvc_tab(tvc_tab)
+        self.build_viewer_tab(view_tab)
+        self.build_charts_tab(chart_tab)
         self.show_motor()
         self.show_fins()
         self.root.after(100, self.poll)
@@ -352,8 +403,15 @@ class App:
                                                         pady=(0, 4))
         self._fields(fin, FIN_FIELDS, columns=3, trace=self.show_fins)
 
-        ttk.Button(tab, text="Reset the vehicle to defaults",
-                   command=self.reset_vehicle).pack(anchor="w", pady=(10, 0))
+        bar = ttk.Frame(tab)
+        bar.pack(fill="x", pady=(10, 0))
+        ttk.Button(bar, text="Import an OpenRocket .ork ...",
+                   command=self.import_ork).pack(side="left", padx=(0, 8))
+        ttk.Button(bar, text="Reset the vehicle to defaults",
+                   command=self.reset_vehicle).pack(side="left")
+        self.ork_info = tk.StringVar(value="")
+        ttk.Label(tab, textvariable=self.ork_info, style="Hint.TLabel",
+                  wraplength=1050, justify="left").pack(anchor="w", pady=(6, 0))
 
     # ------------------------------------------------------------------ #
     #  Page 2: the 1-D ignition-window search
@@ -513,6 +571,68 @@ class App:
         self.show_motor()
         self.show_fins()
 
+    def import_ork(self):
+        """Read an OpenRocket file into the vehicle fields.
+
+        The landing vehicle is NOT the rocket that left the pad: the motor it
+        launched on has burned, so its propellant is gone and its casing is not.
+        The dialog asks for that, because an .ork does not carry motor masses.
+        """
+        from tkinter import filedialog, simpledialog
+        path = filedialog.askopenfilename(
+            title="OpenRocket file",
+            filetypes=[("OpenRocket", "*.ork"), ("XML", "*.xml"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            rock = orkimport.read_ork(path)
+        except Exception as exc:                        # noqa: BLE001
+            messagebox.showerror("Import failed", f"{type(exc).__name__}: {exc}")
+            return
+
+        spent = simpledialog.askfloat(
+            "Spent motor",
+            "Propellant [g] of the motor that has ALREADY burned\n"
+            "(the one it launched on - its casing stays on board):",
+            initialvalue=0.0, minvalue=0.0, parent=self.root)
+        extra = simpledialog.askfloat(
+            "Motor hardware",
+            "Total mass [g] of the motors themselves\n"
+            "(.ork files do not store motor masses - casings, landing motor, D9):",
+            initialvalue=0.0, minvalue=0.0, parent=self.root)
+        spent = (spent or 0.0) / 1000.0
+        extra = (extra or 0.0) / 1000.0
+
+        mass = rock.mass + extra - spent
+        if mass <= self.num("propellant", 0.277):
+            messagebox.showerror("Import failed",
+                                 f"the imported mass comes out at {mass:.3f} kg, "
+                                 f"which is not more than the landing propellant")
+            return
+        self.vars["mass"].set(f"{mass:.3f}")
+        if rock.diameter > 0:
+            self.vars["diameter"].set(f"{rock.diameter * 1000:.1f}")
+        if rock.length > 0:
+            self.vars["mmoi"].set(f"{mass * rock.length ** 2 / 12.0:.4f}")
+            self.vars["mmoi_r"].set(
+                f"{mass * 0.5 * (rock.diameter / 2.0) ** 2:.5f}")
+        if rock.fin_count:
+            self.vars["fin_count"].set(str(rock.fin_count))
+            self.vars["fin_root"].set(f"{rock.fin_root * 1000:.0f}")
+            self.vars["fin_tip"].set(f"{rock.fin_tip * 1000:.0f}")
+            self.vars["fin_span"].set(f"{rock.fin_span * 1000:.0f}")
+            if rock.fin_position and rock.length:
+                # fins sit at the tail; the arm is from the CG, taken at mid-body
+                arm = max(0.05, rock.fin_position + 0.5 * rock.fin_root
+                          - 0.5 * rock.length)
+                self.vars["fin_arm"].set(f"{arm:.2f}")
+        self.ork_info.set(rock.summary() + f"\n  -> gross mass set to {mass:.3f} kg "
+                          f"({rock.mass:.3f} imported + {extra:.3f} motors "
+                          f"- {spent:.3f} spent propellant); MMOI from a "
+                          f"{rock.length:.2f} m rod. Check every field before flying.")
+        self.show_motor()
+        self.show_fins()
+
     def mmoi_from_rod(self):
         """Fill the two MMOI boxes from the simple geometric bodies."""
         try:
@@ -615,6 +735,252 @@ class App:
             fin_max_deflect=n("fin_deflect"), fin_travel_time=n("fin_travel"),
             fin_brake=self.fin_brake.get(),
             fin_drift_null=bool(self.fin_drift.get()))
+
+    # ------------------------------------------------------------------ #
+    #  Page 5: the campaign's charts, live
+    # ------------------------------------------------------------------ #
+    def build_charts_tab(self, tab):
+        ttk.Label(tab, style="Head.TLabel",
+                  text="The last campaign, drawn").pack(anchor="w")
+        ttk.Label(tab, style="Hint.TLabel", wraplength=1050, justify="left",
+                  text="The same five figures the campaign writes to disk, drawn here "
+                       "from the run in memory - run a campaign on the Monte Carlo "
+                       "page, or load a saved .npz.").pack(anchor="w")
+        bar = ttk.Frame(tab)
+        bar.pack(fill="x", pady=(6, 4))
+        ttk.Label(bar, text="figure:").pack(side="left", padx=(8, 4))
+        self.chart_kind = tk.StringVar(value="envelope")
+        cb = ttk.Combobox(bar, textvariable=self.chart_kind, width=16, state="readonly",
+                          values=list(tvc_sim.FIGURES))
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda _e: self.draw_chart())
+        ttk.Button(bar, text="Redraw", command=self.draw_chart).pack(side="left",
+                                                                     padx=8)
+        ttk.Button(bar, text="Load a saved run (.npz) ...",
+                   command=self.load_campaign_file).pack(side="left")
+        self.chart_info = tk.StringVar(value="no campaign in memory yet")
+        ttk.Label(bar, textvariable=self.chart_info,
+                  style="Hint.TLabel").pack(side="left", padx=12)
+
+        body = ttk.Frame(tab)
+        body.pack(fill="both", expand=True)
+        self.camp = None
+        if not HAVE_MPL:
+            ttk.Label(body, foreground=BAD, wraplength=900, justify="left",
+                      text=f"matplotlib is not usable ({MPL_ERR}).\n{MPL_HINT}").pack(
+                anchor="w")
+            self.chart_fig = None
+            return
+        self.chart_fig = Figure(figsize=(12.5, 6.6), dpi=96)
+        self.chart_canvas = FigureCanvasTkAgg(self.chart_fig, master=body)
+        NavigationToolbar2Tk(self.chart_canvas, body).update()
+        self.chart_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def draw_chart(self):
+        if not HAVE_MPL or self.camp is None:
+            return
+        self.chart_fig.clear()
+        try:
+            tvc_sim.draw_figure(self.chart_kind.get(), self.chart_fig, self.camp)
+            self.chart_fig.tight_layout()
+        except Exception as exc:                        # noqa: BLE001
+            self.chart_info.set(f"drawing failed: {type(exc).__name__}: {exc}")
+        self.chart_canvas.draw_idle()
+
+    def load_campaign_file(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(title="Saved campaign",
+                                          filetypes=[("numpy", "*.npz"),
+                                                     ("All", "*.*")])
+        if not path:
+            return
+        try:
+            self.camp = tvc_sim.load_campaign(path)
+        except Exception as exc:                        # noqa: BLE001
+            messagebox.showerror("Load failed", f"{type(exc).__name__}: {exc}")
+            return
+        n = self.camp["out"][:, :, :, 0].size
+        self.chart_info.set(f"{os.path.basename(path)}: {n} flights")
+        self.draw_chart()
+
+    # ------------------------------------------------------------------ #
+    #  Page 4: the flight viewer
+    # ------------------------------------------------------------------ #
+    def build_viewer_tab(self, tab):
+        ttk.Label(tab, style="Head.TLabel",
+                  text="Fly one trajectory and watch it").pack(anchor="w")
+        ttk.Label(tab, style="Hint.TLabel", wraplength=1050, justify="left",
+                  text="One flight at a time, with the vehicle drawn where it "
+                       "actually is and pointing where it actually points. The panels "
+                       "on the right are the same flight, so a wobble in the 3-D view "
+                       "has a cause you can read off the traces.").pack(anchor="w")
+
+        bar = ttk.Frame(tab)
+        bar.pack(fill="x", pady=(6, 4))
+        for label, key, default, width in (("release [m]", "v_h0", "160", 6),
+                                           ("vx [m/s]", "v_vx", "5", 5),
+                                           ("seed", "v_seed", "3", 6)):
+            ttk.Label(bar, text=label + ":").pack(side="left", padx=(8, 3))
+            self.vars.setdefault(key, tk.StringVar(value=default))
+            ttk.Entry(bar, textvariable=self.vars[key], width=width).pack(side="left")
+        ttk.Button(bar, text="Fly it", style="Run.TButton",
+                   command=self.viewer_fly).pack(side="left", padx=(12, 6))
+        self.play_btn = ttk.Button(bar, text="Play", command=self.viewer_play,
+                                   state="disabled")
+        self.play_btn.pack(side="left")
+        ttk.Label(bar, text="speed:").pack(side="left", padx=(10, 3))
+        self.play_speed = tk.StringVar(value="1.0")
+        ttk.Combobox(bar, textvariable=self.play_speed, width=5, state="readonly",
+                     values=("0.25", "0.5", "1.0", "2.0")).pack(side="left")
+        self.frame_var = tk.IntVar(value=0)
+        self.frame_scale = ttk.Scale(bar, from_=0, to=1, orient="horizontal",
+                                     variable=self.frame_var,
+                                     command=lambda _v: self.viewer_draw())
+        self.frame_scale.pack(side="left", fill="x", expand=True, padx=(12, 8))
+        self.viewer_status = tk.StringVar(value="no flight yet")
+        ttk.Label(tab, textvariable=self.viewer_status,
+                  font=("TkFixedFont", 9)).pack(anchor="w", pady=(0, 4))
+
+        body = ttk.Frame(tab)
+        body.pack(fill="both", expand=True)
+        if not HAVE_MPL:
+            ttk.Label(body, foreground=BAD, wraplength=900, justify="left",
+                      text=f"matplotlib is not usable, so there is nothing to draw "
+                           f"here ({MPL_ERR}).\n{MPL_HINT}").pack(anchor="w")
+            self.view_fig = None
+            return
+        self.view_fig = Figure(figsize=(12.5, 6.4), dpi=96)
+        self.view_fig.patch.set_facecolor("#fcfcfb")
+        self.ax3d = self.view_fig.add_subplot(1, 2, 1, projection="3d")
+        self.ax_a = self.view_fig.add_subplot(3, 2, 2)
+        self.ax_b = self.view_fig.add_subplot(3, 2, 4)
+        self.ax_c = self.view_fig.add_subplot(3, 2, 6)
+        self.view_canvas = FigureCanvasTkAgg(self.view_fig, master=body)
+        self.view_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.tel = None
+        self.playing = False
+
+    def viewer_fly(self):
+        try:
+            cfg = self.tvc_config()
+            h0 = self.num("v_h0")
+            vx = self.num("v_vx")
+            seed = int(self.num("v_seed"))
+        except ValueError as exc:
+            messagebox.showerror("Invalid input", str(exc))
+            return
+        out, tel = tvc_sim.fly_one(cfg, seed, h0, vx, n_tel=6000)
+        if len(tel) < 2:
+            messagebox.showerror("Flight viewer", "the flight produced no telemetry")
+            return
+        self.out, self.tel, self.cfg_view = out, tel, cfg
+        self.frame_scale.configure(to=len(tel) - 1)
+        self.frame_var.set(len(tel) - 1)
+        self.play_btn.configure(state="normal")
+        self.viewer_status.set(
+            f"{'LANDED' if out[0] > 0.5 else 'FAILED'}  -  touchdown {out[1]:.2f} m/s "
+            f"down, {out[2]:.2f} m/s across, tilt {out[3]:.1f} deg, rate "
+            f"{out[4]:.1f} deg/s, roll {out[15]:.1f} deg/s   |   ignition commanded "
+            f"{out[5]:.1f} m, lit {out[6]:.1f} m after {out[7] * 1000:.0f} ms, D9 "
+            f"{'lit' if out[8] > 0.5 else 'unused'}, clamp waste {out[11]:.1f} m/s, "
+            f"steering {out[16]:.2f} m/s")
+        self.viewer_draw()
+
+    def viewer_play(self):
+        if not HAVE_MPL or self.tel is None:
+            return
+        self.playing = not self.playing
+        self.play_btn.configure(text="Pause" if self.playing else "Play")
+        if self.playing:
+            if self.frame_var.get() >= len(self.tel) - 1:
+                self.frame_var.set(0)
+            self.viewer_step()
+
+    def viewer_step(self):
+        if not self.playing:
+            return
+        i = self.frame_var.get()
+        if i >= len(self.tel) - 1:
+            self.playing = False
+            self.play_btn.configure(text="Play")
+            return
+        try:
+            speed = float(self.play_speed.get())
+        except ValueError:
+            speed = 1.0
+        self.frame_var.set(i + 1)
+        self.viewer_draw()
+        # telemetry is sampled every 20 ms of flight; play it at that pace
+        self.root.after(max(10, int(20 / max(speed, 0.05))), self.viewer_step)
+
+    def viewer_draw(self):
+        """Redraw the 3-D view and the three traces at the current frame."""
+        if not HAVE_MPL or self.tel is None:
+            return
+        tel = self.tel
+        i = max(0, min(int(self.frame_var.get()), len(tel) - 1))
+        t, h, vz, x, vx = tel[:, 0], tel[:, 1], tel[:, 2], tel[:, 3], tel[:, 4]
+        y = tel[:, 15]
+        ax = self.ax3d
+        ax.clear()
+        ax.set_facecolor("#fcfcfb")
+        # flown so far, and where it is still going
+        ax.plot(x[:i + 1], y[:i + 1], h[:i + 1], color=ACCENT, lw=2)
+        ax.plot(x[i:], y[i:], h[i:], color="#cfd6db", lw=1, ls="--")
+        ax.plot(x[:i + 1], y[:i + 1], np.zeros(i + 1), color="#dfe4e8", lw=1)
+        ax.scatter([0], [0], [0], color=GOOD, s=40, marker="o")
+        # the vehicle: a stick along the thrust axis, plus the thrust itself
+        bx, by, bz = tel[i, 16], tel[i, 17], tel[i, 18]
+        L = max(4.0, 0.04 * float(np.max(h)))
+        ax.plot([x[i] - 0.5 * L * bx, x[i] + 0.5 * L * bx],
+                [y[i] - 0.5 * L * by, y[i] + 0.5 * L * by],
+                [h[i] - 0.5 * L * bz, h[i] + 0.5 * L * bz],
+                color=INK, lw=4, solid_capstyle="round")
+        if tel[i, 6] > 1.0:
+            f = 1.2 * L * tel[i, 6] / max(np.max(tel[:, 6]), 1.0)
+            ax.plot([x[i] - 0.5 * L * bx, x[i] - 0.5 * L * bx - f * bx],
+                    [y[i] - 0.5 * L * by, y[i] - 0.5 * L * by - f * by],
+                    [h[i] - 0.5 * L * bz, h[i] - 0.5 * L * bz - f * bz],
+                    color="#eb6834", lw=3, alpha=0.85)
+        span = max(12.0, float(np.max(np.abs(x))) * 1.3, float(np.max(np.abs(y))) * 1.3)
+        ax.set_xlim(-span, span)
+        ax.set_ylim(-span, span)
+        ax.set_zlim(0, float(np.max(h)) * 1.05)
+        ax.set_xlabel("x [m]", fontsize=8)
+        ax.set_ylabel("y [m]", fontsize=8)
+        ax.set_zlabel("altitude [m]", fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.set_title(f"t = {t[i]:5.2f} s    h = {h[i]:6.1f} m    "
+                     f"vz = {vz[i]:6.1f} m/s    thrust = {tel[i, 6]:5.1f} N",
+                     fontsize=9, color=INK, loc="left")
+
+        for a, series, title, ylabel in (
+                (self.ax_a, ((h, ACCENT, "altitude [m]"),
+                             (-vz, "#eb6834", "descent rate [m/s]")),
+                 "Altitude and descent rate", ""),
+                (self.ax_b, ((tel[:, 6], ACCENT, "total thrust [N]"),
+                             (tel[:, 7] * 100.0, "#eb6834", "clamp [%]")),
+                 "Thrust and clamp", ""),
+                (self.ax_c, ((tel[:, 5], ACCENT, "tilt [deg]"),
+                             (tel[:, 12], "#1baf7a", "fin 1 [deg]"),
+                             (tel[:, 8], "#eb6834", "servo 1 [deg]")),
+                 "Attitude and actuators", "time [s]")):
+            a.clear()
+            a.set_facecolor("#fcfcfb")
+            for data, colour, label in series:
+                a.plot(t, data, color=colour, lw=1.4, label=label)
+            a.axvline(t[i], color=INK2, lw=1.0)
+            a.grid(True, color="#e7e6e1", lw=0.7)
+            a.set_axisbelow(True)
+            a.tick_params(labelsize=7, colors=INK2)
+            a.set_title(title, fontsize=9, loc="left", color=INK)
+            if ylabel:
+                a.set_xlabel(ylabel, fontsize=8, color=INK2)
+            a.legend(fontsize=7, frameon=False, loc="upper right")
+            for side in ("top", "right"):
+                a.spines[side].set_visible(False)
+        self.view_fig.tight_layout()
+        self.view_canvas.draw_idle()
 
     # ------------------------------------------------------------------ #
     #  1-D run
@@ -878,6 +1244,12 @@ class App:
 
     def tvc_finish(self, camp, paths, fig_err=None):
         s = tvc_sim.summarise(camp)
+        self.camp = camp
+        if HAVE_MPL:
+            n = camp["out"][:, :, :, 0].size
+            self.chart_info.set(f"latest campaign: {n} flights, "
+                                f"{s['success']:.1f} % success")
+            self.draw_chart()
         self.tvc_summary.set(f"Success {s['success']:.1f} %   "
                              f"({camp['out'][:, :, :, 0].size} flights in "
                              f"{time.time() - self.t_start:.0f} s)")

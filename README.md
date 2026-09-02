@@ -259,6 +259,60 @@ touchdown rate drops by a factor of six, and the burn gives away a third as much
 thrust to steering. Success once again equals the |vz| gate exactly: the controller is
 no longer part of the problem.
 
+### What the flight computer is allowed to know
+
+The controller used to read the *true* thrust out of the plant for its dynamic
+inversion and its terminal law - a small cheat, but a cheat. It now estimates it the
+way hardware would, from a body-axial accelerometer:
+
+```
+T_measured = a_axial * m - (aerodynamic axial force, which the computer models)
+t_scale   += (clamp(T_measured / (T_table(t) * clamp_setting), 0.6, 1.4) - t_scale)
+             * dt / 0.25 s          // and t_scale is clamped to [0.7, 1.3]
+```
+
+One filtered scalar, a handful of flops, and it feeds the planner what the motor is
+really doing instead of what the catalogue says. `--no-thrust-estimator` flies the
+tabulated curve instead.
+
+**And it buys nothing** - 61.1 % [58.6-63.6] with it against 62.9 % [60.5-65.3]
+without, on 1500 flights each. That is worth understanding rather than hiding: the
+clamp planner already re-solves ten times a second from the *measured altitude and
+speed*, so a motor that is running weak has already shown up in the trajectory by the
+time the accelerometer could tell you about it. The feedback was doing the job.
+
+The estimator stays on by default anyway, because it is what the real vehicle will
+have to do, and the model should not be flying on information the hardware cannot get.
+
+### The vehicle is impulse-limited, and here is the measurement
+
+Four independent attempts to improve the guidance all came back flat, which is itself
+the finding. Splitting 1800 flights by how the motor performed and how high it lit:
+
+| | ignited high | ignited low |
+|---|---|---|
+| **strong motor** (above-nominal impulse) | 84.3 % | 82.0 % |
+| **weak motor** (below-nominal impulse) | 38.1 % | 38.8 % |
+
+Read across: the ignition altitude is worth **two points**. Read down: the motor is
+worth **forty-four**. The +/-15 % instantaneous scatter, correlated over 0.7 s and
+integrated over a 2.6 s burn, comes out as about +/-4 % of delivered impulse - which
+is +/-3 m/s of dV against a margin of about 2. The igniter spread, which used to look
+like the villain, is no longer the binding constraint at all.
+
+That is why every one of these came back inside its confidence interval:
+
+| change | result |
+|---|---|
+| accelerometer thrust estimate feeding the planner | 61.1 % vs 62.9 % - no change |
+| sizing the ignition altitude on a de-rated motor (-5 %, -10 %) | 62.9 %, 63.4 % vs 61.5 % - inside noise |
+| planner aiming for -1.0 / -1.5 / -2.0 m/s instead of -0.5 | 61.1 / 60.0 / 51.9 % - no gain, then worse |
+| igniting lower or higher within the feasible band | two points |
+
+**The control law is at its ceiling on this airframe.** What is left is propulsion:
+more impulse, a tighter motor, or a lower entry speed. That is a vehicle decision, not
+a guidance one, and no amount of gain tuning will substitute for it.
+
 ### Reading the numbers: a 40-flight cell is worth +/-14 points
 
 The by-altitude table used to wander - 160 m worse than 180 m, and so on - which
@@ -407,16 +461,16 @@ go sideways. Both `--booster-cant` and `--booster-azimuth` are settable.
 
 | | |
 |---|---|
-| success, all five gates | **74.1 %**  [95 % interval 72.9 - 75.2] |
-| \|vz\| < 3 m/s | 74.1 % (p95 9.9 m/s) |
-| \|vh\| < 0.75 m/s | 94.6 % (p95 0.77 m/s) |
-| tilt < 10 deg | 100.0 % (p95 5.3 deg) |
-| transverse rate < 60 deg/s | 100.0 % (p95 10.2 deg/s) |
+| success, all five gates | **74.0 %**  [95 % interval 72.9 - 75.2] |
+| \|vz\| < 3 m/s | 74.0 % (p95 9.8 m/s) |
+| \|vh\| < 0.75 m/s | 94.0 % (p95 0.82 m/s) |
+| tilt < 10 deg | 100.0 % (p95 5.5 deg) |
+| transverse rate < 60 deg/s | 100.0 % (p95 6.6 deg/s) |
 | D9 lit | 100 % of flights |
 | burnout before touchdown | 0.9 % |
-| dV spent on steering | 0.14 m/s (clamp waste 16.7 m/s) |
+| dV spent on steering | 0.13 m/s (clamp waste 16.7 m/s) |
 
-Over the 3999 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
+Over the 3998 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
 **100.0 %** (p95 \|vh\| 0.31 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
 
 Success by release altitude, with its 95 % interval on 600 flights each - monotone, as
@@ -877,9 +931,9 @@ the guidance law as a known input rather than discovered later as a drift.
 | terminal gate | `h<3 m`, `vz>-3 m/s`, `T>1.6*m*g` | terminal law |
 | terminal profile | `vz_ref = -clamp(sqrt(16*h), 0.8, 2.5)`, `Kp = 3.0`, cap 70 m/s2 | terminal law |
 | D9 trigger | projected touchdown worse than -1.5 m/s | booster rule |
-| TVC bandwidth / damping | **7.89 rad/s / 0.60**, schedule `(T/100N)^0.60` | fitted |
-| fin bandwidth / damping | **9.21 rad/s / 1.48**, schedule `(q/700Pa)^0.47` | fitted |
-| roll damper | **0.30 rad/s**, max 2 deg of fin | fitted |
+| TVC bandwidth / damping | **6.58 rad/s / 1.07**, schedule `(T/100N)^0.51` | fitted |
+| fin bandwidth / damping | **8.94 rad/s / 1.44**, schedule `(q/700Pa)^-0.08` | fitted |
+| roll damper | **5.44 rad/s**, max 2 deg of fin | fitted |
 | nozzle | +/-5 deg (+/-10 deg servo, 2:1), 500 deg/s, 0.15 deg step | actuator |
 | fins | +/-15 deg, 90 ms end-to-end (333 deg/s) | actuator |
 | fin control cut-off | below 8 m/s airspeed | authority gate |
@@ -935,6 +989,14 @@ nulled to well under 1 deg/s by touchdown.
 
 ### Speed
 
+The campaign spreads its cells over worker processes - the flights are independent and
+the ignition search is solved once per cell, so a whole cell is the right unit of work.
+Measured here on 4 cores: **34.3 s serial against 6.4 s parallel**, and the results are
+bit-identical (the seeds belong to the cell, not to the order the results come back
+in). On a 6-core laptop like a Vostro 7500 a 5400-flight campaign is a couple of
+minutes rather than a quarter of an hour. `--tune-workers` and the campaign's own
+worker count default to one per core.
+
 The flight kernel (`fly`, the planner projections, the fin aerodynamics) is compiled
 with **numba** when it is installed - about 14 ms per trajectory, so a 5400-flight
 campaign takes ~12 minutes on four cores' worth of one core. Without numba the same
@@ -978,9 +1040,39 @@ python3 landsim.py --coarse-step 5 --gen 200 --pop 80 --tol 0.1   # higher quali
 
 Requires only `numpy`.
 
+## Importing a rocket from OpenRocket
+
+`orkimport.py` reads an `.ork` file and fills the vehicle page in: **Import an
+OpenRocket .ork ...** on the Vehicle page, or from the command line:
+
+```
+python3 orkimport.py myrocket.ork
+```
+
+It walks the component tree and takes the airframe length and the largest body
+diameter, the aft-most fin set (count, root and tip chord, span, sweep and position),
+and a mass estimate component by component.
+
+Two things are worth knowing, and the import says both out loud:
+
+* **OpenRocket does not store the masses it shows you.** It recomputes them from
+  geometry and material density every time the file is opened, so this module does the
+  same arithmetic - shells for tubes and nose cones, plates for fins, stated mass for
+  mass components. Anything you have *overridden* in OpenRocket is taken exactly.
+  The import prints the breakdown so you can see what it is made of.
+* **Motor masses are not in the file at all**, and the landing vehicle is not the
+  rocket that left the pad: it launched on a motor that has since burned. The import
+  asks for two numbers - the propellant of that spent motor (subtracted; its casing
+  stays on board) and the total mass of the motor hardware (added) - and reports the
+  arithmetic it did.
+
+MMOI is then estimated as a slender rod of the imported length and mass, which is a
+starting point and not a CAD number; the fin arm is taken from the fin position
+relative to mid-body. Check every field before flying it.
+
 ## GUI
 
-Three pages:
+Five pages:
 
 * **Vehicle** - the rocket itself: motor, airframe, inertia and arms, both actuators,
   the clamp range, the D9 mounting and the fins. Both simulations read this page, so
@@ -991,6 +1083,13 @@ Three pages:
   the tuner, with a large simulation log: it prints the full run header (every vehicle
   and controller number that went in), live progress with elapsed time and an ETA, and
   the complete report at the end - the same text the command line prints.
+* **Flight viewer** - one flight, drawn. A 3-D view with the vehicle where it actually
+  is and pointing where it actually points, its thrust vector, its ground track and the
+  pad; beside it the altitude and descent rate, the thrust and clamp, and the attitude
+  and both sets of actuators, with a cursor that follows the animation. Play it at a
+  quarter speed to watch the fins swap from airbrake to steering at ignition.
+* **Campaign charts** - the five campaign figures drawn live from the run in memory
+  (or from a saved `.npz`), with the matplotlib toolbar for zooming and saving.
 
 Figures land in a **timestamped folder per run** (`figures/run_<date>_<motor>_<n>flights/`)
 so campaigns do not overwrite each other, with a copy of the latest set refreshed at
