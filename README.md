@@ -85,7 +85,7 @@ the motor, the throttle clamp and the D9 booster are this project's.
   able to stop it. Attitude is carried as two body-fixed unit vectors - the thrust axis
   `b` and a transverse reference `g` that marks the roll orientation - never as Euler
   angles, because the two servos are bolted to the airframe and their axes roll with it.
-* **Fin control**: four all-moving NACA 0012 fins, +/-15 deg in 90 ms, 0.50 m aft of
+* **Fin control**: four all-moving NACA 0012 fins, +/-15 deg in 50 ms, 0.50 m aft of
   the CG - steering, the only roll authority on the vehicle, and airbrakes. See the
   section below.
 * **Two TVC channels**: +/-10 deg servo through a 2:1 linkage -> +/-5 deg of nozzle,
@@ -95,7 +95,8 @@ the motor, the throttle clamp and the D9 booster are this project's.
   fights - plus transverse (never roll) aero damping.
 * **The throttle clamp** of the 1-D modes (10-100 %, diverted impulse wasted, burn
   duration fixed) and **one Klima D9** lit by an on-board rule.
-* **Dispersions**: igniter delay U(0, 300 ms), instantaneous thrust scatter up to
+* **Dispersions**: igniter delay U(0, 300 ms) - the guidance pads for 400 ms, see the
+  sweep below - instantaneous thrust scatter up to
   +/-15 % correlated over a 700 ms window, roll rate U(0, 90) deg/s, and the entry grid
   (release 140-180 m in 5 m steps, vx 0 to +/-7 m/s in 1 m/s steps). Avionics sensor
   noise is deliberately **not** modelled - the controller sees the true state.
@@ -131,7 +132,8 @@ uncontrollable by design and does not tip the vehicle over.
 ## Fin control
 
 Four all-moving cruciform fins (the airframe's own geometry: 120 mm root, 63 mm tip,
-70 mm span, 26.6 deg sweep), NACA 0012, **+/-15 deg with 90 ms end stop to end stop**,
+70 mm span, 26.6 deg sweep), NACA 0012, **+/-15 deg with 50 ms end stop to end stop**
+(a Blue Bird **BMS-117WV+** per fin, see below),
 mounted **0.50 m aft of the CG**. Deflection limit, travel time, arm and the whole
 planform are editable in the GUI and on the command line.
 
@@ -301,6 +303,84 @@ is 4.54 deg, i.e. the 95th percentile sits *outside* a 4 deg gate. `--tilt-min`,
 it was under the old, looser set, with tilt passing 88.7 % and the rate gate untouched
 at 100 %. The tuner's cost normalises each gate by its own limit, so tightening a gate
 automatically buys that channel more attention.
+
+### The fin servo: a BMS-117WV+, and why it changes nothing
+
+Each fin is driven by a **Blue Bird BMS-117WV+**: a coreless micro servo quoted at
+**0.06 s/60 deg at 7.4 V** (0.05 s at 8.4 V) and 5.5-7.1 kg.cm, no load. Driven 1:1,
+the +/-15 deg of fin travel is 30 deg of shaft, so end stop to end stop is **0.03 s**
+unloaded. The model uses **0.05 s**, which is that with a generous derate for hinge
+moment, linkage slop and the fact that the manufacturer measures unloaded. That is
+still nearly twice the 0.09 s the earlier placeholder assumed.
+
+Measured over the same 16200 flights, common random numbers, nothing else touched:
+
+| fin travel, end to end | success |
+|---|---|
+| 0.09 s (old placeholder) | 74.88 % [74.2 - 75.5] |
+| 0.05 s (BMS-117WV+) | 74.90 % [74.2 - 75.6] |
+
+**A difference of 0.01 points - i.e. none at all.** That is the expected answer, not a
+disappointing one: the fin loop runs at 8.94 rad/s, about 1.4 Hz, and asks for a few
+degrees of deflection at a time. A 0.09 s servo already slews a 3 deg step in 9 ms,
+an order of magnitude inside the loop's own time constant, so the actuator was never
+the limiting element. The BMS-117WV+ is the right part for other reasons - it has the
+torque to hold a fin against 40 m/s of dynamic pressure without deflecting under load,
+which the model assumes and a weaker servo would not deliver - but the pay-off is
+holding the commanded angle, not reaching it faster.
+
+### What the igniter delay spread costs (0 - 600 ms)
+
+The igniter fires, and some time later thrust appears. That time is drawn
+`U(0, spread)` and the vehicle **cannot know its own draw in advance**. Against it the
+guidance has exactly one lever: the **pad**, the extra altitude it adds to `h_cmd` so
+that even the slowest igniter still lights above the altitude the plan needs
+(section 3 of the algorithm). The pad is a ground-tuned constant in the firmware.
+
+Sweeping the spread with the pad **frozen at 300 ms**, and again with the pad
+**re-tuned for each spread** (16200 flights per point in the first series, 8100 in the
+second, common random numbers throughout):
+
+| spread | pad frozen at 300 ms | pad re-tuned | best pad |
+|---|---|---|---|
+| 0 ms | 76.6 % | **77.9 %** | 200 ms |
+| 100 ms | 76.0 % | **76.5 %** | 200 ms |
+| 200 ms | 76.1 % | **76.1 %** | 300 ms |
+| 300 ms | 74.9 % | **75.8 %** | 400 ms |
+| 400 ms | 62.0 % | **75.3 %** | 400 ms |
+| 500 ms | 49.3 % | **72.8 %** | 500 ms |
+| 600 ms | 41.2 % | **64.7 %** | 600 ms |
+
+![igniter delay sweep](figures/ignition_delay_sweep.png)
+
+Three things fall out of this.
+
+**1. The spread itself is cheap; the pad being wrong is ruinous.** Going from a perfect
+igniter to a 300 ms spread costs **2 points** (77.9 -> 75.8) if the pad is set for it.
+Leaving the pad at 300 ms while the real spread is 600 ms costs **36 points**
+(77.9 -> 41.2). The dangerous quantity is not the scatter, it is the **mismatch between
+the scatter and what the firmware assumed**.
+
+**2. The failure is one-sided, and it is always the vertical gate.** At 600 ms with a
+300 ms pad the |vz| gate collapses to 42.7 % and p95 touchdown speed is 32.7 m/s - the
+long draws light so late that the vehicle is simply still falling when it arrives. The
+tilt gate barely moves (76 %), because attitude was never the problem. Under-padding
+kills; over-padding merely wastes impulse holding the vehicle up, which is why the
+re-tuned curve is nearly flat out to 400 ms and the optimum pad sits about **100 ms
+above the spread** with another 100-200 ms of flat ground past it.
+
+**3. Beyond ~400 ms the pad stops being able to buy the loss back.** The usable
+ignition band `h_max - h_min` is only about 14 m; a 600 ms spread is ~26 m of fall, so
+no single `h_cmd` can cover every draw, and the last 13 points (77.9 -> 64.7) are
+structural. This is the same impulse limit as everywhere else in this project: there is
+not enough motor to absorb an ignition that arrives late.
+
+**For the flight computer**, in order of value: (a) *measure* your igniter spread on the
+bench and set the pad to that plus 100 ms - `default_delay_pad()` in `tvc_sim.py` does
+exactly this and is what the sim now uses by default; (b) if you can shrink the spread,
+the first 300 ms are almost free to give up, so spend the effort on the pad instead;
+(c) never let the real spread exceed the pad - if you are unsure, pad high, since the
+curve is flat above the optimum and a cliff below it.
 
 ### What the flight computer is allowed to know
 
@@ -498,23 +578,23 @@ It costs about 4-5 points, and it costs them in the vertical channel: 3.4 % of t
 booster's impulse never points up, and the main motor has to lean to cancel what does
 go sideways. Both `--booster-cant` and `--booster-azimuth` are settable.
 
-## Results (5400 flights, 135 entry states x 40)
+## Results (16200 flights, 135 entry states x 120)
 
 ![Landing success across the entry envelope](figures/fig1_success_envelope.png)
 
 | | |
 |---|---|
-| success, all five gates | **75.0 %**  [95 % interval 73.8 - 76.2] |
-| \|vz\| < 4 m/s | 77.9 % (p95 9.8 m/s) |
-| \|vh\| < 0.5 m/s | 89.2 % (p95 0.81 m/s) |
-| tilt < 4 deg | 88.7 % (p95 4.9 deg) |
+| success, all five gates | **75.6 %**  [95 % interval 74.9 - 76.2] |
+| \|vz\| < 4 m/s | 78.3 % (p95 9.1 m/s) |
+| \|vh\| < 0.5 m/s | 90.6 % (p95 0.72 m/s) |
+| tilt < 4 deg | 89.9 % (p95 4.7 deg) |
 | transverse rate < 30 deg/s | 100.0 % (p95 7.4 deg/s) |
 | D9 lit | 100 % of flights |
-| burnout before touchdown | 0.9 % |
-| dV spent on steering | 0.13 m/s (clamp waste 16.7 m/s) |
+| burnout before touchdown | 1.0 % |
+| dV spent on steering | 0.14 m/s (clamp waste 19.7 m/s) |
 
-Over the 3998 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
-**100.0 %** (p95 \|vh\| 0.31 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
+Over the 12686 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
+**99.8 %** (p95 \|vh\| 0.28 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
 
 Success by release altitude, with its 95 % interval on 600 flights each - monotone, as
 it should be, and the trend is only two intervals wide across the whole range:
@@ -677,7 +757,8 @@ Three numbers decide it:
    ```
    pad = |vz at h_min| * t_delay_max  +  0.5 * 9.81 * t_delay_max^2
    ```
-   With `t_delay_max = 0.30 s` and ~44 m/s, that is about **13.5 m**.
+   `t_delay_max` is the configurable **pad** (`--delay-pad`), not the spread itself.
+   With `t_delay_max = 0.40 s` and ~44 m/s, that is about **18.4 m**.
 3. **`h_max`, the ceiling.** The grain burns for its fixed 2.6 s whatever the clamp
    does, so igniting too high means burning out with altitude left and falling the rest
    of the way. Found the same way as `h_min`, from above.
@@ -861,7 +942,7 @@ the residual is 0.005 N m.
 and above `h_cmd + 40 m` the attitude channels stay off entirely (phase FREE FALL).
 The roll damper and the airbrake run the whole way down.
 
-**f) Actuator.** +/-15 deg, 90 ms end stop to end stop = **333 deg/s**, rate-limited.
+**f) Actuator.** +/-15 deg, 50 ms end stop to end stop = **600 deg/s**, rate-limited.
 
 ### 7. Scheduling: aggressiveness follows authority
 
@@ -978,7 +1059,7 @@ the guidance law as a known input rather than discovered later as a drift.
 | fin bandwidth / damping | **8.94 rad/s / 1.44**, schedule `(q/700Pa)^-0.08` | fitted |
 | roll damper | **5.44 rad/s**, max 2 deg of fin | fitted |
 | nozzle | +/-5 deg (+/-10 deg servo, 2:1), 500 deg/s, 0.15 deg step | actuator |
-| fins | +/-15 deg, 90 ms end-to-end (333 deg/s) | actuator |
+| fins | +/-15 deg, 50 ms end-to-end (600 deg/s) | actuator |
 | fin control cut-off | below 8 m/s airspeed | authority gate |
 | attitude loop wakes | 40 m above `h_cmd` | phase logic |
 | clamp | 0.10-1.00, 12.84 /s slew | actuator |

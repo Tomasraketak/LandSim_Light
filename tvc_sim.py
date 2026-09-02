@@ -123,7 +123,11 @@ FIN_TIP = 0.063           # m, tip chord
 FIN_SPAN = 0.070          # m, exposed semi-span (the "height" on the drawing)
 FIN_ARM = 0.50            # m, CG -> fin quarter-chord, aft
 FIN_MAX_DEFLECT = 15.0    # deg
-FIN_TRAVEL_TIME = 0.09    # s to go from one end stop to the other (2 x max)
+# Blue Bird BMS-117WV+ on each fin: 0.06 s/60 deg at 7.4 V (0.05 s at 8.4 V),
+# no load. Driven 1:1, the +/-15 deg of travel is 30 deg, so end stop to end stop
+# is 0.03 s unloaded; 0.05 s is that with a generous derate for hinge moment,
+# linkage slop and the fact that the quoted figure is measured unloaded.
+FIN_TRAVEL_TIME = 0.05    # s to go from one end stop to the other (2 x max)
 FIN_CD0 = 0.012           # NACA 0012 profile drag at this Reynolds number
 FIN_ALPHA_STALL = 14.0    # deg
 FIN_CL_MAX = 0.95
@@ -211,11 +215,27 @@ FEASIBLE_VZ = -2.3
 
 # Dispersions asked for in the test plan
 IGN_DELAY_MAX = 0.300     # s, U(0, IGN_DELAY_MAX) from command to thrust onset
-IGN_DELAY_PLAN = 0.300    # s, what the guidance pads for (worst case, see below)
+IGN_DELAY_PLAN = 0.400    # s, what the guidance pads for (worst case, see below)
 THRUST_SCATTER = 0.15     # +/- of the tabulated thrust, at any instant
 THRUST_TAU = 0.70         # s, correlation window of that scatter
 ROLL_RATE_MAX = 90.0      # deg/s, U(0, max) with a random sign
 SIG_ALIGN = 0.25          # deg, initial attitude alignment error (physical)
+
+
+def default_delay_pad(spread):
+    """How much igniter delay the guidance should plan for, given its spread.
+
+    The pad is the only thing that moves the ignition altitude: the command goes
+    out `pad` seconds' worth of fall EARLY, so that even the slowest igniter still
+    lights above the altitude the plan needs. Padding too little loses the long
+    draws (they light too low and hit the ground fast); padding too much lights
+    every flight high and wastes impulse holding the vehicle up.
+
+    Measured on 8100 flights per point, the optimum sits about 100 ms above the
+    spread and the curve is flat for another 100-200 ms past it, so this errs
+    high. Below 200 ms of pad the loop has no room at all, hence the floor.
+    """
+    return min(max(spread + 0.10, 0.20), 0.70)
 
 N_OUT = 18                # length of the per-flight result vector
 N_TEL = 19                # telemetry columns:
@@ -2426,7 +2446,8 @@ def print_report(camp):
           f"schedule {cfg.sched_tvc:+.2f}), wn {cfg.wn_fin:.2f} / zeta "
           f"{cfg.zeta_fin:.2f} (fins, schedule {cfg.sched_fin:+.2f}), "
           f"roll {cfg.roll_gain:.2f}")
-    print(f"  dispersions       : igniter U(0, {cfg.ign_delay_max * 1000:.0f}) ms, "
+    print(f"  dispersions       : igniter U(0, {cfg.ign_delay_max * 1000:.0f}) ms "
+          f"(guidance pads {cfg.delay_pad * 1000:.0f} ms), "
           f"thrust +/-{cfg.thrust_scatter * 100:.0f} % over {cfg.thrust_tau * 1000:.0f} ms, "
           f"roll U(0, {cfg.roll_max:.0f}) deg/s")
     print(f"  flights           : {camp['out'].shape[0] * camp['out'].shape[1]} cells"
@@ -2619,6 +2640,9 @@ def main():
     ap.add_argument("--boosters", type=int, default=1)
     ap.add_argument("--ign-delay", type=float, default=IGN_DELAY_MAX,
                     help="igniter delay is U(0, this) [s]")
+    ap.add_argument("--delay-pad", type=float, default=None,
+                    help="what the guidance pads for [s]; default is the measured "
+                         "optimum for the spread, delay_pad(spread)")
     ap.add_argument("--thrust-scatter", type=float, default=THRUST_SCATTER)
     ap.add_argument("--thrust-tau", type=float, default=THRUST_TAU)
     ap.add_argument("--roll-max", type=float, default=ROLL_RATE_MAX)
@@ -2716,7 +2740,9 @@ def main():
                     thrust_mult=args.thrust_mult, n_boosters=max(0, args.boosters),
                     h_lo=args.h_lo, h_hi=args.h_hi, h_step=args.h_step,
                     vx_max=args.vx_max, vx_step=args.vx_step, runs=args.runs,
-                    ign_delay_max=args.ign_delay, delay_pad=args.ign_delay,
+                    ign_delay_max=args.ign_delay,
+                    delay_pad=(args.delay_pad if args.delay_pad is not None
+                               else default_delay_pad(args.ign_delay)),
                     thrust_scatter=args.thrust_scatter, thrust_tau=args.thrust_tau,
                     roll_max=args.roll_max,
                     gate_vz=args.gate_vz, gate_vh=args.gate_vh,

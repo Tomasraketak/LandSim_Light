@@ -88,7 +88,8 @@ MOTOR_FIELDS = [
 FIN_FIELDS = [
     ("Fin count",         "fin_count",    "4",     "-",     ""),
     ("Max deflection",    "fin_deflect",  "15",    "deg +/-", ""),
-    ("Travel time",       "fin_travel",   "0.09",  "s",     "end stop to end stop"),
+    ("Travel time",       "fin_travel",   "0.05",  "s",     "end stop to end stop "
+                                                    "(BMS-117WV+ derated)"),
     ("Arm from CG",       "fin_arm",      "0.50",  "m",     "aft"),
     ("Root chord",        "fin_root",     "120",   "mm",    ""),
     ("Tip chord",         "fin_tip",      "63",    "mm",    ""),
@@ -117,6 +118,8 @@ CAMPAIGN_FIELDS = [
     ("|vx| max",          "vx_max",       "7",     "m/s",   ""),
     ("vx step",           "vx_step",      "1",     "m/s",   ""),
     ("Igniter delay",     "ign_delay",    "0.3",   "s",     "U(0, x) from command"),
+    ("Delay pad",         "delay_pad",    "",      "s",     "what guidance plans "
+                                                   "for; empty = delay + 0.1 s"),
     ("Thrust scatter",    "scatter",      "0.15",  "+/- frac", "instantaneous"),
     ("Scatter window",    "tau",          "0.7",   "s",     "correlation time"),
     ("Roll rate max",     "roll",         "90",    "deg/s", "U(0, x), either sign"),
@@ -741,7 +744,9 @@ class App:
             booster_cant=n("b_cant"), booster_azimuth=n("b_azim"),
             h_lo=n("h_lo"), h_hi=n("h_hi"), h_step=n("h_step"),
             vx_max=n("vx_max"), vx_step=n("vx_step"), runs=int(n("runs")),
-            ign_delay_max=n("ign_delay"), delay_pad=n("ign_delay"),
+            ign_delay_max=n("ign_delay"),
+            delay_pad=(n("delay_pad") if self.vars["delay_pad"].get().strip()
+                       else tvc_sim.default_delay_pad(n("ign_delay"))),
             thrust_scatter=n("scatter"), thrust_tau=n("tau"), roll_max=n("roll"),
             gate_vz=n("gate_vz"), gate_vh=n("gate_vh"), gate_tilt=n("gate_tilt"),
             gate_omega=n("gate_rate"),
@@ -1176,7 +1181,8 @@ class App:
             f"{cfg.sched_fin:+.2f}   roll {cfg.roll_gain:.2f}\n"
             f"  entry grid   : {cfg.h_lo:.0f}-{cfg.h_hi:.0f} m step {cfg.h_step:.0f}, "
             f"vx 0 +/-{cfg.vx_max:.0f} m/s step {cfg.vx_step:.0f}\n"
-            f"  dispersions  : igniter U(0, {cfg.ign_delay_max * 1000:.0f}) ms, thrust "
+            f"  dispersions  : igniter U(0, {cfg.ign_delay_max * 1000:.0f}) ms "
+            f"(pad {cfg.delay_pad * 1000:.0f} ms), thrust "
             f"+/-{cfg.thrust_scatter * 100:.0f} % over "
             f"{cfg.thrust_tau * 1000:.0f} ms, roll U(0, {cfg.roll_max:.0f}) deg/s\n"
             f"  flights      : {len(hg)} x {len(vg)} cells x {cfg.runs} = {n}\n"
