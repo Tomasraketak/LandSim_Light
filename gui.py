@@ -839,7 +839,10 @@ class App:
                   text="One flight at a time, with the vehicle drawn where it "
                        "actually is and pointing where it actually points. The panels "
                        "on the right are the same flight, so a wobble in the 3-D view "
-                       "has a cause you can read off the traces.").pack(anchor="w")
+                       "has a cause you can read off the traces. Playback runs on the "
+                       "wall clock: 1.0x is real time, and if the machine cannot draw "
+                       "every 20 ms telemetry frame it drops frames instead of "
+                       "running slow.").pack(anchor="w")
 
         bar = ttk.Frame(tab)
         bar.pack(fill="x", pady=(6, 4))
@@ -857,11 +860,20 @@ class App:
         ttk.Label(bar, text="speed:").pack(side="left", padx=(10, 3))
         self.play_speed = tk.StringVar(value="1.0")
         ttk.Combobox(bar, textvariable=self.play_speed, width=5, state="readonly",
-                     values=("0.25", "0.5", "1.0", "2.0")).pack(side="left")
+                     values=("0.1", "0.25", "0.5", "1.0", "2.0", "4.0")
+                     ).pack(side="left")
+        self.equal_z = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="1:1 axes", variable=self.equal_z,
+                        command=self.viewer_rescale).pack(side="left", padx=(10, 0))
+        Tooltip(bar.winfo_children()[-1],
+                "One metre is the same length on x, y and altitude. The two "
+                "horizontal axes are always equal to each other; unticking this only "
+                "stretches the altitude axis so a 160 m fall over 20 m of drift is "
+                "readable.")
         self.frame_var = tk.IntVar(value=0)
         self.frame_scale = ttk.Scale(bar, from_=0, to=1, orient="horizontal",
                                      variable=self.frame_var,
-                                     command=lambda _v: self.viewer_draw())
+                                     command=self.viewer_scrub)
         self.frame_scale.pack(side="left", fill="x", expand=True, padx=(12, 8))
         self.viewer_status = tk.StringVar(value="no flight yet")
         ttk.Label(tab, textvariable=self.viewer_status,
@@ -885,7 +897,12 @@ class App:
         self.view_canvas.get_tk_widget().pack(fill="both", expand=True)
         self.tel = None
         self.playing = False
+        self.art = None            # the artists that get moved, see viewer_build()
+        self._bg = None            # cached background for blitting
+        self._bg_size = None
+        self._scrub_lock = False   # set while playback drives the slider itself
 
+    # ---------------- the flight ----------------
     def viewer_fly(self):
         try:
             cfg = self.tvc_config()
@@ -899,10 +916,11 @@ class App:
         if len(tel) < 2:
             messagebox.showerror("Flight viewer", "the flight produced no telemetry")
             return
+        self.playing = False
+        self.play_btn.configure(text="Play", state="normal")
         self.out, self.tel, self.cfg_view = out, tel, cfg
+        self.tel_dt = max(1e-3, float(tel[1, 0] - tel[0, 0]))
         self.frame_scale.configure(to=len(tel) - 1)
-        self.frame_var.set(len(tel) - 1)
-        self.play_btn.configure(state="normal")
         self.viewer_status.set(
             f"{'LANDED' if out[0] > 0.5 else 'FAILED'}  -  touchdown {out[1]:.2f} m/s "
             f"down, {out[2]:.2f} m/s across, tilt {out[3]:.1f} deg, rate "
@@ -910,79 +928,49 @@ class App:
             f"{out[5]:.1f} m, lit {out[6]:.1f} m after {out[7] * 1000:.0f} ms, D9 "
             f"{'lit' if out[8] > 0.5 else 'unused'}, clamp waste {out[11]:.1f} m/s, "
             f"steering {out[16]:.2f} m/s")
-        self.viewer_draw()
+        if HAVE_MPL:
+            self.viewer_build()
+            self.set_frame(len(tel) - 1)
 
-    def viewer_play(self):
-        if not HAVE_MPL or self.tel is None:
-            return
-        self.playing = not self.playing
-        self.play_btn.configure(text="Pause" if self.playing else "Play")
-        if self.playing:
-            if self.frame_var.get() >= len(self.tel) - 1:
-                self.frame_var.set(0)
-            self.viewer_step()
-
-    def viewer_step(self):
-        if not self.playing:
-            return
-        i = self.frame_var.get()
-        if i >= len(self.tel) - 1:
-            self.playing = False
-            self.play_btn.configure(text="Play")
-            return
-        try:
-            speed = float(self.play_speed.get())
-        except ValueError:
-            speed = 1.0
-        self.frame_var.set(i + 1)
-        self.viewer_draw()
-        # telemetry is sampled every 20 ms of flight; play it at that pace
-        self.root.after(max(10, int(20 / max(speed, 0.05))), self.viewer_step)
-
-    def viewer_draw(self):
-        """Redraw the 3-D view and the three traces at the current frame."""
-        if not HAVE_MPL or self.tel is None:
-            return
+    # ---------------- drawing ----------------
+    #
+    # The viewer used to rebuild all four panels from scratch on every frame:
+    # ax.clear(), replot ~6000 points per trace, rebuild three legends and run
+    # tight_layout - 150-250 ms of work for one 20 ms step of flight, which is why
+    # "1.0x" crawled at a tenth of real time. Now everything static is drawn ONCE
+    # by viewer_build() and every frame only moves a handful of artists.
+    def viewer_build(self):
+        """Draw everything that does not change during playback, once."""
         tel = self.tel
-        i = max(0, min(int(self.frame_var.get()), len(tel) - 1))
-        t, h, vz, x, vx = tel[:, 0], tel[:, 1], tel[:, 2], tel[:, 3], tel[:, 4]
-        y = tel[:, 15]
+        t, h, x, y = tel[:, 0], tel[:, 1], tel[:, 3], tel[:, 15]
+        # The flown path is redrawn every frame, so cap it at ~400 points. At 20 ms
+        # sampling that is still 8 s of trajectory per point-pair at worst, which no
+        # screen can tell apart from the full record.
+        self.path_stride = max(1, len(tel) // 400)
         ax = self.ax3d
         ax.clear()
         ax.set_facecolor("#fcfcfb")
-        # flown so far, and where it is still going
-        ax.plot(x[:i + 1], y[:i + 1], h[:i + 1], color=ACCENT, lw=2)
-        ax.plot(x[i:], y[i:], h[i:], color="#cfd6db", lw=1, ls="--")
-        ax.plot(x[:i + 1], y[:i + 1], np.zeros(i + 1), color="#dfe4e8", lw=1)
-        ax.scatter([0], [0], [0], color=GOOD, s=40, marker="o")
-        # the vehicle: a stick along the thrust axis, plus the thrust itself
-        bx, by, bz = tel[i, 16], tel[i, 17], tel[i, 18]
-        L = max(4.0, 0.04 * float(np.max(h)))
-        ax.plot([x[i] - 0.5 * L * bx, x[i] + 0.5 * L * bx],
-                [y[i] - 0.5 * L * by, y[i] + 0.5 * L * by],
-                [h[i] - 0.5 * L * bz, h[i] + 0.5 * L * bz],
-                color=INK, lw=4, solid_capstyle="round")
-        if tel[i, 6] > 1.0:
-            f = 1.2 * L * tel[i, 6] / max(np.max(tel[:, 6]), 1.0)
-            ax.plot([x[i] - 0.5 * L * bx, x[i] - 0.5 * L * bx - f * bx],
-                    [y[i] - 0.5 * L * by, y[i] - 0.5 * L * by - f * by],
-                    [h[i] - 0.5 * L * bz, h[i] - 0.5 * L * bz - f * bz],
-                    color="#eb6834", lw=3, alpha=0.85)
-        span = max(12.0, float(np.max(np.abs(x))) * 1.3, float(np.max(np.abs(y))) * 1.3)
-        ax.set_xlim(-span, span)
-        ax.set_ylim(-span, span)
-        ax.set_zlim(0, float(np.max(h)) * 1.05)
+        ax.plot(x, y, h, color="#cfd6db", lw=1, ls="--")           # the whole flight
+        ax.scatter([0], [0], [0], color=GOOD, s=40, marker="o")    # the pad
+        flown, = ax.plot([], [], [], color=ACCENT, lw=2)
+        shadow, = ax.plot([], [], [], color="#dfe4e8", lw=1)
+        stick, = ax.plot([], [], [], color=INK, lw=4,
+                         solid_capstyle="round")
+        flame, = ax.plot([], [], [], color="#eb6834", lw=3, alpha=0.85)
         ax.set_xlabel("x [m]", fontsize=8)
         ax.set_ylabel("y [m]", fontsize=8)
         ax.set_zlabel("altitude [m]", fontsize=8)
         ax.tick_params(labelsize=7)
-        ax.set_title(f"t = {t[i]:5.2f} s    h = {h[i]:6.1f} m    "
-                     f"vz = {vz[i]:6.1f} m/s    thrust = {tel[i, 6]:5.1f} N",
-                     fontsize=9, color=INK, loc="left")
+        # The readout lives INSIDE the axes, not in the title: only the axes
+        # rectangles are blitted per frame, and a title sits outside them.
+        title3d = ax.text2D(0.0, 1.0, "", transform=ax.transAxes, fontsize=9,
+                            color=INK, ha="left", va="top",
+                            family="monospace")
 
-        for a, series, title, ylabel in (
+        vlines = []
+        for a, series, title, xlabel in (
                 (self.ax_a, ((h, ACCENT, "altitude [m]"),
-                             (-vz, "#eb6834", "descent rate [m/s]")),
+                             (-tel[:, 2], "#eb6834", "descent rate [m/s]")),
                  "Altitude and descent rate", ""),
                 (self.ax_b, ((tel[:, 6], ACCENT, "total thrust [N]"),
                              (tel[:, 7] * 100.0, "#eb6834", "clamp [%]")),
@@ -995,18 +983,179 @@ class App:
             a.set_facecolor("#fcfcfb")
             for data, colour, label in series:
                 a.plot(t, data, color=colour, lw=1.4, label=label)
-            a.axvline(t[i], color=INK2, lw=1.0)
+            vlines.append(a.axvline(t[0], color=INK2, lw=1.0))
             a.grid(True, color="#e7e6e1", lw=0.7)
             a.set_axisbelow(True)
             a.tick_params(labelsize=7, colors=INK2)
             a.set_title(title, fontsize=9, loc="left", color=INK)
-            if ylabel:
-                a.set_xlabel(ylabel, fontsize=8, color=INK2)
+            if xlabel:
+                a.set_xlabel(xlabel, fontsize=8, color=INK2)
             a.legend(fontsize=7, frameon=False, loc="upper right")
             for side in ("top", "right"):
                 a.spines[side].set_visible(False)
-        self.view_fig.tight_layout()
-        self.view_canvas.draw_idle()
+
+        self.art = dict(flown=flown, shadow=shadow, stick=stick, flame=flame,
+                        title=title3d, vlines=vlines)
+        self.thrust_max = max(float(np.max(tel[:, 6])), 1.0)
+        self.stick_len = max(4.0, 0.04 * float(np.max(h)))
+        self.viewer_rescale(redraw=False)
+        self.view_fig.tight_layout()          # once per flight, not once per frame
+        self._bg = None
+
+    def viewer_rescale(self, redraw=True):
+        """Axis limits and the box aspect. Both horizontal axes always share one
+        scale; the altitude axis joins them when '1:1 axes' is ticked."""
+        if not HAVE_MPL or self.tel is None or self.art is None:
+            return
+        tel = self.tel
+        h, x, y = tel[:, 1], tel[:, 3], tel[:, 15]
+        # One symmetric span for x and y, so a metre across is a metre across
+        # whichever way the vehicle drifted.
+        span = max(12.0, float(np.max(np.abs(x))) * 1.3,
+                   float(np.max(np.abs(y))) * 1.3)
+        zmax = float(np.max(h)) * 1.05
+        ax = self.ax3d
+        ax.set_xlim(-span, span)
+        ax.set_ylim(-span, span)
+        ax.set_zlim(0, zmax)
+        if self.equal_z.get():
+            # True 1:1:1. The box comes out tall and narrow - that IS the flight:
+            # 160 m of fall against 20 m of drift.
+            ax.set_box_aspect((2.0 * span, 2.0 * span, zmax))
+        else:
+            ax.set_box_aspect((1.0, 1.0, 1.0))
+        self._bg = None                       # the cached background is now stale
+        if redraw:
+            self.viewer_draw()
+
+    def viewer_scrub(self, _value=None):
+        """The slider moved. Ignore it while playback is the one moving it."""
+        if self._scrub_lock:
+            return
+        self.playing = False
+        self.play_btn.configure(text="Play")
+        self.viewer_draw()
+
+    def set_frame(self, i):
+        self._scrub_lock = True
+        self.frame_var.set(int(i))
+        self._scrub_lock = False
+        self.viewer_draw()
+
+    def viewer_draw(self):
+        """Move the artists to the current frame. No clearing, no re-layout."""
+        if not HAVE_MPL or self.tel is None or self.art is None:
+            return
+        tel = self.tel
+        i = max(0, min(int(self.frame_var.get()), len(tel) - 1))
+        t, h, vz, x = tel[:, 0], tel[:, 1], tel[:, 2], tel[:, 3]
+        y = tel[:, 15]
+        a = self.art
+        st = self.path_stride
+        sl = slice(0, i + 1, st)
+        a["flown"].set_data_3d(x[sl], y[sl], h[sl])
+        a["shadow"].set_data_3d(x[sl], y[sl], np.zeros(len(h[sl])))
+        bx, by, bz = tel[i, 16], tel[i, 17], tel[i, 18]
+        L = self.stick_len
+        a["stick"].set_data_3d([x[i] - 0.5 * L * bx, x[i] + 0.5 * L * bx],
+                               [y[i] - 0.5 * L * by, y[i] + 0.5 * L * by],
+                               [h[i] - 0.5 * L * bz, h[i] + 0.5 * L * bz])
+        if tel[i, 6] > 1.0:
+            f = 1.2 * L * tel[i, 6] / self.thrust_max
+            a["flame"].set_data_3d(
+                [x[i] - 0.5 * L * bx, x[i] - 0.5 * L * bx - f * bx],
+                [y[i] - 0.5 * L * by, y[i] - 0.5 * L * by - f * by],
+                [h[i] - 0.5 * L * bz, h[i] - 0.5 * L * bz - f * bz])
+        else:
+            a["flame"].set_data_3d([], [], [])
+        a["title"].set_text(f"t = {t[i]:5.2f} s    h = {h[i]:6.1f} m    "
+                            f"vz = {vz[i]:6.1f} m/s    thrust = {tel[i, 6]:5.1f} N")
+        for v in a["vlines"]:
+            v.set_xdata([t[i], t[i]])
+        try:
+            self.viewer_blit()
+        except Exception:                      # noqa: BLE001
+            # Any matplotlib version that will not blit still gets a correct, if
+            # slower, picture.
+            self._bg = None
+            self.view_canvas.draw_idle()
+
+    def viewer_moving(self):
+        a = self.art
+        return [a["flown"], a["shadow"], a["stick"], a["flame"], a["title"],
+                *a["vlines"]]
+
+    def viewer_blit(self):
+        """Repaint only the artists that moved.
+
+        A full redraw of this figure costs ~190 ms on a laptop - the four sets of
+        ticks, the 3-D panes and the font lookups dominate, not the data. All of that
+        is identical from frame to frame, so it is rendered once into a bitmap and
+        restored; only six artists are actually drawn per frame. That is the
+        difference between 5 fps and real time.
+        """
+        cv = self.view_canvas
+        size = (int(self.view_fig.bbox.width), int(self.view_fig.bbox.height))
+        if self._bg is None or self._bg_size != size:
+            for art in self.viewer_moving():
+                art.set_visible(False)
+            cv.draw()
+            self._bg = cv.copy_from_bbox(self.view_fig.bbox)
+            self._bg_size = size
+            for art in self.viewer_moving():
+                art.set_visible(True)
+        cv.restore_region(self._bg)
+        for art in self.viewer_moving():
+            art.axes.draw_artist(art)
+        # Push only the four panels, not the whole canvas: the tk blit is charged by
+        # the pixel and the margins never change.
+        for a in (self.ax3d, self.ax_a, self.ax_b, self.ax_c):
+            cv.blit(a.bbox)
+
+    # ---------------- playback ----------------
+    def viewer_play(self):
+        if not HAVE_MPL or self.tel is None:
+            return
+        self.playing = not self.playing
+        self.play_btn.configure(text="Pause" if self.playing else "Play")
+        if self.playing:
+            i = self.frame_var.get()
+            if i >= len(self.tel) - 1:
+                i = 0
+            self._play_i0 = i
+            self._play_t0 = time.perf_counter()
+            self.viewer_step()
+
+    def viewer_step(self):
+        """Wall-clock playback.
+
+        The frame index comes from how much real time has passed, NOT from counting
+        redraws, so a slow machine drops frames and still finishes the flight in the
+        right number of seconds. The old version advanced exactly one 20 ms frame per
+        redraw, so it ran at whatever rate matplotlib could manage - about a tenth of
+        real time.
+        """
+        if not self.playing or self.tel is None:
+            return
+        try:
+            speed = float(self.play_speed.get())
+        except ValueError:
+            speed = 1.0
+        elapsed = (time.perf_counter() - self._play_t0) * speed
+        i = self._play_i0 + int(elapsed / self.tel_dt)
+        last = len(self.tel) - 1
+        if i >= last:
+            self.set_frame(last)
+            self.playing = False
+            self.play_btn.configure(text="Play")
+            return
+        t0 = time.perf_counter()
+        self.set_frame(i)
+        draw_ms = (time.perf_counter() - t0) * 1000.0
+        # Aim for 30 fps of DISPLAY. Whatever a redraw actually costs is subtracted
+        # from the wait, and a redraw slower than the budget simply becomes the frame
+        # rate - the flight still plays at the right speed, just less smoothly.
+        self.root.after(int(max(1.0, 33.0 - draw_ms)), self.viewer_step)
 
     # ------------------------------------------------------------------ #
     #  1-D run

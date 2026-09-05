@@ -1212,6 +1212,20 @@ Five pages:
   pad; beside it the altitude and descent rate, the thrust and clamp, and the attitude
   and both sets of actuators, with a cursor that follows the animation. Play it at a
   quarter speed to watch the fins swap from airbrake to steering at ignition.
+
+  **Playback is on the wall clock**: 1.0x really is real time. The frame is picked from
+  how much time has actually passed, so a machine that cannot keep up drops frames
+  rather than playing the flight in slow motion. Getting there needed the drawing to be
+  cheap as well: everything static is drawn once per flight and each frame **blits** a
+  cached background and repaints only the six artists that move - the flown path, its
+  ground shadow, the vehicle, the flame, the readout and the three time cursors. That
+  is 190 ms per frame down to about 20 ms, i.e. 5 fps up to 45.
+
+  **1:1 axes** (ticked by default) gives the 3-D box a true aspect ratio, so one metre
+  is the same length on x, y and altitude - the box comes out tall and narrow because
+  the flight is: 160 m of fall against 25 m of drift. The two horizontal axes always
+  share one scale and one symmetric range whatever the setting; unticking the box only
+  stretches the altitude axis to fill the panel.
 * **Campaign charts** - the five campaign figures drawn live from the run in memory
   (or from a saved `.npz`), with the matplotlib toolbar for zooming and saving.
 
