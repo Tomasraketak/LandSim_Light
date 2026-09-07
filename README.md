@@ -595,24 +595,24 @@ go sideways. Both `--booster-cant` and `--booster-azimuth` are settable.
 
 | | |
 |---|---|
-| success, all five gates | **75.6 %**  [95 % interval 74.9 - 76.2] |
-| \|vz\| < 4 m/s | 78.3 % (p95 9.1 m/s) |
-| \|vh\| < 0.5 m/s | 90.6 % (p95 0.72 m/s) |
-| tilt < 4 deg | 89.9 % (p95 4.7 deg) |
-| transverse rate < 30 deg/s | 100.0 % (p95 7.4 deg/s) |
+| success, all five gates | **76.1 %**  [95 % interval 75.4 - 76.7] |
+| \|vz\| < 4 m/s | 79.6 % (p95 8.7 m/s) |
+| \|vh\| < 0.5 m/s | 90.8 % (p95 0.71 m/s) |
+| tilt < 4 deg | 88.9 % (p95 4.9 deg) |
+| transverse rate < 30 deg/s | 100.0 % (p95 7.9 deg/s) |
 | D9 lit | 100 % of flights |
-| burnout before touchdown | 1.0 % |
-| dV spent on steering | 0.14 m/s (clamp waste 19.7 m/s) |
+| burnout before touchdown | 1.1 % |
+| dV spent on steering | 0.13 m/s (clamp waste 20.0 m/s) |
 
-Over the 12686 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
-**99.8 %** (p95 \|vh\| 0.28 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
+Over the 12889 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
+**99.5 %** (p95 \|vh\| 0.30 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
 
-Success by release altitude, with its 95 % interval on 600 flights each - monotone, as
+Success by release altitude, with its 95 % interval on 1800 flights each - monotone, as
 it should be, and the trend is only two intervals wide across the whole range:
 
 | release [m] | 140 | 150 | 160 | 170 | 180 |
 |---|---|---|---|---|---|
-| success [%] | 75.8 | **77.7** | 73.5 | 71.0 | **71.5** |
+| success [%] | **79.1** | 78.8 | 76.6 | 74.2 | **73.2** |
 | 95 % interval | 72-79 | 74-81 | 70-77 | 67-75 | 68-75 |
 
 > **Mass.** These are for the current default vehicle, **2.85 kg gross**. The tables
@@ -997,6 +997,16 @@ projection then assumes **full clamp** for the rest of the burn. That is what ma
 knob enough. The honest question at any instant is *"how much do I waste right now,
 given that I can still use everything later"*; a family that assumed the level was held
 to burnout cannot express "coast now, brake later" and burns too much too early.
+
+**The startup gate.** The clamp is **held wide open from ignition until the motor
+reaches 30 % of its peak tabulated thrust**, whatever the planner asks for. Two reasons,
+both physical rather than numerical: a clamp already sitting in the flow when the grain
+lights takes the whole startup spike for nothing, and there is no impulse worth diverting
+while the motor is still coming up. The gate is driven by the *table* value, not the
+dispersed one, so a scatter draw cannot rattle it open and shut, and it **latches** - it
+never re-opens, so tail-off, where the thrust falls back through 30 % on the way down, is
+left to the planner. The clamp actuator also starts the flight at full open rather than
+at `k_min`, so it is already in that position when the motor lights.
 
 **Solving it.** The predicted touchdown speed is **not monotone** in the clamp level -
 too little thrust crashes, enough lands, and **too much stops the vehicle in mid-air

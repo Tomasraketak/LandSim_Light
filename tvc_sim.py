@@ -93,6 +93,11 @@ TVC_MAX_ACCEL = 2000.0    # deg/s^2
 SERVO_QUANT = 0.15        # servo command quantisation [deg]
 THROTTLE_SPEED = 12.84    # clamp slew [1/s]
 THROTTLE_ACCEL = 257.0    # clamp acceleration [1/s^2]
+# The clamp is held fully open from ignition until the motor makes this fraction of
+# its peak table thrust. Below it there is nothing worth diverting - the grain is
+# still lighting - and a clamp already in the flow during the startup spike is both
+# useless and needlessly loaded.
+THRUST_GATE_FRAC = 0.30   # of peak table thrust
 K_MIN, K_MAX = 0.10, 1.00
 
 # ---------------------------------------------------------------------------
@@ -963,9 +968,17 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
     srv1 = srv2 = 0.0            # servo angles [deg]
     sr1 = sr2 = 0.0              # servo rates [deg/s]
     cmd1 = cmd2 = 0.0
-    k_act, k_rate_act = k_min, 0.0
-    k_cmd = k_min
+    # The clamp starts WIDE OPEN and stays open through the ignition transient. A
+    # clamp that is already blocking when the grain lights is sitting in the path of
+    # the chuff: it eats the startup spike, and the actuator then has to travel the
+    # whole range while the thrust is still climbing. Physically it is also the safe
+    # position - nothing diverted, nothing to choke. The gate below re-hands control
+    # to the planner once the motor is actually running (30 % of peak table thrust).
+    k_act, k_rate_act = k_max, 0.0
+    k_cmd = k_max
     k_level = k_max
+    f_gate = THRUST_GATE_FRAC * mf.max()   # thrust above which the clamp may close
+    gate_open = True                       # latch: opens once, never re-opens
 
     t = 0.0
     t_ign_cmd = -1.0
@@ -1002,7 +1015,14 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             2.0 * DT_PHYS / thr_tau) * np.random.normal()
         s_thr = clampf(s_thr, -thr_scatter, thr_scatter)
 
-        t_nom = main_thrust(tb, mt, mf) * (1.0 + s_thr) if tb >= 0.0 else 0.0
+        t_table = main_thrust(tb, mt, mf) if tb >= 0.0 else 0.0
+        t_nom = t_table * (1.0 + s_thr) if tb >= 0.0 else 0.0
+        # The gate latches shut the first time the motor makes real thrust. It is
+        # driven by the TABLE value, not the dispersed one, so a scatter draw cannot
+        # rattle it open and shut; and it never re-opens, so tail-off - where the
+        # thrust falls back below 30 % on the way down - is left to the planner.
+        if gate_open and t_table >= f_gate:
+            gate_open = False
         mass = dry + prop_mass
         if tb > 0.0:
             mass = dry + (prop_mass - main_burned(tb, mt, mc, prop_mass, i_total))
@@ -1032,6 +1052,13 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             # phase included. Anything else and the planner is solving for a vehicle
             # that does not exist.
             k_cmd = k_from_plan(k_level, 0.0, h, vz, mass, t_nom, k_min, k_max)
+            if gate_open:
+                # Ignition transient: full open, whatever the planner wants. The
+                # planner's projection assumes its own clamp level from t = 0, so
+                # this is a small modelling mismatch - it lasts the few tens of ms
+                # the grain needs to come up to 30 %, over which the impulse the
+                # clamp could have diverted is negligible.
+                k_cmd = k_max
 
         # ---------------- controller, 200 Hz ----------------
         if step % CTRL_DIV == 0:
