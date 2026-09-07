@@ -2011,9 +2011,18 @@ def gain_cost(camp):
 
 
 def _tune_eval(job):
-    """One candidate, in a worker process."""
-    cfg, gains, h_cmd_grid = job
-    camp = run_campaign(cfg.with_gains(tuple(gains)), h_cmd_grid=h_cmd_grid)
+    """One candidate. `camp_workers` MUST be 1 when this runs inside a worker.
+
+    Nesting process pools is what used to make tuning look like it had hung: the
+    tuner spread candidates over N processes, and each of those then asked
+    run_campaign for another pool of its own. That is N x N processes fighting over
+    the cores, and - worse on Windows and macOS, where a new process re-imports
+    everything instead of forking - a fresh numba import per candidate. The whole
+    run turned into process startup.
+    """
+    cfg, gains, h_cmd_grid, camp_workers = job
+    camp = run_campaign(cfg.with_gains(tuple(gains)), h_cmd_grid=h_cmd_grid,
+                        workers=camp_workers)
     return gain_cost(camp)
 
 
@@ -2056,6 +2065,9 @@ def tune_gains(cfg: TvcConfig, budget=60, runs=12, cells=3, seed=1,
 
     lo, hi = GAIN_BOUNDS[:, 0], GAIN_BOUNDS[:, 1]
     pop_size = min(12, max(6, budget // 5))
+    # More workers than candidates in a generation just adds startup cost.
+    workers = max(1, min(workers, pop_size))
+    t_start = time.perf_counter()
     pop = rng.uniform(lo, hi, size=(pop_size, len(lo)))
     pop[0] = np.array(cfg.gains())          # the shipped default is candidate zero
 
@@ -2063,22 +2075,60 @@ def tune_gains(cfg: TvcConfig, budget=60, runs=12, cells=3, seed=1,
            f"= {n_cells * runs} flights per candidate, {budget} candidates, "
            f"{workers} worker process(es)")
 
-    pool = (cf.ProcessPoolExecutor(max_workers=workers) if workers > 1 else None)
+    pool = None
+    if workers > 1:
+        try:
+            pool = cf.ProcessPoolExecutor(max_workers=workers)
+        except (OSError, ValueError, ImportError, RuntimeError) as exc:  # noqa: BLE001
+            # Some frozen / restricted environments cannot start processes at all.
+            # Tuning single-process is slow, not broken - say so and carry on.
+            report(f"  cannot start worker processes ({exc}); tuning in this one")
+            workers = 1
     try:
-        def evaluate_many(cands, conf=None):
+        def evaluate_many(cands, conf=None, label="candidates"):
+            """Fly a generation, reporting each candidate as it lands.
+
+            Progress used to appear only once a whole generation was done, so a
+            tuner that was merely slow was indistinguishable from one that had
+            hung - and Stop could not be honoured until the generation ended
+            either. Both are per-candidate now.
+            """
             check_stop()
             conf = conf or small
-            jobs = [(conf, c, h_cmd_grid) for c in cands]
+            # One pool, one level: the campaign inside a worker runs single-process.
+            jobs = [(conf, c, h_cmd_grid, 1 if pool is not None else workers)
+                    for c in cands]
+            n = len(jobs)
+            out = [None] * n
             if pool is None:
-                return [_tune_eval(j) for j in jobs]
-            return list(pool.map(_tune_eval, jobs))
+                for k, job in enumerate(jobs):
+                    check_stop()
+                    out[k] = _tune_eval(job)
+                    tick(k + 1, n, label)
+                return out
+            futures = {pool.submit(_tune_eval, job): k for k, job in enumerate(jobs)}
+            done = 0
+            for fut in cf.as_completed(futures):
+                out[futures[fut]] = fut.result()
+                done += 1
+                tick(done, n, label)
+                check_stop()
+            return out
 
-        res = evaluate_many(pop)
+        def tick(done, n, label):
+            el = time.perf_counter() - t_start
+            report(f"      {label} {done}/{n}   {el:5.1f} s elapsed")
+
+        res = evaluate_many(pop, label="seed")
         cost = np.array([r[0] for r in res])
         succ = np.array([r[1] for r in res])
         used = pop_size
+        gen_s = time.perf_counter() - t_start
         report(f"  {used:3d}/{budget}  seeded: best cost {cost.min():.4f}  "
-               f"success {succ[int(np.argmin(cost))] * 100:5.1f} %")
+               f"success {succ[int(np.argmin(cost))] * 100:5.1f} %"
+               f"   ({gen_s:.0f} s for {pop_size} candidates, so roughly "
+               f"{gen_s / max(pop_size, 1) * (budget - used + pop_size * 3):.0f} s "
+               f"left including the run-off)")
 
         while used < budget:
             trials = []
@@ -2090,7 +2140,7 @@ def tune_gains(cfg: TvcConfig, budget=60, runs=12, cells=3, seed=1,
                 mask[rng.integers(len(lo))] = True
                 trials.append(np.where(mask, t, pop[i]))
             trials = trials[:max(1, budget - used)]
-            res = evaluate_many(trials)
+            res = evaluate_many(trials, label=f"gen {used + len(trials)}/{budget}")
             used += len(trials)
             for i, (t_cost, t_succ) in enumerate(res):
                 if t_cost < cost[i]:
@@ -2105,7 +2155,7 @@ def tune_gains(cfg: TvcConfig, budget=60, runs=12, cells=3, seed=1,
         finalists = pop[np.argsort(cost)[:n_final]]
         big = replace(small, runs=runs * 3)
         report(f"  run-off: {n_final} finalists re-flown on {runs * 3} runs per state")
-        res = evaluate_many(finalists, conf=big)
+        res = evaluate_many(finalists, conf=big, label="run-off")
         f_cost = np.array([r[0] for r in res])
         f_succ = np.array([r[1] for r in res])
         best = int(np.argmin(f_cost))
@@ -2115,9 +2165,11 @@ def tune_gains(cfg: TvcConfig, budget=60, runs=12, cells=3, seed=1,
 
     g = tuple(float(x) for x in finalists[best])
     report("  best: " + "  ".join(f"{n}={v:.3f}" for n, v in zip(GAIN_NAMES, g)))
+    report(f"  tuning took {time.perf_counter() - t_start:.0f} s")
     return g, {"cost": float(f_cost[best]), "success": float(f_succ[best]),
                "budget": budget, "runs": runs, "runoff_runs": runs * 3,
-               "cells": n_cells, "workers": workers}
+               "cells": n_cells, "workers": workers,
+               "seconds": round(time.perf_counter() - t_start, 1)}
 
 
 def save_gains(gains, report, path="tvc_gains.json"):

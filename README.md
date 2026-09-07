@@ -215,11 +215,22 @@ them on the ground against a reduced campaign (9 entry states x 12 flights per
 candidate, 60 candidates, differential evolution) and writes `tvc_gains.json`, which
 every later run loads automatically.
 
-It takes about a minute: candidates are evaluated a generation at a time across worker
-processes (`--tune-workers`, one per core by default), and the search flies a cheap
-`--tune-runs` per candidate after which the best five are **re-flown on three times as
-many seeds** - a gain set that only looked good because of eight lucky flights does not
-survive that, and the extra flights are paid for only at the end.
+It takes about two minutes on four cores: candidates are evaluated a generation at a
+time across worker processes (`--tune-workers`, one per core by default, never more
+than there are candidates in a generation), and the search flies a cheap `--tune-runs`
+per candidate after which the best five are **re-flown on three times as many seeds** -
+a gain set that only looked good because of eight lucky flights does not survive that,
+and the extra flights are paid for only at the end.
+
+> **Do not nest process pools.** The tuner used to hand each candidate to a worker
+> process, and the campaign inside that worker then asked for a pool of its own - N x N
+> processes competing for N cores, each of them importing numba from scratch. On Linux
+> that made tuning about twice as slow as it needed to be; on Windows and macOS, where
+> a new process re-imports everything instead of forking, the whole run collapsed into
+> process startup and looked like it had hung. The campaign inside a tuning worker now
+> runs single-process, and progress is reported **per candidate** with an elapsed time
+> and an estimate of what is left, so a slow run can be told apart from a stuck one.
+> Stop is honoured per candidate too, not per generation.
 
 Three things keep it honest and affordable:
 
