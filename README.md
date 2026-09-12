@@ -97,7 +97,9 @@ the motor, the throttle clamp and the D9 booster are this project's.
   duration fixed) and **one Klima D9** lit by an on-board rule.
 * **Dispersions**: igniter delay U(0, 300 ms) - the guidance pads for 400 ms, see the
   sweep below - instantaneous thrust scatter up to
-  +/-15 % correlated over a 700 ms window, roll rate U(0, 90) deg/s, and the entry grid
+  +/-15 % correlated over a 700 ms window, roll rate U(0, 90) deg/s, initial roll
+  ANGLE U(0, 360 deg) - which matters because the D9 is canted, see below - a 0.25 deg
+  attitude alignment error at an arbitrary azimuth, and the entry grid
   (release 140-180 m in 5 m steps, vx 0 to +/-7 m/s in 1 m/s steps). Avionics sensor
   noise is deliberately **not** modelled - the controller sees the true state.
 
@@ -253,11 +255,11 @@ with the exponents left for the tuner to find. It found them clearly non-zero:
 
 | | fitted | meaning |
 |---|---|---|
-| `wn` / `zeta` (TVC) | 5.93 / 0.64 | slower and lighter than the guessed 9.0 / 1.0 |
-| `sched_tvc` | **+0.60** | gentle at low clamp, aggressive at full thrust |
-| `wn_fin` / `zeta_fin` | 6.46 / 1.60 | heavily damped - the fins fly the free fall |
-| `sched_fin` | **+0.30** | aggressiveness follows dynamic pressure |
-| `roll_gain` | 1.39 | close to the hand-set 1.5 |
+| `wn` / `zeta` (TVC) | 4.00 / 0.60 | slower and lighter than the guessed 9.0 / 1.0 |
+| `sched_tvc` | **+0.10** | slightly gentler at low clamp |
+| `wn_fin` / `zeta_fin` | 7.44 / 1.60 | heavily damped - the fins fly the free fall |
+| `sched_fin` | **-0.53** | *less* aggressive as dynamic pressure rises |
+| `roll_gain` | 4.07 | well above the hand-set 1.5 |
 
 What it bought, on the full 5400-flight campaign:
 
@@ -409,14 +411,23 @@ One filtered scalar, a handful of flops, and it feeds the planner what the motor
 really doing instead of what the catalogue says. `--no-thrust-estimator` flies the
 tabulated curve instead.
 
-**And it buys nothing** - 61.1 % [58.6-63.6] with it against 62.9 % [60.5-65.3]
-without, on 1500 flights each. That is worth understanding rather than hiding: the
-clamp planner already re-solves ten times a second from the *measured altitude and
-speed*, so a motor that is running weak has already shown up in the trajectory by the
-time the accelerometer could tell you about it. The feedback was doing the job.
+**It is worth about ten points** - 90.4 % [89.3-91.4] with it against 79.8 %
+[78.3-81.2] without, on 3000 flights each across 140-180 m. That makes it the single
+most valuable thing the flight computer knows, which is what you would expect for a
+vehicle whose whole problem is a +/-15 % motor: knowing the grain is running weak two
+tenths of a second after ignition is worth far more than discovering it from the
+trajectory a second later.
 
-The estimator stays on by default anyway, because it is what the real vehicle will
-have to do, and the model should not be flying on information the hardware cannot get.
+> This number used to read the other way round - "it buys nothing", 61.1 % against
+> 62.9 % - and that was a **bug, not a finding**. `project_vz`, the forward simulation
+> the clamp planner solves, took `t_scale` as an argument and then integrated the
+> tabulated thrust curve without ever multiplying by it. The estimator ran, the
+> filter converged, the number was correct, and the one consumer it was written for
+> threw it away. It only ever reached the gain scheduling. If a carefully measured
+> A/B says a good idea is worthless, check that the idea is actually connected.
+
+The estimator stays on by default, as it did before - it is what the real vehicle will
+have to do, and the model should not fly on information the hardware cannot get.
 
 ### The vehicle is impulse-limited, and here is the measurement
 
@@ -479,6 +490,79 @@ way: a higher release means more speed at the ignition altitude and less margin.
 (The dip at 140 m is real and is the other end of the same trade: from that low a
 release the vehicle arrives slowly enough that it over-brakes and floats, and the
 plan has to spoil a lot of a grain it cannot save.)
+
+### ... and a 4000-flight cell can still be nonsense, if the PLAN is noisy
+
+Sampling was not the whole story. Cranking the flights per cell up and finding the
+map *still* jagged - 53 %, 34 %, 80 % between neighbouring entry states - means the
+noise is not in the flights, it is in the number they all share: the **commanded
+ignition altitude**, solved once per cell.
+
+`find_ignition` looks for the band of altitudes from which the landing still closes,
+by testing `project_rh(h) >= -2.3 m/s` on a scan of altitudes. That is a THRESHOLD on
+a simulated number, and the simulated number was not converged. Its inner planner
+integrated at 30 ms, which left it
+
+* **0.18 m/s pessimistic**, and
+* **rough to +/-0.09 m/s** between ignition altitudes only 0.5 m apart - pure
+  integration noise, not physics.
+
+For the default vehicle that does not matter: with the D9 the projection sits at
+-2.16 m/s over a 21 m span, comfortably clear of the -2.3 m/s test, so the band is
+found cleanly and the map is smooth. Take the booster away and the whole curve slides
+down INTO the noise band, and then whether a given altitude counts as "usable" is
+decided by integration error. The band would be found at one release altitude and
+missed 10 m higher, at random:
+
+| no D9, vx = 0 | 140 m | 150 m | 160 m | 170 m | 180 m |
+|---|---|---|---|---|---|
+| commanded ignition, before | 46.1 | **42.8** | 45.4 | **62.4** | 58.3 m |
+| commanded ignition, after | 51.9 | 55.4 | 56.3 | 56.6 | 58.1 m |
+
+And when the scan found nothing feasible at all, the fallback silently **dropped the
+igniter pad**: the command went out at the one altitude that still worked, the
+igniter then took its 0-300 ms, and every flight lit below the only point that had a
+chance. That is the 20 % cell in the table below.
+
+Three lines of fix: integrate the pre-flight projection at 10 ms inside and 5 ms
+outside (0.009 m/s of bias, 0.015 m/s of roughness, 3.5x the cost - and it is paid
+once per entry state, never per flight), refine the fallback peak properly instead of
+taking the best coarse sample, and **always apply the pad**.
+
+| 600 flights, vx = 0 | before | after |
+|---|---|---|
+| no D9, 150 m | 20.5 % | **80.0 %** |
+| no D9, 170 m | 73.7 % | 70.5 % |
+| no D9 + 1.15x thrust, 150 m | 26.2 % | **86.2 %** |
+| no D9 + 1.15x thrust, 170 m | 80.3 % | **82.8 %** |
+| D9, 150 m (the default) | 80.8 % | 81.5 % |
+
+Note the second row of that table before the fix: **more impulse made the vehicle
+worse**, and a lower release was worse than a higher one. Whenever a simulation says
+something that backwards, the number it is saying it about is usually not the
+physics - it is a threshold sitting inside somebody's numerical noise.
+
+### The map was also not symmetric in +/-vx, and it should have been
+
+Same story, different mechanism. A -7 m/s entry scored 62.7 % against 69.7 % at
++7 m/s - seven points, on a vehicle that is mirror-symmetric about its own axis.
+
+The cause was a missing DISPERSION, not a bug in the physics. The airframe left the
+release point at a fixed roll orientation every single flight, so the D9 - bolted on
+at a body-fixed azimuth and canted 15 deg - always pushed the same way relative to
+the entry velocity. Entries moving *with* that push were harder than entries moving
+against it. The roll RATE was dispersed; the roll ANGLE was not.
+
+Drawing the initial roll phase from U(0, 2*pi) costs one random number and makes the
+grid symmetric, as it has to be:
+
+| h0 = 160 m, 600 flights each | -7 | -5 | -3 | 0 | +3 | +5 | +7 |
+|---|---|---|---|---|---|---|---|
+| before | 62.7 | 68.2 | 77.2 | 78.5 | 78.3 | 77.0 | 69.7 |
+| after | 75.7 | 83.2 | 90.5 | 90.3 | 90.3 | 83.7 | 74.2 |
+
+(all +vx 84.9 % against all -vx 85.2 % - a third of a point apart, which is what
+symmetry looks like when it is measured on 4200 flights a side.)
 
 ### Things that were checked and turned out NOT to be the problem
 
@@ -595,25 +679,29 @@ go sideways. Both `--booster-cant` and `--booster-azimuth` are settable.
 
 | | |
 |---|---|
-| success, all five gates | **76.1 %**  [95 % interval 75.4 - 76.7] |
-| \|vz\| < 4 m/s | 79.6 % (p95 8.7 m/s) |
-| \|vh\| < 0.5 m/s | 90.8 % (p95 0.71 m/s) |
-| tilt < 4 deg | 88.9 % (p95 4.9 deg) |
-| transverse rate < 30 deg/s | 100.0 % (p95 7.9 deg/s) |
+| success, all five gates | **85.9 %**  [95 % interval 85.3 - 86.4] |
+| \|vz\| < 4 m/s | 89.6 % (p95 5.9 m/s) |
+| \|vh\| < 0.5 m/s | 95.9 % (p95 0.45 m/s) |
+| tilt < 4 deg | 92.4 % (p95 4.4 deg) |
+| transverse rate < 30 deg/s | 100.0 % (p95 8.1 deg/s) |
 | D9 lit | 100 % of flights |
-| burnout before touchdown | 1.1 % |
-| dV spent on steering | 0.13 m/s (clamp waste 20.0 m/s) |
+| burnout before touchdown | 0.3 % |
+| dV spent on steering | 0.13 m/s (clamp waste 20.2 m/s) |
 
-Over the 12889 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
-**99.5 %** (p95 \|vh\| 0.30 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
+Over the 14523 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
+**99.6 %** (p95 \|vh\| 0.30 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
 
 Success by release altitude, with its 95 % interval on 1800 flights each - monotone, as
 it should be, and the trend is only two intervals wide across the whole range:
 
 | release [m] | 140 | 150 | 160 | 170 | 180 |
 |---|---|---|---|---|---|
-| success [%] | **79.1** | 78.8 | 76.6 | 74.2 | **73.2** |
-| 95 % interval | 72-79 | 74-81 | 70-77 | 67-75 | 68-75 |
+| success [%] | **89.2** | 87.8 | 85.8 | 83.7 | **81.0** |
+| 95 % interval | 88-91 | 86-89 | 84-87 | 82-85 | 79-83 |
+
+Success by horizontal entry speed is symmetric to within a point, which it has to be
+for a vehicle that is mirror-symmetric about its own axis: 76.2 % at -7 m/s against
+76.2 % at +7 m/s, rising to ~90 % inside +/-3 m/s.
 
 > **Mass.** These are for the current default vehicle, **2.85 kg gross**. The tables
 > further down that compare configurations (fins on/off, brake modes, the D9 cant, the
@@ -626,6 +714,22 @@ it should be, and the trend is only two intervals wide across the whole range:
 > projection assumed a terminal descent law that the plant was no longer flying, so the
 > planner was solving for a vehicle that did not exist. Flying the same clamp law it
 > solves for took burnout-before-touchdown from 30 % to 1 %.
+
+> **And the jump from 76 % to 86 % came from three more of the same kind** - all found
+> by chasing one complaint, "the success map looks random". None of them was in the
+> physics; all three were in what the guidance was allowed to see:
+>
+> 1. The thrust estimate never reached the clamp planner (`project_vz` took `t_scale`
+>    and ignored it). **+10 points**, and it turned a documented "this buys nothing"
+>    into the most valuable signal on the vehicle.
+> 2. The pre-flight ignition search tested a hard feasibility threshold against a
+>    projection that was 0.18 m/s biased and +/-0.09 m/s rough. Harmless with the D9,
+>    catastrophic without it - 20 % where it should be 80 % - and the source of the
+>    "random" map. Converging the projection and never dropping the igniter pad fixed
+>    it.
+> 3. The airframe always left the release point at the same roll angle, so the canted
+>    D9 always pushed the same way across the entry velocity. That alone made +vx and
+>    -vx differ by seven points. The initial roll phase is now dispersed.
 
 (with the tuned gains from `tvc_gains.json` - see *Fitting the gains* below)
 
@@ -1023,6 +1127,14 @@ the most room for the replan a tenth of a second later.
 
 **Cost:** about 20 projections x ~250 steps x ~15 flops = **under 100 kflop per solve**,
 ten times a second. An RP2350 with its FPU does that in a fraction of a millisecond.
+
+**Two step sizes, on purpose.** In flight the projection integrates at 20 ms, which is
+what the flight computer can afford and is therefore part of the modelled avionics -
+it costs the plan about 0.1 m/s of pessimism, which the 10 Hz replan absorbs. The
+PRE-FLIGHT search that picks the ignition altitude runs on a PC, once per entry state,
+and integrates at 10 ms inside / 5 ms outside, because its answer is fed to a hard
+feasibility threshold where 0.1 m/s of integration error is not absorbed by anything -
+see *a 4000-flight cell can still be nonsense* above.
 
 **The terminal law** - the last few metres, and a *narrow* gate:
 

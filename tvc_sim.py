@@ -590,14 +590,20 @@ def project_vz(h0, vz0, t0, mass_extra, k_level,
     n = 0
     n_max = int(30.0 / dt)
     while h > 0.0 and n < n_max:
-        tn = main_thrust(t, mt, mf)
+        # `t_scale` is what the accelerometer says this motor is really doing, as a
+        # multiple of the table. It has to be IN here: this is the projection the
+        # clamp planner solves ten times a second, so a motor running 10 % weak is
+        # invisible to the plan without it. (It used to be: the argument was passed
+        # in and never used, which quietly made the estimator a no-op for the one
+        # consumer it was written for.)
+        tn = main_thrust(t, mt, mf) * t_scale
         mass = dry + (prop_mass - main_burned(t, mt, mc, prop_mass, i_total))
         if b_t_ign < 1.0e5:
             mass -= boost_burned(t - b_t_ign, bt, bb, b_prop)
         k = k_from_plan(k_level, t - t0, h, vz, mass, tn, k_min, k_max)
         thrust = tn * k
         if b_t_ign < 1.0e5:
-            thrust += boost_thrust(t - b_t_ign, bt, bf)
+            thrust += boost_thrust(t - b_t_ign, bt, bf) * t_scale
         a = (thrust - kd * vz * abs(vz)) / mass - G
         vz_new = vz + a * dt
         h += 0.5 * (vz + vz_new) * dt
@@ -698,9 +704,17 @@ def project_rh(h0, vz0, t0, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area
     later, and no constant level can imitate that. Using the honest closed loop
     here is what makes the pre-flight ignition window match the flight.
 
-    Only used pre-flight (once per entry state), never inside the 10 Hz loop.
+    Only used pre-flight (once per entry state), never inside the 10 Hz loop, so
+    it is integrated FINELY. That is not a detail. With the 30 ms inner step this
+    used to carry, the projection came back 0.18 m/s pessimistic and - far worse -
+    rough: neighbouring ignition altitudes 0.5 m apart differed by up to 0.17 m/s
+    of pure integration noise. A feasibility test is a THRESHOLD on this number,
+    so that noise decided whether an altitude was called usable, and the ignition
+    plan became a coin flip in the entry state. Measured against a converged
+    reference, 10 ms inside and 5 ms outside leave 0.009 m/s of bias and 0.015 m/s
+    of roughness for 3.5x the cost - paid once per entry cell, never per flight.
     """
-    dt = 0.01
+    dt = 0.005
     h, vz, t = h0, vz0, t0
     kd = 0.5 * RHO * area * cd
     k_level = k_max
@@ -712,7 +726,7 @@ def project_rh(h0, vz0, t0, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area
             k_level, _ = solve_plan(h, vz, t, mass_extra,
                                     mt, mf, mc, prop_mass, i_total, cd, area,
                                     k_min, k_max, bt, bf, bb, b_prop, b_t_ign,
-                                    0.03, target, t_scale)
+                                    0.01, target, t_scale)
             since = 0.0
         tn = main_thrust(t, mt, mf) * t_scale
         mass = mass_extra + (prop_mass - main_burned(t, mt, mc, prop_mass, i_total))
@@ -801,10 +815,37 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
             h_hi_ok = hh
         elif h_lo_ok > 0.0:
             break                      # the feasible band is one interval
-    if h_lo_ok < 0.0:
+    no_band = h_lo_ok < 0.0
+    if no_band:
         # No altitude closes the landing at all. Take the least-bad one rather than
         # an arbitrary default: the flight is going to be scored on how hard it
-        # arrives, and this is where it arrives softest.
+        # arrives, and this is where it arrives softest. Refine it properly - the
+        # scan grid is coarse and the peak is what the whole plan now rests on.
+        a = h_best - step
+        c = h_best + step
+        if a < 5.0:
+            a = 5.0
+        if c > h_start - 1.0:
+            c = h_start - 1.0
+        for _ in range(12):
+            m1 = a + (c - a) / 3.0
+            m2 = c - (c - a) / 3.0
+            _, v1, _ = freefall_to(h_start, m1, vx0, vz0, cd_free, area, mass0, 0.005)
+            f1 = project_rh(m1, v1, 0.0, mass0 - prop_mass,
+                            mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
+                            bt, bf, bb, b_prop, b_ign, plan_target)
+            _, v2, _ = freefall_to(h_start, m2, vx0, vz0, cd_free, area, mass0, 0.005)
+            f2 = project_rh(m2, v2, 0.0, mass0 - prop_mass,
+                            mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
+                            bt, bf, bb, b_prop, b_ign, plan_target)
+            if f1 > vz_best:
+                vz_best, h_best = f1, m1
+            if f2 > vz_best:
+                vz_best, h_best = f2, m2
+            if f1 < f2:
+                a = m1
+            else:
+                c = m2
         h_lo_ok = h_hi_ok = h_best
     # refine both edges
     lo, hi = max(5.0, h_lo_ok - step), h_lo_ok
@@ -832,6 +873,15 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
             hi = mid
     h_max = lo
 
+    if no_band:
+        # There is no band to sit inside, only a best point - so there is nothing
+        # to cap the pad against either. Leaving h_max at the peak (which is what
+        # the edge refinements above collapse to) would silently throw the PAD
+        # away, and that is the worst of both worlds: the command goes out at the
+        # one altitude that works, the igniter then takes its 0-300 ms, and every
+        # flight lights BELOW the only point that had a chance. Measured on the
+        # no-booster vehicle, that alone was the difference between 20 % and 70 %.
+        h_max = h_start - 1.0
     _, vz_at, _ = freefall_to(h_start, h_min, vx0, vz0, cd_free, area, mass0, 0.005)
     pad = abs(vz_at) * delay_pad + 0.5 * G * delay_pad * delay_pad
     h_cmd = h_min + pad
@@ -895,6 +945,14 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
         roll_rate = -roll_rate
     align = math.radians(np.random.normal() * SIG_ALIGN)
     align_az = np.random.uniform(0.0, 2.0 * math.pi)
+    # Which way up the airframe is at release. Nothing in the vehicle cares about
+    # roll ATTITUDE - but the D9 does: it is bolted on at a body-fixed azimuth and
+    # canted, so its side force points somewhere definite relative to the entry
+    # velocity. With this angle left at zero the booster always pushed the same way
+    # across the drift, and the grid came out asymmetric in +/-vx for a vehicle
+    # that is otherwise mirror-symmetric - measured, 69.7 % at +7 m/s against
+    # 62.7 % at -7 m/s. That asymmetry was the missing draw, not the physics.
+    roll_phase = np.random.uniform(0.0, 2.0 * math.pi)
     s_thr = 0.0                                  # instantaneous thrust deviation
     # What the FLIGHT COMPUTER believes the motor is doing, as a multiple of the
     # tabulated curve. It starts at 1.0 (it has only the table) and is corrected from
@@ -957,6 +1015,13 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
     gx, gy, gz = gx - d * bx, gy - d * by, gz - d * bz
     gn = math.sqrt(gx * gx + gy * gy + gz * gz)
     gx, gy, gz = gx / gn, gy / gn, gz / gn
+    # ... turned to this flight's roll phase (Rodrigues about b, which g is already
+    # perpendicular to, so the rotation is just the 2-D one in that plane)
+    cr, sr = math.cos(roll_phase), math.sin(roll_phase)
+    kgx = by * gz - bz * gy
+    kgy = bz * gx - bx * gz
+    kgz = bx * gy - by * gx
+    gx, gy, gz = (cr * gx + sr * kgx, cr * gy + sr * kgy, cr * gz + sr * kgz)
     # angular rate: the inherited spin about the body axis
     wx, wy, wz = roll_rate * bx, roll_rate * by, roll_rate * bz
 
@@ -1885,11 +1950,16 @@ def run_campaign(cfg: TvcConfig, on_progress=None, should_stop=None,
     if workers is None:
         workers = max(1, min(os.cpu_count() or 1, 16))
 
+    # Each cell is offset into its own stretch of the seed line. The stride has to
+    # be at least `runs`, or the tail of one cell's seeds is the head of another
+    # cell's and the two are the SAME flights - silently, and worse the more
+    # flights you ask for (at 12000 runs a third of the grid would be duplicates).
+    stride = max(7919, cfg.runs)
     jobs = []
     for i, h0 in enumerate(h_grid):
         for j, vx0 in enumerate(vx_grid):
             jobs.append((cfg, i, j, float(h0), float(vx0), seeds,
-                         7919 * (i * len(vx_grid) + j),
+                         stride * (i * len(vx_grid) + j),
                          None if h_cmd_grid is None else float(h_cmd_grid[i, j])))
 
     done = 0
@@ -2528,7 +2598,7 @@ def print_report(camp):
     print(f"  dispersions       : igniter U(0, {cfg.ign_delay_max * 1000:.0f}) ms "
           f"(guidance pads {cfg.delay_pad * 1000:.0f} ms), "
           f"thrust +/-{cfg.thrust_scatter * 100:.0f} % over {cfg.thrust_tau * 1000:.0f} ms, "
-          f"roll U(0, {cfg.roll_max:.0f}) deg/s")
+          f"roll U(0, {cfg.roll_max:.0f}) deg/s, roll phase U(0, 360) deg")
     print(f"  flights           : {camp['out'].shape[0] * camp['out'].shape[1]} cells"
           f" x {cfg.runs} = {camp['out'][:, :, :, 0].size}")
     print()
