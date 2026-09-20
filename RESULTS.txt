@@ -1,5 +1,3 @@
-  gains loaded from tvc_gains.json
-
 ==============================================================================
 LandSim Light - 3-D / TVC Monte Carlo
 ==============================================================================
@@ -15,58 +13,59 @@ LandSim Light - 3-D / TVC Monte Carlo
   fins              : 4 fins, 64.0 cm2 each, AR 1.53, CL_alpha 2.13 /rad, +/-15 deg in 50 ms (600 deg/s), arm 0.50 m, roll arm 80 mm; airbrake adds dCd 0.231
   airbrake mode     : auto  (free-fall Cd 0.581 against 0.350 bare)
   entry grid        : 140-180 m step 5, vx 0 +/-7 m/s step 1
-  gains             : wn 4.00 / zeta 0.60 (TVC, schedule +0.10), wn 7.44 / zeta 1.60 (fins, schedule -0.53), roll 4.07
+  gains             : wn 5.93 / zeta 0.72 (TVC, schedule +0.33), wn 6.54 / zeta 1.59 (fins, schedule +0.02), roll 1.86
   dispersions       : igniter U(0, 300) ms (guidance pads 400 ms), thrust +/-15 % over 700 ms, roll U(0, 90) deg/s, roll phase U(0, 360) deg
+  altitude knowledge: bias U(+/-1.00) m until the lidar acquires at 7.0 m, then corrected as a step
   flights           : 135 cells x 120 = 16200
 
-  SUCCESS (all five gates)   :  85.9 %   [95 % interval 85.3 - 86.4 on 16200 flights]
-    |v_z| < 4 m/s              :  89.6 %   p95   5.88 m/s
-    |v_h| < 0.5 m/s           :  95.9 %   p95   0.45 m/s
-    tilt  < 4 deg             :  92.4 %   p95   4.37 deg
-    rate  < 30 deg/s           : 100.0 %   p95   8.05 deg/s
+  SUCCESS (all five gates)   :  96.4 %   [95 % interval 96.1 - 96.7 on 16200 flights]
+    |v_z| < 4 m/s              :  97.3 %   p95   3.16 m/s
+    |v_h| < 0.5 m/s           :  98.4 %   p95   0.35 m/s
+    tilt  < 4 deg             :  99.1 %   p95   3.02 deg
+    rate  < 30 deg/s           : 100.0 %   p95   7.41 deg/s
 
-  ... and over the 14523 flights that survived the VERTICAL gate, i.e. where
+  ... and over the 15763 flights that survived the VERTICAL gate, i.e. where
       the horizontal and attitude corrections actually ran to touchdown:
-    |v_h| < 0.5 m/s           :  99.6 %   p95   0.30 m/s
-    tilt  < 4 deg             :  95.8 %
+    |v_h| < 0.5 m/s           :  99.2 %   p95   0.32 m/s
+    tilt  < 4 deg             :  99.8 %
     rate  < 30 deg/s           : 100.0 %
 
   D9 lit in                  : 100.0 % of flights
-  burnout before touchdown   :   0.3 %
-  mean commanded ignition    :  58.0 m, mean clamp 0.72
-  dV spent on steering       :  0.13 m/s (clamp waste  20.2 m/s)
+  burnout before touchdown   :   1.1 %
+  mean commanded ignition    :  58.0 m, mean clamp 0.71
+  dV spent on steering       :  0.14 m/s (clamp waste  22.2 m/s)
 
   success [%] by release altitude   (95 % interval, 1800 flights each)
      - a wiggle inside these brackets is sampling, not physics:
-     140.0 m :  89.2   [ 87.7 -  90.6]
-     145.0 m :  89.2   [ 87.6 -  90.5]
-     150.0 m :  87.8   [ 86.2 -  89.2]
-     155.0 m :  87.3   [ 85.7 -  88.8]
-     160.0 m :  85.8   [ 84.1 -  87.4]
-     165.0 m :  84.7   [ 82.9 -  86.3]
-     170.0 m :  83.7   [ 81.9 -  85.4]
-     175.0 m :  83.9   [ 82.2 -  85.6]
-     180.0 m :  81.0   [ 79.1 -  82.7]
+     140.0 m :  96.7   [ 95.7 -  97.4]
+     145.0 m :  96.9   [ 96.0 -  97.6]
+     150.0 m :  97.5   [ 96.7 -  98.1]
+     155.0 m :  97.6   [ 96.8 -  98.2]
+     160.0 m :  97.0   [ 96.1 -  97.7]
+     165.0 m :  96.9   [ 96.0 -  97.6]
+     170.0 m :  95.7   [ 94.7 -  96.6]
+     175.0 m :  94.9   [ 93.8 -  95.9]
+     180.0 m :  94.4   [ 93.2 -  95.4]
   success [%] by horizontal entry speed   (1080 flights each)
-     -7.0 m/s :  76.2   [ 73.6 -  78.6]
-     -6.0 m/s :  77.6   [ 75.0 -  80.0]
-     -5.0 m/s :  84.1   [ 81.8 -  86.1]
-     -4.0 m/s :  88.1   [ 86.0 -  89.9]
-     -3.0 m/s :  89.6   [ 87.7 -  91.3]
-     -2.0 m/s :  90.8   [ 89.0 -  92.4]
-     -1.0 m/s :  90.7   [ 88.9 -  92.3]
-     +0.0 m/s :  90.3   [ 88.4 -  91.9]
-     +1.0 m/s :  90.0   [ 88.1 -  91.6]
-     +2.0 m/s :  91.7   [ 89.9 -  93.2]
-     +3.0 m/s :  89.4   [ 87.5 -  91.1]
-     +4.0 m/s :  87.9   [ 85.8 -  89.7]
-     +5.0 m/s :  84.4   [ 82.2 -  86.5]
-     +6.0 m/s :  80.7   [ 78.3 -  83.0]
-     +7.0 m/s :  76.2   [ 73.6 -  78.6]
+     -7.0 m/s :  91.5   [ 89.7 -  93.0]
+     -6.0 m/s :  96.3   [ 95.0 -  97.3]
+     -5.0 m/s :  96.1   [ 94.8 -  97.1]
+     -4.0 m/s :  96.8   [ 95.5 -  97.7]
+     -3.0 m/s :  97.0   [ 95.8 -  97.9]
+     -2.0 m/s :  97.6   [ 96.5 -  98.4]
+     -1.0 m/s :  97.9   [ 96.8 -  98.6]
+     +0.0 m/s :  98.0   [ 96.9 -  98.7]
+     +1.0 m/s :  96.8   [ 95.5 -  97.7]
+     +2.0 m/s :  98.4   [ 97.5 -  99.0]
+     +3.0 m/s :  97.3   [ 96.2 -  98.1]
+     +4.0 m/s :  97.2   [ 96.1 -  98.0]
+     +5.0 m/s :  97.7   [ 96.6 -  98.4]
+     +6.0 m/s :  96.2   [ 94.9 -  97.2]
+     +7.0 m/s :  91.5   [ 89.7 -  93.0]
 
   figures written:
-    figures/run_20260912_165838_long_16200flights/fig1_success_envelope.png
-    figures/run_20260912_165838_long_16200flights/fig2_touchdown_dispersion.png
-    figures/run_20260912_165838_long_16200flights/fig3_single_flight.png
-    figures/run_20260912_165838_long_16200flights/fig4_ignition_and_booster.png
-    figures/run_20260912_165838_long_16200flights/fig5_gates.png
+    figures/run_20260920_205649_long_16200flights/fig1_success_envelope.png
+    figures/run_20260920_205649_long_16200flights/fig2_touchdown_dispersion.png
+    figures/run_20260920_205649_long_16200flights/fig3_single_flight.png
+    figures/run_20260920_205649_long_16200flights/fig4_ignition_and_booster.png
+    figures/run_20260920_205649_long_16200flights/fig5_gates.png

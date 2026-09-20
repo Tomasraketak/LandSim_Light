@@ -226,6 +226,28 @@ THRUST_TAU = 0.70         # s, correlation window of that scatter
 ROLL_RATE_MAX = 90.0      # deg/s, U(0, max) with a random sign
 SIG_ALIGN = 0.25          # deg, initial attitude alignment error (physical)
 
+# --- ALTITUDE KNOWLEDGE -------------------------------------------------------
+# Until the lidar has the ground in range, altitude comes from a barometer and the
+# accelerometer, and it carries a BIAS: a pressure offset, a launch-site elevation
+# that was never quite right, the drift of a double integration. The vehicle flies
+# the whole descent on that number. When the lidar acquires - somewhere around 7 m
+# on a small unit - the truth arrives all at once, as a STEP in what the flight
+# computer believes its altitude to be, and the guidance has to swallow it with a
+# second of flight left.
+#
+# The step is the interesting part. The bias itself is nearly free (1 m out of a
+# 21 m ignition band); a step in the state a 10 Hz receding-horizon planner is
+# solving from is not obviously free at all.
+LIDAR_ACQ_H = 7.0         # m, true altitude at which the lidar gets ground return
+ALT_BIAS_MAX = 1.0        # m, altitude bias before that, U(-max, +max)
+LIDAR_BLEND = 0.0         # s, time constant for easing the correction in
+                          # (0 = apply it as a step, which is what hardware does)
+ALT_PAD = 1.0             # m the guidance assumes it may be LOWER than it reads,
+                          # until the lidar settles the question. Sized on the bias
+                          # it is protecting against, the same worst-case argument
+                          # the igniter pad uses - and it turns out to be worth far
+                          # more than that; see the README.
+
 
 def default_delay_pad(spread):
     """How much igniter delay the guidance should plan for, given its spread.
@@ -242,10 +264,11 @@ def default_delay_pad(spread):
     """
     return min(max(spread + 0.10, 0.20), 0.70)
 
-N_OUT = 18                # length of the per-flight result vector
-N_TEL = 19                # telemetry columns:
+N_OUT = 19                # length of the per-flight result vector
+N_TEL = 20                # telemetry columns:
 #  0 t   1 h   2 vz   3 x   4 vx   5 tilt   6 thrust   7 clamp   8 servo1  9 servo2
 # 10 |w| 11 D9 thrust  12 fin1  13 fin2  14 roll rate  15 y   16-18 thrust axis b
+# 19 the altitude the flight computer believes it is at
 
 
 # ======================================================================
@@ -910,7 +933,8 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
 def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fin,
         roll_gain, sched_tvc, sched_fin,
         n_boost, use_boost_rule, roll_max, ign_delay_max, delay_pad,
-        thr_scatter, thr_tau, gyro_ff, use_t_est, plan_target,
+        thr_scatter, thr_tau, lidar_acq, alt_bias_max, lidar_blend, alt_pad,
+        gyro_ff, use_t_est, plan_target,
         tilt_min, tilt_slope, tilt_cap,
         n_fin, fin_area, fin_arm, fin_roll_arm, fin_cl_alpha, fin_aspect,
         fin_max, fin_rate, fin_brake_mode, fin_drift, cd_free, b_cant, b_azim, veh,
@@ -953,6 +977,12 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
     # that is otherwise mirror-symmetric - measured, 69.7 % at +7 m/s against
     # 62.7 % at -7 m/s. That asymmetry was the missing draw, not the physics.
     roll_phase = np.random.uniform(0.0, 2.0 * math.pi)
+    # How wrong the altitude is before the lidar has the ground. Drawn every flight
+    # whether or not it is used, so that turning the dispersion off does not shift
+    # every other draw in the stream and make two campaigns incomparable.
+    alt_bias = np.random.uniform(-1.0, 1.0) * alt_bias_max
+    bias_now = alt_bias          # what the error is RIGHT NOW (see the loop)
+    acquired = False
     s_thr = 0.0                                  # instantaneous thrust deviation
     # What the FLIGHT COMPUTER believes the motor is doing, as a multiple of the
     # tabulated curve. It starts at 1.0 (it has only the table) and is corrected from
@@ -1064,8 +1094,34 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
     tel_i = 0
 
     while t < 40.0:
+        # ---------------- what the computer believes its altitude is ----------
+        # `h` is the truth and only the physics may read it. Everything the flight
+        # computer decides - when to light the motor, what the clamp planner is
+        # solving from, where the guidance points, when the terminal law takes
+        # over - reads `h_est` instead, which carries the bias until the lidar
+        # acquires the ground and then does not.
+        if (not acquired) and lidar_acq > 0.0 and h <= lidar_acq:
+            acquired = True
+        if acquired:
+            if lidar_blend > 0.0:
+                # ease the correction in over a time constant instead of stepping
+                f = DT_PHYS / lidar_blend
+                if f > 1.0:
+                    f = 1.0
+                bias_now -= bias_now * f
+            else:
+                bias_now = 0.0       # what a real filter does: it snaps
+        # The margin is the worst-case version of the same number: "I may be this
+        # much LOWER than my altimeter says". Padding the ignition trigger alone
+        # was measured and bought nothing (86.1 % against 86.3 %) - because the
+        # bias is not a one-off error at ignition, it is in every plan the vehicle
+        # solves for the whole burn. Biasing the altitude the guidance works from
+        # makes it brake as if it were that much lower, all the way down, which is
+        # a different and much bigger lever.
+        h_est = h + bias_now - (0.0 if acquired else alt_pad)
+
         # ---------------- ignition logic ----------------
-        if t_ign_cmd < 0.0 and h <= h_cmd:
+        if t_ign_cmd < 0.0 and h_est <= h_cmd:
             t_ign_cmd = t
         if t_burn0 < 0.0 and t_ign_cmd >= 0.0 and t - t_ign_cmd >= ign_delay:
             t_burn0 = t
@@ -1097,9 +1153,9 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             mass -= boost_burned(tb - b_t_ign, bt, bb, b_prop)
 
         # ---------------- planner, 10 Hz ----------------
-        if step % PLAN_DIV == 0 and t_ign_cmd >= 0.0 and h > 0.05:
+        if step % PLAN_DIV == 0 and t_ign_cmd >= 0.0 and h_est > 0.05:
             tb_p = tb if tb >= 0.0 else 0.0
-            k_level, resid = solve_plan(h, vz, tb_p, dry,
+            k_level, resid = solve_plan(h_est, vz, tb_p, dry,
                                         mt, mf, mc, prop_mass, i_total, cd_burn, area,
                                         k_min, k_max, bt, bf_ax, bb, b_prop,
                                         b_t_ign, 0.02, plan_target, t_scale)
@@ -1116,7 +1172,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             # The plant flies the SAME clamp law the projection assumed, terminal
             # phase included. Anything else and the planner is solving for a vehicle
             # that does not exist.
-            k_cmd = k_from_plan(k_level, 0.0, h, vz, mass, t_nom, k_min, k_max)
+            k_cmd = k_from_plan(k_level, 0.0, h_est, vz, mass, t_nom, k_min, k_max)
             if gate_open:
                 # Ignition transient: full open, whatever the planner wants. The
                 # planner's projection assumes its own clamp level from t = 0, so
@@ -1143,7 +1199,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                 sb = math.sin(b_cant)
                 bxf = -thr_boost * (-sb * mfx) / mass
                 byf = -thr_boost * (-sb * mfy) / mass
-            ux, uy, uz, t_go = guidance_dir(h, vx, vy, vz, mass, cd,
+            ux, uy, uz, t_go = guidance_dir(h_est, vx, vy, vz, mass, cd,
                                             ax_bias + bxf, ay_bias + byf, area,
                                             tilt_min, tilt_slope, tilt_cap)
             # ---- aerodynamic drift nulling, before the motor is lit ----
@@ -1156,8 +1212,8 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             # its thrust on steering, which is the one thing this vehicle cannot
             # afford. It is handed over to the ordinary guidance law once the
             # attitude loop wakes up for the ignition.
-            if (fin_drift > 0.5 and t_ign_cmd < 0.0 and h > h_cmd + FIN_CTRL_LEAD
-                    and n_fin > 0.5):
+            if (fin_drift > 0.5 and t_ign_cmd < 0.0
+                    and h_est > h_cmd + FIN_CTRL_LEAD and n_fin > 0.5):
                 vh_m = math.sqrt(vx * vx + vy * vy)
                 if vh_m > 0.2:
                     tl = math.tan(math.radians(clampf(vh_m * DRIFT_TILT_GAIN, 0.0,
@@ -1336,7 +1392,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                 # it spun the airframe to 340 deg/s before the motor was even lit.
                 # Attitude control starts with the ignition command; the airbrake and
                 # the roll damper run the whole way down.
-                if (t_ign_cmd < 0.0 and h > h_cmd + FIN_CTRL_LEAD
+                if (t_ign_cmd < 0.0 and h_est > h_cmd + FIN_CTRL_LEAD
                         and fin_drift < 0.5):
                     k_t = 0.0
                 if k_t < 1e-6:
@@ -1579,6 +1635,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             tel[tel_i, 16] = bx      # the thrust axis, for the 3-D viewer
             tel[tel_i, 17] = by
             tel[tel_i, 18] = bz
+            tel[tel_i, 19] = h_est
             tel_i += 1
 
         # ---------------- integrate ----------------
@@ -1653,6 +1710,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
     out[15] = math.degrees(abs(w_r))
     out[16] = dv_tilt
     out[17] = s_thr_sum / s_thr_n if s_thr_n > 0.0 else 0.0   # mean thrust deviation
+    out[18] = alt_bias                                       # altitude error drawn
     return out, tel_i
 
 
@@ -1706,6 +1764,13 @@ class TvcConfig:
     # dispersions
     ign_delay_max: float = IGN_DELAY_MAX
     delay_pad: float = IGN_DELAY_PLAN
+    # altitude knowledge (see LIDAR_ACQ_H above)
+    lidar_acq: float = LIDAR_ACQ_H       # m; 0 = the lidar never acquires
+    alt_bias_max: float = ALT_BIAS_MAX   # m; 0 = the computer knows the truth
+    lidar_blend: float = LIDAR_BLEND     # s; 0 = correct as a step
+    alt_pad: float = ALT_PAD             # m the guidance assumes it may be LOWER
+                                         # than the altimeter says, until the lidar
+                                         # settles it; 0 = trust the altimeter
     # touchdown gates - see the constants above
     gate_vz: float = GATE_VZ
     gate_vh: float = GATE_VH
@@ -1870,6 +1935,7 @@ def fly_one(cfg: TvcConfig, seed: int, h0: float, vx0: float, n_tel: int = 0,
                  float(cfg.n_boosters), 1.0 if cfg.use_booster_rule else 0.0,
                  cfg.roll_max, cfg.ign_delay_max, cfg.delay_pad,
                  cfg.thrust_scatter, cfg.thrust_tau,
+                 cfg.lidar_acq, cfg.alt_bias_max, cfg.lidar_blend, cfg.alt_pad,
                  1.0 if cfg.gyro_ff else 0.0,
                  1.0 if cfg.thrust_estimator else 0.0, cfg.plan_target,
                  cfg.tilt_min, cfg.tilt_slope, cfg.tilt_cap,
@@ -1917,6 +1983,7 @@ def _campaign_cell(job):
                      1.0 if cfg.use_booster_rule else 0.0,
                      cfg.roll_max, cfg.ign_delay_max, cfg.delay_pad,
                      cfg.thrust_scatter, cfg.thrust_tau,
+                     cfg.lidar_acq, cfg.alt_bias_max, cfg.lidar_blend, cfg.alt_pad,
                      1.0 if cfg.gyro_ff else 0.0,
                      1.0 if cfg.thrust_estimator else 0.0, cfg.plan_target,
                      cfg.tilt_min, cfg.tilt_slope, cfg.tilt_cap,
@@ -2599,6 +2666,14 @@ def print_report(camp):
           f"(guidance pads {cfg.delay_pad * 1000:.0f} ms), "
           f"thrust +/-{cfg.thrust_scatter * 100:.0f} % over {cfg.thrust_tau * 1000:.0f} ms, "
           f"roll U(0, {cfg.roll_max:.0f}) deg/s, roll phase U(0, 360) deg")
+    if cfg.alt_bias_max > 0.0:
+        print(f"  altitude knowledge: bias U(+/-{cfg.alt_bias_max:.2f}) m until the "
+              f"lidar acquires at {cfg.lidar_acq:.1f} m"
+              + (f", then eased out over {cfg.lidar_blend:.2f} s"
+                 if cfg.lidar_blend > 0.0 else ", then corrected as a step")
+              if cfg.lidar_acq > 0.0 else ", never corrected")
+    else:
+        print("  altitude knowledge: exact")
     print(f"  flights           : {camp['out'].shape[0] * camp['out'].shape[1]} cells"
           f" x {cfg.runs} = {camp['out'][:, :, :, 0].size}")
     print()
@@ -2718,10 +2793,35 @@ def verify():
           f" deg early -> {np.abs(late[:, 5]).mean() if len(late) else float('nan'):.1f}"
           f" deg at ignition: {'ok' if fin_ok else 'NOT CONVERGING'}")
 
+    # ---- the lidar step must be a step, and only the computer may see it ----
+    # The believed altitude has to carry the bias all the way down to the
+    # acquisition height and then be exactly right, with the TRUE altitude never
+    # disturbed. Getting this backwards would quietly hand the guidance the truth.
+    cfgl = TvcConfig(alt_bias_max=1.0, lidar_acq=7.0, thrust_scatter=0.0,
+                     ign_delay_max=0.0, roll_max=0.0)
+    worst_hi, worst_lo, seen = 0.0, 0.0, 0
+    for sd in range(6):
+        ol, tl = fly_one(cfgl, sd, 160.0, 0.0)
+        bias = ol[18]
+        if abs(bias) < 0.05:
+            continue
+        seen += 1
+        above = tl[(tl[:, 1] > 7.2) & (tl[:, 0] > 0.5)]
+        below = tl[(tl[:, 1] < 6.8) & (tl[:, 1] > 0.3)]
+        if len(above):
+            worst_hi = max(worst_hi, np.abs(above[:, 19] - above[:, 1] - bias).max())
+        if len(below):
+            worst_lo = max(worst_lo, np.abs(below[:, 19] - below[:, 1]).max())
+    step_ok = seen > 0 and worst_hi < 1e-9 and worst_lo < 1e-9
+    print(f"  lidar step, {seen} flights           : believed-minus-true is the bias "
+          f"to {worst_hi:.1e} m above 7 m and zero to {worst_lo:.1e} m below: "
+          f"{'ok' if step_ok else 'WRONG'}")
+
     # ---- the planner's model of the flight must match the flight ----
     # This is the check that caught the terminal-law mismatch: if the projection
     # believes a different vehicle, every ignition altitude it picks is wrong.
-    cfgp = TvcConfig(thrust_scatter=0.0, ign_delay_max=0.0, roll_max=0.0)
+    cfgp = TvcConfig(thrust_scatter=0.0, ign_delay_max=0.0, roll_max=0.0,
+                     alt_bias_max=0.0, alt_pad=0.0)
     m2, b2 = cfgp.tables()
     mt2, mf2, mc2 = motor_arrays(m2)
     bt2, bf2, bb2 = booster_arrays(b2)
@@ -2795,6 +2895,18 @@ def main():
     ap.add_argument("--thrust-scatter", type=float, default=THRUST_SCATTER)
     ap.add_argument("--thrust-tau", type=float, default=THRUST_TAU)
     ap.add_argument("--roll-max", type=float, default=ROLL_RATE_MAX)
+    ap.add_argument("--lidar-acq", type=float, default=LIDAR_ACQ_H,
+                    help="altitude at which the lidar acquires the ground [m], "
+                         "0 = never")
+    ap.add_argument("--alt-bias", type=float, default=ALT_BIAS_MAX,
+                    help="altitude bias before acquisition, U(-x, +x) [m], "
+                         "0 = the computer knows the truth")
+    ap.add_argument("--alt-pad", type=float, default=ALT_PAD,
+                    help="how much LOWER than the altimeter the guidance assumes "
+                         "it might be, before the lidar acquires [m]")
+    ap.add_argument("--lidar-blend", type=float, default=LIDAR_BLEND,
+                    help="time constant for easing the lidar correction in [s], "
+                         "0 = apply it as a step")
     ap.add_argument("--gate-vz", type=float, default=GATE_VZ,
                     help="vertical touchdown limit [m/s]")
     ap.add_argument("--gate-vh", type=float, default=GATE_VH,
@@ -2893,6 +3005,8 @@ def main():
                     delay_pad=(args.delay_pad if args.delay_pad is not None
                                else default_delay_pad(args.ign_delay)),
                     thrust_scatter=args.thrust_scatter, thrust_tau=args.thrust_tau,
+                    lidar_acq=args.lidar_acq, alt_bias_max=args.alt_bias,
+                    lidar_blend=args.lidar_blend, alt_pad=args.alt_pad,
                     roll_max=args.roll_max,
                     gate_vz=args.gate_vz, gate_vh=args.gate_vh,
                     gate_tilt=args.gate_tilt, gate_omega=args.gate_rate,

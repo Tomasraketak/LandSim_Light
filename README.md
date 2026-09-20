@@ -99,7 +99,8 @@ the motor, the throttle clamp and the D9 booster are this project's.
   sweep below - instantaneous thrust scatter up to
   +/-15 % correlated over a 700 ms window, roll rate U(0, 90) deg/s, initial roll
   ANGLE U(0, 360 deg) - which matters because the D9 is canted, see below - a 0.25 deg
-  attitude alignment error at an arbitrary azimuth, and the entry grid
+  attitude alignment error at an arbitrary azimuth, an **altitude bias of U(+/-1 m)
+  that the lidar only corrects at 7 m**, and the entry grid
   (release 140-180 m in 5 m steps, vx 0 to +/-7 m/s in 1 m/s steps). Avionics sensor
   noise is deliberately **not** modelled - the controller sees the true state.
 
@@ -255,11 +256,11 @@ with the exponents left for the tuner to find. It found them clearly non-zero:
 
 | | fitted | meaning |
 |---|---|---|
-| `wn` / `zeta` (TVC) | 4.00 / 0.60 | slower and lighter than the guessed 9.0 / 1.0 |
-| `sched_tvc` | **+0.10** | slightly gentler at low clamp |
-| `wn_fin` / `zeta_fin` | 7.44 / 1.60 | heavily damped - the fins fly the free fall |
-| `sched_fin` | **-0.53** | *less* aggressive as dynamic pressure rises |
-| `roll_gain` | 4.07 | well above the hand-set 1.5 |
+| `wn` / `zeta` (TVC) | 5.93 / 0.72 | slower and lighter than the guessed 9.0 / 1.0 |
+| `sched_tvc` | **+0.33** | gentle at low clamp, aggressive at full thrust |
+| `wn_fin` / `zeta_fin` | 6.54 / 1.59 | heavily damped - the fins fly the free fall |
+| `sched_fin` | +0.02 | flat: the fin loop wants no schedule at all |
+| `roll_gain` | 1.86 | close to the hand-set 1.5 |
 
 What it bought, on the full 5400-flight campaign:
 
@@ -564,6 +565,76 @@ grid symmetric, as it has to be:
 (all +vx 84.9 % against all -vx 85.2 % - a third of a point apart, which is what
 symmetry looks like when it is measured on 4200 flights a side.)
 
+### The lidar only sees the ground at 7 m - and that turned out to be a gift
+
+Until a lidar has ground return, altitude comes from a barometer and a double
+integration, and it carries a **bias**: a pressure offset, a launch-site elevation
+that was never quite right, drift. The vehicle flies the whole descent on that
+number. Then the lidar acquires - around 7 m on a small unit - and the truth arrives
+all at once, as a step in what the computer believes its altitude to be, with about a
+second of flight left. `--alt-bias` sets the bias, `--lidar-acq` the altitude it is
+corrected at, and everything the flight computer decides now reads a *believed*
+altitude while the physics reads the true one.
+
+Handled naively - trust the altimeter, take the step when it comes - a +/-1 m bias
+costs **4.2 points** (90.5 % -> 86.3 %, 9600 flights each). But the average hides
+what is actually going on:
+
+| +/-1 m bias, by which way it is wrong | success |
+|---|---|
+| believes it is LOW, so lights high | 96.9 % |
+| within half a metre | 91.6 % |
+| believes it is HIGH, so lights low | **65.3 %** |
+
+All of the cost is in one direction, and it is the same asymmetry the igniter delay
+has: **igniting high is recoverable by throttling down, igniting low is not.**
+
+The obvious fix is the wrong one. Padding the ignition ALTITUDE for the bias, exactly
+as the igniter pad does for the delay, buys nothing at all - 86.1 % against 86.3 %,
+and the 65 % group stays at 65.8 %. That is worth understanding: the bias is not a
+one-off error at the ignition point, it is in **every plan the vehicle solves for the
+whole burn**. Moving where it lights does not fix what it does afterwards.
+
+What works is to bias the altitude the guidance *plans from*: "assume you may be
+`alt_pad` metres LOWER than you read, until the lidar settles it". The vehicle then
+brakes as though the ground were a metre closer, all the way down, and the margin is
+dropped the instant the lidar acquires:
+
+| +/-1 m bias, 9600 flights each | success | p95 \|vz\| | burnout |
+|---|---|---|---|
+| no margin | 86.3 % | 6.97 m/s | 0.3 % |
+| margin 0.5 m | 94.0 % | 4.58 m/s | 0.7 % |
+| **margin 1.0 m** | **97.0 %** | 3.37 m/s | 1.4 % |
+| margin 1.5 m | 97.2 % | 3.56 m/s | 3.1 % |
+| margin 2.0 m | 94.6 % | 4.06 m/s | 7.2 % |
+
+**And it is worth more than the bias ever cost.** With a perfect altimeter and the
+same 1 m margin the vehicle scores **98.7 %** against 90.5 % without it. The margin
+is not really compensating for the lidar at all - it is using headroom the planner
+was leaving on the table. The plan aims to arrive at the pad at 0.5 m/s; the landing
+gear will take **4 m/s**. Aiming to be nearly stopped a metre up instead, and letting
+the terminal law fly the last metre at ~2 m/s, spends a little of that headroom and
+buys a great deal of robustness against everything else: p95 touchdown speed falls
+from 5.9 to 3.0 m/s.
+
+Three things follow, and the third is a hardware decision:
+
+* **Take the step raw.** Easing the correction in over a time constant is measurably
+  worse - 85.3 % at 0.2 s and 84.7 % at 0.5 s against 86.3 % for a clean step. The
+  10 Hz replan absorbs a step in its own state without complaint; what it cannot use
+  is an altitude it knows to be stale.
+* **The margin must be dropped at acquisition.** Left in - a lidar that never
+  acquires - the same configuration collapses to 51.9 % with 55.8 % burning out,
+  because the vehicle hovers waiting for a ground that is already under it.
+* **Buy range.** Acquiring at 15 m instead of 7 m is worth 3 points on its own
+  (89.4 % against 86.3 %, naive handling). The longer the lidar sees, the less of the
+  descent is flown on a guess.
+
+A caveat worth stating plainly: the margin's value comes from the gap between what
+the plan aims for and what the gear survives. It is sized against `--gate-vz`. Fit a
+landing gear that only takes 1 m/s and the 1 m margin becomes a liability - re-run the
+sweep above before trusting it.
+
 ### Things that were checked and turned out NOT to be the problem
 
 Written down because a negative result is worth as much as a positive one:
@@ -679,29 +750,34 @@ go sideways. Both `--booster-cant` and `--booster-azimuth` are settable.
 
 | | |
 |---|---|
-| success, all five gates | **85.9 %**  [95 % interval 85.3 - 86.4] |
-| \|vz\| < 4 m/s | 89.6 % (p95 5.9 m/s) |
-| \|vh\| < 0.5 m/s | 95.9 % (p95 0.45 m/s) |
-| tilt < 4 deg | 92.4 % (p95 4.4 deg) |
-| transverse rate < 30 deg/s | 100.0 % (p95 8.1 deg/s) |
+| success, all five gates | **96.4 %**  [95 % interval 96.1 - 96.7] |
+| \|vz\| < 4 m/s | 97.3 % (p95 3.2 m/s) |
+| \|vh\| < 0.5 m/s | 98.4 % (p95 0.35 m/s) |
+| tilt < 4 deg | 99.1 % (p95 3.0 deg) |
+| transverse rate < 30 deg/s | 100.0 % (p95 7.4 deg/s) |
 | D9 lit | 100 % of flights |
-| burnout before touchdown | 0.3 % |
-| dV spent on steering | 0.13 m/s (clamp waste 20.2 m/s) |
+| burnout before touchdown | 1.1 % |
+| dV spent on steering | 0.14 m/s (clamp waste 22.2 m/s) |
 
-Over the 14523 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
-**99.6 %** (p95 \|vh\| 0.30 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
+Over the 15763 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
+**99.2 %** (p95 \|vh\| 0.32 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
+
+This is **with** the altitude bias modelled: the flight computer does not know its own
+altitude to better than a metre until 7 m. It is higher than the 85.9 % measured
+*without* that dispersion, because the margin the bias forced on the guidance turned
+out to be worth more than the bias costs - see *The lidar only sees the ground at 7 m*.
 
 Success by release altitude, with its 95 % interval on 1800 flights each - monotone, as
 it should be, and the trend is only two intervals wide across the whole range:
 
 | release [m] | 140 | 150 | 160 | 170 | 180 |
 |---|---|---|---|---|---|
-| success [%] | **89.2** | 87.8 | 85.8 | 83.7 | **81.0** |
-| 95 % interval | 88-91 | 86-89 | 84-87 | 82-85 | 79-83 |
+| success [%] | 96.7 | **97.5** | 97.0 | 95.7 | **94.4** |
+| 95 % interval | 96-97 | 97-98 | 96-98 | 95-97 | 93-95 |
 
 Success by horizontal entry speed is symmetric to within a point, which it has to be
-for a vehicle that is mirror-symmetric about its own axis: 76.2 % at -7 m/s against
-76.2 % at +7 m/s, rising to ~90 % inside +/-3 m/s.
+for a vehicle that is mirror-symmetric about its own axis: 91.5 % at -7 m/s against
+91.5 % at +7 m/s, rising to ~98 % inside +/-3 m/s.
 
 > **Mass.** These are for the current default vehicle, **2.85 kg gross**. The tables
 > further down that compare configurations (fins on/off, brake modes, the D9 cant, the
@@ -803,7 +879,7 @@ that number is a simulation detail, not a firmware requirement.
 
 | symbol | meaning | where it comes from |
 |---|---|---|
-| `h` | altitude above the pad [m] | fused baro + LiDAR |
+| `h` | altitude above the pad [m] | fused baro + LiDAR. **Biased by up to a metre until the lidar acquires at 7 m**, and the guidance plans a metre low on purpose until it does - see *The lidar only sees the ground at 7 m* |
 | `v = (vx, vy, vz)` | velocity in world axes [m/s], `vz` negative while falling | fused |
 | `b` | unit vector along the thrust axis (points **up** out of the vehicle) | attitude estimate |
 | `g_ref` | a second unit vector, fixed in the airframe, perpendicular to `b` | attitude estimate |
@@ -1182,14 +1258,16 @@ the guidance law as a known input rather than discovered later as a drift.
 | control loop | 200 Hz | all servo channels |
 | clamp planner | 10 Hz | forward simulation |
 | ignition delay assumed | 0.30 s worst case | ignition-altitude pad |
+| altitude margin | 1.0 m assumed LOW, dropped at lidar acquisition | every guidance decision |
+| lidar acquires | 7 m | altitude becomes exact, as a step |
 | tilt cone | `1.5 deg/m * h + 4 deg`, capped 20 deg | guidance |
 | plan target touchdown | -0.5 m/s | clamp planner |
 | plan hold | 0.30 s, then full clamp | clamp planner |
 | terminal gate | `h<3 m`, `vz>-3 m/s`, `T>1.6*m*g` | terminal law |
 | terminal profile | `vz_ref = -clamp(sqrt(16*h), 0.8, 2.5)`, `Kp = 3.0`, cap 70 m/s2 | terminal law |
 | D9 trigger | projected touchdown worse than -1.5 m/s | booster rule |
-| TVC bandwidth / damping | **6.58 rad/s / 1.07**, schedule `(T/100N)^0.51` | fitted |
-| fin bandwidth / damping | **8.94 rad/s / 1.44**, schedule `(q/700Pa)^-0.08` | fitted |
+| TVC bandwidth / damping | **5.93 rad/s / 0.72**, schedule `(T/100N)^0.33` | fitted |
+| fin bandwidth / damping | **6.54 rad/s / 1.59**, schedule `(q/700Pa)^0.02` | fitted |
 | roll damper | **5.44 rad/s**, max 2 deg of fin | fitted |
 | nozzle | +/-5 deg (+/-10 deg servo, 2:1), 500 deg/s, 0.15 deg step | actuator |
 | fins | +/-15 deg, 50 ms end-to-end (600 deg/s) | actuator |

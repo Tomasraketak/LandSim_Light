@@ -123,6 +123,14 @@ CAMPAIGN_FIELDS = [
     ("Thrust scatter",    "scatter",      "0.15",  "+/- frac", "instantaneous"),
     ("Scatter window",    "tau",          "0.7",   "s",     "correlation time"),
     ("Roll rate max",     "roll",         "90",    "deg/s", "U(0, x), either sign"),
+    ("Altitude bias",     "alt_bias",     "1.0",   "+/- m", "how wrong the altitude "
+                                                   "is before the lidar sees ground"),
+    ("Lidar acquires at", "lidar_acq",    "7.0",   "m",     "the bias is corrected "
+                                                   "here; 0 = never"),
+    ("Lidar blend",       "lidar_blend",  "0.0",   "s",     "ease the correction in; "
+                                                   "0 = step, which is what hardware does"),
+    ("Altitude margin",   "alt_pad",      "1.0",   "m",     "how much LOWER than the "
+                                                   "altimeter the guidance assumes it may be"),
     ("Figure directory",  "figdir",       "figures", "",    "each run gets a subfolder"),
 ]
 
@@ -748,6 +756,8 @@ class App:
             delay_pad=(n("delay_pad") if self.vars["delay_pad"].get().strip()
                        else tvc_sim.default_delay_pad(n("ign_delay"))),
             thrust_scatter=n("scatter"), thrust_tau=n("tau"), roll_max=n("roll"),
+            alt_bias_max=n("alt_bias"), lidar_acq=n("lidar_acq"),
+            lidar_blend=n("lidar_blend"), alt_pad=n("alt_pad"),
             gate_vz=n("gate_vz"), gate_vh=n("gate_vh"), gate_tilt=n("gate_tilt"),
             gate_omega=n("gate_rate"),
             tilt_min=n("tilt_min"), tilt_slope=n("tilt_slope"),
@@ -970,6 +980,7 @@ class App:
         vlines = []
         for a, series, title, xlabel in (
                 (self.ax_a, ((h, ACCENT, "altitude [m]"),
+                             (tel[:, 19], "#9a94d0", "believed altitude [m]"),
                              (-tel[:, 2], "#eb6834", "descent rate [m/s]")),
                  "Altitude and descent rate", ""),
                 (self.ax_b, ((tel[:, 6], ACCENT, "total thrust [N]"),
