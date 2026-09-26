@@ -85,7 +85,7 @@ the motor, the throttle clamp and the D9 booster are this project's.
   able to stop it. Attitude is carried as two body-fixed unit vectors - the thrust axis
   `b` and a transverse reference `g` that marks the roll orientation - never as Euler
   angles, because the two servos are bolted to the airframe and their axes roll with it.
-* **Fin control**: four all-moving NACA 0012 fins, +/-15 deg in 50 ms, 0.50 m aft of
+* **Fin control**: four all-moving NACA 0012 fins (lift and drag from CFD), +/-15 deg in 50 ms, 0.50 m aft of
   the CG - steering, the only roll authority on the vehicle, and airbrakes. See the
   section below.
 * **Two TVC channels**: +/-10 deg servo through a 2:1 linkage -> +/-5 deg of nozzle,
@@ -158,8 +158,76 @@ delta_i = roll + A*cos(phi_i) + B*sin(phi_i)   +   brake * (+1,-1,+1,-1)
   is worth ~800 deg/s^2 and a loop sized by authority instead of by inertia demands
   more than a 333 deg/s actuator can track.
 * **Airbrakes.** Splayed +,-,+,- the set cancels its own lift and roll torque and
-  leaves pure drag: **free-fall Cd 0.581 against 0.350 bare, 1.66x**. Control is
-  allocated first and the brake takes what travel is left.
+  leaves pure drag: **free-fall Cd 0.808 against 0.350 bare, 2.31x** (with the CFD
+  fin; the analytic model said 0.581). Control is allocated first and the brake takes
+  what travel is left.
+
+### Fin lift and drag come from CFD
+
+One fin, alone, simulated at 20 and 40 m/s and 0 / 3 / 7 / 10 deg (plus one
+not-quite-converged 50 m/s / 10 deg case). The table sits in `tvc_sim.py` exactly as
+the solver returned it - body-frame `Fx`, `Fz` and the solver's own drag `D` - and is
+turned into wind-axis coefficients on the fin's planform area (64.0 cm^2, rho 1.225):
+
+```
+L = Fx cos a + Fz sin a        D = Fx sin a - Fz cos a      (reproduces the D column to 1e-4 N)
+```
+
+| | 0 deg | 3 deg | 7 deg | 10 deg |
+|---|---|---|---|---|
+| CL at 20 m/s | 0 | 0.094 | 0.222 | 0.318 |
+| CL at 40 m/s | 0 | 0.092 | 0.219 | 0.316 |
+| CD at 20 m/s | 0.049 | 0.054 | 0.072 | 0.095 |
+| CD at 40 m/s | 0.048 | 0.052 | 0.070 | 0.093 |
+
+The plant interpolates bilinearly in |angle of attack| and airspeed (clamped to
+20-40 m/s; the 50 m/s point agrees with both to 3 % and is left out because it did not
+converge). Against the analytic model it replaces, the CFD says:
+
+| | analytic (Helmbold, mirrored AR 1.53) | CFD |
+|---|---|---|
+| lift slope | 2.13 /rad | **1.80 /rad** - 15 % less authority, linear to 10 deg |
+| zero-lift drag CD0 | 0.012 | **0.048** - four times; thick blunt edges at Re ~1e5 |
+| induced factor dCD/dCL^2 | 0.25 | **0.45** |
+| fins at 0 deg, as body dCd | 0.036 | **0.142** |
+| airbrake (15 deg), as body dCd | 0.231 | **0.458** |
+
+The controller's inversion uses the CFD slope (the 7 deg secant, 1.80 /rad), so it is
+not surprised by the lost authority. `--verify` flies the plant's own `fin_forces` at
+all eight table points - one fin deflected by the table angle in axial flow, which is
+the same geometry as the fin fixed and the flow inclined - and asserts that lift and
+drag come back as the solver's numbers (worst error 0.02 % of full scale).
+
+**What the table does not cover: anything past 10 deg.** The lift continues on the
+7-10 deg slope up to the 14 deg stall assumed before, the drag on the polar fitted
+through the last two points, and past stall the lift decays while the drag keeps
+growing like a flat plate. The airbrake at 15 deg lives entirely in that extrapolated
+region, so **one CFD case at 15 deg and one at 20 deg would be the most valuable next
+data** - they would pin down both the brake and where the fin actually stalls.
+
+`--fin-aero analytic` (and the "aero" box in the GUI) brings back the old model for
+comparison.
+
+**What it did to the landing.** Same gains, same seeds, 16200 flights each:
+
+| fin aerodynamics | success | \|vz\| gate | p95 \|vz\| | tilt gate |
+|---|---|---|---|---|
+| analytic (before) | 96.4 % [96.1-96.7] | 97.3 % | 3.16 m/s | 99.1 % |
+| **CFD table** | **97.6 % [97.4-97.8]** | **98.1 %** | **2.86 m/s** | 99.4 % |
+
++1.2 points, and almost all of it in the vertical channel. That is the drag, not the
+lift: the fins now cost dCd 0.142 even at zero deflection, so the burn has 28 % more
+aerodynamic help (`cd_burn` 0.386 -> 0.493) on a vehicle whose whole problem is
+arriving with more energy than the grain can take out. The 15 % of lift slope the CFD
+took away costs nothing measurable - the attitude loop never needed the authority,
+and its inversion was told the new slope.
+
+**The gains were NOT refitted, on purpose.** `--tune` on the CFD fin returned a set
+with four of the seven gains on the edges of their search box (wn 4.0, zeta 0.60,
+zeta_fin 1.60, sched_fin -0.57), and flown on the full grid it scored **97.2 %
+[97.0-97.5] - worse** than the old gains' 97.6 %. The tuner's 108 flights per
+candidate cannot resolve a half-point difference at 97 %, so it was fitting its own
+noise; the old gains stay. (The same retuned set on the analytic fin: 96.0 %.)
 
 ### Why a splayed airbrake rolls the vehicle - and how it was fixed
 
@@ -168,8 +236,9 @@ The splay pattern (+,-,+,-) is roll-neutral **only while every fin sits at the s
 and the lift curve is odd. With sideslip the crossflow adds to one fin of a pair and
 subtracts from the other, so equal angles of attack need *unequal deflections* - and
 once the fins stall (15 deg of splay plus the sideslip of a weathercocking airframe is
-past stall), a pattern of equal deflections stops cancelling. Measured on the fin
-model, four fins at a plain +/-15 deg:
+past stall), a pattern of equal deflections stops cancelling. Measured on the
+analytic fin model, four fins at a plain +/-15 deg (the CFD fin gives 0.021, 0.168 and
+0.302 N m in the first column - the same story, a little milder at large sideslip):
 
 | sideslip | roll moment | with the crossflow cancelled in the command |
 |---|---|---|
@@ -750,21 +819,22 @@ go sideways. Both `--booster-cant` and `--booster-azimuth` are settable.
 
 | | |
 |---|---|
-| success, all five gates | **96.4 %**  [95 % interval 96.1 - 96.7] |
-| \|vz\| < 4 m/s | 97.3 % (p95 3.2 m/s) |
-| \|vh\| < 0.5 m/s | 98.4 % (p95 0.35 m/s) |
-| tilt < 4 deg | 99.1 % (p95 3.0 deg) |
+| success, all five gates | **97.6 %**  [95 % interval 97.4 - 97.8] |
+| \|vz\| < 4 m/s | 98.1 % (p95 2.9 m/s) |
+| \|vh\| < 0.5 m/s | 99.1 % (p95 0.33 m/s) |
+| tilt < 4 deg | 99.4 % (p95 2.9 deg) |
 | transverse rate < 30 deg/s | 100.0 % (p95 7.4 deg/s) |
 | D9 lit | 100 % of flights |
 | burnout before touchdown | 1.1 % |
-| dV spent on steering | 0.14 m/s (clamp waste 22.2 m/s) |
+| dV spent on steering | 0.13 m/s (clamp waste 22.7 m/s) |
 
-Over the 15763 flights that survived the vertical gate, \|vh\|, tilt and rate all pass
-**99.2 %** (p95 \|vh\| 0.32 m/s) - see *Why isn't the \|vh\| gate 100 %* below.
+Over the 15889 flights that survived the vertical gate, \|vh\| passes **99.6 %**
+(p95 0.30 m/s), tilt 99.8 % and rate 100 % - see *Why isn't the \|vh\| gate 100 %* below.
 
 This is **with** the altitude bias modelled: the flight computer does not know its own
 altitude to better than a metre until 7 m. It is higher than the 85.9 % measured
-*without* that dispersion, because the margin the bias forced on the guidance turned
+*without* that dispersion (and than the 96.4 % measured before the fins got their
+CFD aerodynamics), because the margin the bias forced on the guidance turned
 out to be worth more than the bias costs - see *The lidar only sees the ground at 7 m*.
 
 Success by release altitude, with its 95 % interval on 1800 flights each - monotone, as
@@ -772,12 +842,12 @@ it should be, and the trend is only two intervals wide across the whole range:
 
 | release [m] | 140 | 150 | 160 | 170 | 180 |
 |---|---|---|---|---|---|
-| success [%] | 96.7 | **97.5** | 97.0 | 95.7 | **94.4** |
-| 95 % interval | 96-97 | 97-98 | 96-98 | 95-97 | 93-95 |
+| success [%] | 97.3 | **98.5** | 97.8 | 97.1 | **96.8** |
+| 95 % interval | 96-98 | 98-99 | 97-98 | 96-98 | 96-98 |
 
 Success by horizontal entry speed is symmetric to within a point, which it has to be
-for a vehicle that is mirror-symmetric about its own axis: 91.5 % at -7 m/s against
-91.5 % at +7 m/s, rising to ~98 % inside +/-3 m/s.
+for a vehicle that is mirror-symmetric about its own axis: 95.1 % at -7 m/s against
+94.4 % at +7 m/s, rising to ~98-99 % inside +/-3 m/s.
 
 > **Mass.** These are for the current default vehicle, **2.85 kg gross**. The tables
 > further down that compare configurations (fins on/off, brake modes, the D9 cant, the
@@ -1116,7 +1186,7 @@ Without it the fins fight their own weathercock moment through the loop and end 
 limit cycle with the gimbal.
 
 **d) Airbrake.** Splayed alternately (+,-,+,-) the four fins cancel each other's lift
-and roll torque and leave pure drag - **1.66x the vehicle's bare drag**, deployed for
+and roll torque and leave pure drag - **2.31x the vehicle's bare drag** (1.66x on the old analytic fin), deployed for
 the whole free fall, stowed at ignition. Two rules matter:
 
 * **control first, brake with what is left**, and

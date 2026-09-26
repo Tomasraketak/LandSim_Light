@@ -270,6 +270,7 @@ class App:
         self.fin_on = tk.BooleanVar(value=True)
         self.fin_brake = tk.StringVar(value="auto")
         self.fin_drift = tk.BooleanVar(value=False)
+        self.fin_aero = tk.StringVar(value="cfd")
         self.fin_info = tk.StringVar(value="")
 
         nb = ttk.Notebook(root)
@@ -420,6 +421,11 @@ class App:
         ttk.Label(head, text="airbrake:").pack(side="left")
         ttk.Combobox(head, textvariable=self.fin_brake, width=8, state="readonly",
                      values=("auto", "always", "off")).pack(side="left", padx=(4, 16))
+        ttk.Label(head, text="aero:").pack(side="left")
+        aero = ttk.Combobox(head, textvariable=self.fin_aero, width=9,
+                            state="readonly", values=("cfd", "analytic"))
+        aero.pack(side="left", padx=(4, 16))
+        aero.bind("<<ComboboxSelected>>", lambda _e: self.show_fins())
         ttk.Checkbutton(head, text="aerodynamic drift nulling",
                         variable=self.fin_drift).pack(side="left")
         ttk.Label(fin, textvariable=self.fin_info, foreground="#777",
@@ -596,6 +602,7 @@ class App:
         self.fin_on.set(True)
         self.fin_brake.set("auto")
         self.fin_drift.set(False)
+        self.fin_aero.set("cfd")
         self.show_motor()
         self.show_fins()
 
@@ -769,7 +776,7 @@ class App:
             fin_root=n("fin_root") / 1000.0, fin_tip=n("fin_tip") / 1000.0,
             fin_span=n("fin_span") / 1000.0, fin_arm=n("fin_arm"),
             fin_max_deflect=n("fin_deflect"), fin_travel_time=n("fin_travel"),
-            fin_brake=self.fin_brake.get(),
+            fin_brake=self.fin_brake.get(), fin_aero=self.fin_aero.get(),
             fin_drift_null=bool(self.fin_drift.get()))
 
     # ------------------------------------------------------------------ #

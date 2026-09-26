@@ -151,6 +151,62 @@ DRIFT_TILT_MAX = 8.0      # deg, cap on the aerodynamic drift-nulling tilt. NOT 
                           # can steer at all, so past ~10 deg of trim the set
                           # saturates - asymmetrically, which puts the roll straight
                           # back. Measured, 18 deg re-introduced 290 deg/s of spin.
+# ---------------------------------------------------------------------------
+# FIN AERODYNAMICS FROM CFD - one fin, alone, at 20 / 40 m/s and 0 / 3 / 7 / 10 deg
+#
+# Forces in the rocket frame (+z to the nose, x normal to the fin), incompressible,
+# every case converged. Converted to lift and drag in WIND axes and then to
+# coefficients on the fin's own planform area at rho = 1.225, so the table survives
+# a change of fin size (the shape and Reynolds number are what it is valid for).
+#   L = Fx cos a + Fz sin a        D = Fx sin a - Fz cos a
+# D computed this way reproduces the solver's own drag column to 1e-4 N.
+#
+# What it says, against the analytic model it replaces:
+#   * lift slope 1.78-1.82 /rad, dead linear to 10 deg at both speeds. Helmbold on
+#     the body-mirrored aspect ratio gave 2.13 - 17 % too much authority.
+#   * zero-lift drag CD0 = 0.048, four times the 0.012 assumed for a NACA 0012 -
+#     the thick blunt edges and the low Reynolds number (1e5) are not a textbook
+#     aerofoil. Induced factor dCD/dCL^2 = 0.45, twice the mirrored-AR value.
+#   * Reynolds dependence is small: 20 -> 40 m/s moves CD0 by 3 % and the slope by 2 %.
+# The 50 m/s / 10 deg case (not fully converged) is not used for the table; its
+# coefficients (CL 0.325, CD 0.095) agree with the other two speeds to 3 %.
+#
+# NOT in the data: anything past 10 deg. Beyond it the lift continues on the 7-10
+# deg slope up to FIN_ALPHA_STALL, the drag on the fitted polar CD = CD10 + k(CL^2 -
+# CL10^2), and past stall the lift decays as before while the drag keeps rising like
+# a flat plate. The airbrake (15 deg) lives in this extrapolated region - a CFD point
+# at 15 and 20 deg would pin it down.
+FIN_CFD_V = np.array([20.0, 40.0])                  # m/s
+FIN_CFD_AOA = np.array([0.0, 3.0, 7.0, 10.0])       # deg
+FIN_CFD_FX = np.array([[0.0011, 0.1516, 0.3589, 0.5177],
+                       [0.0061, 0.5958, 1.4187, 2.0533]])   # N, normal
+FIN_CFD_FZ = np.array([[-0.0770, -0.0762, -0.0690, -0.0598],
+                       [-0.2990, -0.2956, -0.2663, -0.2297]])  # N, axial (+ nose)
+FIN_CFD_D = np.array([[0.0770, 0.0840, 0.1122, 0.1487],
+                      [0.2990, 0.3264, 0.4372, 0.5828]])    # N, solver's own drag
+FIN_CFD_AREA = 0.5 * (FIN_ROOT + FIN_TIP) * FIN_SPAN       # m2 the forces belong to
+FIN_CFD_REF_V = 30.0      # m/s at which the 1-D planner reads the fin drag
+
+
+def _fin_cfd_tables():
+    a = np.radians(FIN_CFD_AOA)
+    qs = 0.5 * RHO * FIN_CFD_V[:, None] ** 2 * FIN_CFD_AREA
+    lift = FIN_CFD_FX * np.cos(a) + FIN_CFD_FZ * np.sin(a)
+    drag = FIN_CFD_FX * np.sin(a) - FIN_CFD_FZ * np.cos(a)
+    cl = lift / qs
+    cd = drag / qs
+    cl[:, 0] = 0.0            # symmetric section: the 1e-3 N at 0 deg is solver noise
+    # extension past the last point: lift on the last segment's slope, drag on the
+    # polar fitted through the last two points
+    slope = (cl[:, -1] - cl[:, -2]) / (a[-1] - a[-2])
+    k_ind = (cd[:, -1] - cd[:, -2]) / (cl[:, -1] ** 2 - cl[:, -2] ** 2)
+    return cl, cd, slope, k_ind, drag
+
+
+FIN_CFD_CL, FIN_CFD_CD, FIN_CFD_SLOPE, FIN_CFD_K, _FIN_CFD_D_CHECK = _fin_cfd_tables()
+# what the CONTROLLER assumes the lift slope is: the secant to 7 deg, speed-averaged
+FIN_CFD_CL_ALPHA = float(np.mean(FIN_CFD_CL[:, 2]) / math.radians(7.0))
+
 FIN_CTRL_LEAD = 40.0      # m above the commanded ignition altitude at which the fin
                           # attitude loop wakes up - far enough for the transient to
                           # settle before the motor lights, late enough that the long
@@ -287,8 +343,9 @@ class Fins:
     def __init__(self, count=FIN_COUNT, root=FIN_ROOT, tip=FIN_TIP, span=FIN_SPAN,
                  arm=FIN_ARM, max_deflect=FIN_MAX_DEFLECT,
                  travel_time=FIN_TRAVEL_TIME, body_diameter=DIAMETER,
-                 body_area=AREA, enabled=True):
+                 body_area=AREA, enabled=True, aero="cfd"):
         self.count = int(count)
+        self.cfd = (aero == "cfd")
         self.enabled = bool(enabled) and self.count > 0
         self.area = 0.5 * (root + tip) * span              # m2, one fin
         self.span = span
@@ -300,20 +357,28 @@ class Fins:
         ar = 2.0 * span * span / self.area                 # mirrored in the body
         self.aspect = ar
         self.cl_alpha = 2.0 * math.pi * ar / (2.0 + math.sqrt(ar * ar + 4.0))
+        if self.cfd:
+            self.cl_alpha = FIN_CFD_CL_ALPHA
         # spanwise centre of pressure -> the roll arm
         self.roll_arm = 0.5 * body_diameter + 0.4 * span
         self.body_area = body_area
 
     def cd_extra(self, deflect_deg=0.0):
         """Fin drag expressed as an addition to the BODY drag coefficient, so the
-        1-D planner can use one number. Induced drag included."""
+        1-D planner can use one number. Induced drag included. With the CFD table
+        it is read at 30 m/s, the middle of the free fall - the Reynolds dependence
+        is a few per cent either way."""
+        if self.cfd:
+            _, cd = fin_cfd_coeffs(math.radians(abs(deflect_deg)), FIN_CFD_REF_V)
+            return self.count * self.area * cd / self.body_area
         a = math.radians(min(abs(deflect_deg), FIN_ALPHA_STALL))
         cl = min(self.cl_alpha * a, FIN_CL_MAX)  # same cap as fin_cl
         cd = FIN_CD0 + cl * cl / (math.pi * self.aspect * 0.85)
         return self.count * self.area * cd / self.body_area
 
     def describe(self):
-        return (f"{self.count} fins, {self.area * 1e4:.1f} cm2 each, AR {self.aspect:.2f}, "
+        return (f"{self.count} fins ({'CFD table' if self.cfd else 'analytic'} aero), "
+                f"{self.area * 1e4:.1f} cm2 each, AR {self.aspect:.2f}, "
                 f"CL_alpha {self.cl_alpha:.2f} /rad, +/-{self.max_deflect:.0f} deg in "
                 f"{self.travel_time * 1000:.0f} ms ({self.rate:.0f} deg/s), arm "
                 f"{self.arm:.2f} m, roll arm {self.roll_arm * 1000:.0f} mm; "
@@ -340,10 +405,50 @@ def fin_cl(alpha, cl_alpha):
     return cl
 
 
+@njit(cache=True, inline='always')
+def fin_cfd_coeffs(alpha, v):
+    """(CL, CD) of one fin from the CFD table, bilinear in |alpha| and airspeed,
+    airspeed clamped to the 20-40 m/s the table covers. Odd in alpha for lift."""
+    sgn = 1.0 if alpha >= 0.0 else -1.0
+    a = abs(alpha)
+    ad = math.degrees(a)
+    w = (v - FIN_CFD_V[0]) / (FIN_CFD_V[1] - FIN_CFD_V[0])
+    if w < 0.0:
+        w = 0.0
+    elif w > 1.0:
+        w = 1.0
+    a_last = FIN_CFD_AOA[FIN_CFD_AOA.shape[0] - 1]
+    a_st = FIN_ALPHA_STALL
+    cl = 0.0
+    cd = 0.0
+    for r in range(2):
+        wr = (1.0 - w) if r == 0 else w
+        cl_last = FIN_CFD_CL[r, FIN_CFD_AOA.shape[0] - 1]
+        cd_last = FIN_CFD_CD[r, FIN_CFD_AOA.shape[0] - 1]
+        if ad <= a_last:
+            cl_r = np.interp(ad, FIN_CFD_AOA, FIN_CFD_CL[r])
+            cd_r = np.interp(ad, FIN_CFD_AOA, FIN_CFD_CD[r])
+        else:
+            a_lin = ad if ad < a_st else a_st
+            cl_lin = cl_last + FIN_CFD_SLOPE[r] * math.radians(a_lin - a_last)
+            cd_r = cd_last + FIN_CFD_K[r] * (cl_lin * cl_lin - cl_last * cl_last)
+            if ad > a_st:
+                # stalled: lift decays, drag keeps growing like a flat plate
+                cl_r = cl_lin * math.exp(-math.radians(ad - a_st) * 1.5)
+                s1 = math.sin(a)
+                s0 = math.sin(math.radians(a_st))
+                cd_r += 2.0 * (s1 * s1 - s0 * s0)
+            else:
+                cl_r = cl_lin
+        cl += wr * cl_r
+        cd += wr * cd_r
+    return sgn * cl, cd
+
+
 @njit(cache=True)
 def fin_forces(bx, by, bz, u1x, u1y, u1z, u2x, u2y, u2z,
                vx, vy, vz, wx, wy, wz, defl, n_fin, fin_area, fin_arm, roll_arm,
-               cl_alpha, aspect):
+               cl_alpha, aspect, use_cfd):
     """Total force and moment of the fin set, in world axes.
 
     Each fin is a flat surface whose hinge is the spanwise direction r_i; positive
@@ -384,14 +489,25 @@ def fin_forces(bx, by, bz, u1x, u1y, u1z, u2x, u2y, u2z,
         cross = lx * nx + ly * ny + lz * nz      # crossflow along +n
         alpha = math.radians(defl[i]) - cross / va
         q = 0.5 * RHO * v2
-        cl = fin_cl(alpha, cl_alpha)
-        cd = FIN_CD0 + cl * cl / (math.pi * aspect * 0.85)
+        if use_cfd > 0.5:
+            cl, cd = fin_cfd_coeffs(alpha, v)
+        else:
+            cl = fin_cl(alpha, cl_alpha)
+            cd = FIN_CD0 + cl * cl / (math.pi * aspect * 0.85)
         lift = q * fin_area * cl
         drag = q * fin_area * cd
-        # lift along +n, drag OPPOSING the vehicle's motion through the air
-        ffx = lift * nx - drag * lx / v
-        ffy = lift * ny - drag * ly / v
-        ffz = lift * nz - drag * lz / v
+        # drag OPPOSING the fin's motion through the air, lift perpendicular to it
+        # in the plane of n and the local flow (with no crossflow, that is n itself)
+        ln = (lx * nx + ly * ny + lz * nz) / v2
+        px_ = nx - ln * lx
+        py_ = ny - ln * ly
+        pz_ = nz - ln * lz
+        pn = math.sqrt(px_ * px_ + py_ * py_ + pz_ * pz_)
+        if pn < 1e-9:
+            pn = 1e-9
+        ffx = lift * px_ / pn - drag * lx / v
+        ffy = lift * py_ / pn - drag * ly / v
+        ffz = lift * pz_ / pn - drag * lz / v
         fx += ffx
         fy += ffy
         fz += ffz
@@ -937,8 +1053,8 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
         gyro_ff, use_t_est, plan_target,
         tilt_min, tilt_slope, tilt_cap,
         n_fin, fin_area, fin_arm, fin_roll_arm, fin_cl_alpha, fin_aspect,
-        fin_max, fin_rate, fin_brake_mode, fin_drift, cd_free, b_cant, b_azim, veh,
-        mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop, b_total,
+        fin_max, fin_rate, fin_brake_mode, fin_drift, fin_cfd, cd_free, b_cant, b_azim,
+        veh, mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop, b_total,
         tel, n_tel, h_cmd_in):
     np.random.seed(seed)
     out = np.zeros(N_OUT, dtype=np.float64)
@@ -1559,7 +1675,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             ffx, ffy, ffz, ftx, fty, ftz = fin_forces(
                 bx, by, bz, c1x, c1y, c1z, c2x, c2y, c2z,
                 vx, vy, vz, wx, wy, wz, defl, int(n_fin), fin_area, fin_arm,
-                fin_roll_arm, fin_cl_alpha, fin_aspect)
+                fin_roll_arm, fin_cl_alpha, fin_aspect, fin_cfd)
             f_ax += ffx
             f_ay += ffy
             f_az += ffz
@@ -1797,6 +1913,7 @@ class TvcConfig:
     fin_max_deflect: float = FIN_MAX_DEFLECT
     fin_travel_time: float = FIN_TRAVEL_TIME
     fin_brake: str = "auto"          # "auto" (unlit only) | "always" | "off"
+    fin_aero: str = "cfd"            # "cfd" (the measured table) | "analytic"
     # controller
     wn: float = WN_DEFAULT                 # bandwidth with the motor lit (TVC)
     zeta: float = ZETA_DEFAULT
@@ -1861,11 +1978,11 @@ class TvcConfig:
                     arm=self.fin_arm, max_deflect=self.fin_max_deflect,
                     travel_time=self.fin_travel_time,
                     body_diameter=self.diameter, body_area=self.area,
-                    enabled=self.fins)
+                    enabled=self.fins, aero=self.fin_aero)
 
     def fin_args(self):
-        """(n, area, arm, roll arm, CL_alpha, AR, max, rate, brake mode) for the
-        compiled plant, plus the free-fall drag coefficient the planner should use."""
+        """(n, area, arm, roll arm, CL_alpha, AR, max, rate, brake mode, drift, cfd)
+        for the compiled plant, plus the free-fall drag coefficient the planner should use."""
         f = self.fin_set()
         n = float(f.count) if f.enabled else 0.0
         mode = {"off": 0.0, "auto": 1.0, "always": 2.0}.get(self.fin_brake, 1.0)
@@ -1876,15 +1993,15 @@ class TvcConfig:
                              (f.cd_extra(0.0) if f.enabled else 0.0))
         drift = 1.0 if (f.enabled and self.fin_drift_null) else 0.0
         return ((n, f.area, f.arm, f.roll_arm, f.cl_alpha, f.aspect,
-                 f.max_deflect, f.rate, mode, drift), cd_free)
+                 f.max_deflect, f.rate, mode, drift, 1.0 if f.cfd else 0.0), cd_free)
 
     @property
     def cd_burn(self) -> float:
         """Drag coefficient the PLANNER should use during the burn.
 
         The fins are still out there at zero deflection while the motor runs, and
-        their parasitic drag is ~10 % of the body's. Leaving it out of the projection
-        makes the planner pessimistic by a few tenths of a m/s - measured against the
+        their parasitic drag (from the CFD table) is ~40 % of the body's. Leaving it
+        out of the projection makes the planner pessimistic - measured against the
         plant, which is the direction one wants to be wrong in, but it is free to be
         right instead."""
         f = self.fin_set()
@@ -1940,7 +2057,7 @@ def fly_one(cfg: TvcConfig, seed: int, h0: float, vx0: float, n_tel: int = 0,
                  1.0 if cfg.thrust_estimator else 0.0, cfg.plan_target,
                  cfg.tilt_min, cfg.tilt_slope, cfg.tilt_cap,
                  fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6], fa[7], fa[8],
-                 fa[9], cd_free, math.radians(cfg.booster_cant),
+                 fa[9], fa[10], cd_free, math.radians(cfg.booster_cant),
                  math.radians(cfg.booster_azimuth), cfg.vehicle(),
                  mt, mf, mc, m.propellant_mass, m.total_impulse,
                  bt, bf, bb, b.propellant_mass, b.total_mass, tel, n_tel,
@@ -1988,7 +2105,7 @@ def _campaign_cell(job):
                      1.0 if cfg.thrust_estimator else 0.0, cfg.plan_target,
                      cfg.tilt_min, cfg.tilt_slope, cfg.tilt_cap,
                      fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6], fa[7], fa[8],
-                     fa[9], cd_free, math.radians(cfg.booster_cant),
+                     fa[9], fa[10], cd_free, math.radians(cfg.booster_cant),
                      math.radians(cfg.booster_azimuth), veh,
                      mt, mf, mc, m.propellant_mass, m.total_impulse,
                      bt, bf, bb, b.propellant_mass, b.total_mass, tel, 0, h_cmd)
@@ -2817,6 +2934,33 @@ def verify():
           f"to {worst_hi:.1e} m above 7 m and zero to {worst_lo:.1e} m below: "
           f"{'ok' if step_ok else 'WRONG'}")
 
+    # ---- the plant's fin must BE the CFD fin ----
+    # One fin in axial flow at each table speed, DEFLECTED by the table angle. An
+    # all-moving fin turns itself, not the flow, so in body axes its force is the
+    # wind-axis pair: lift sideways, drag straight back - the solver's own D column
+    # (independent of the conversion above) and L = Fx cos a + Fz sin a. This
+    # closes the loop through the interpolation and the force directions in
+    # fin_forces - any sign or axis slip shows up here.
+    worst_cfd = 0.0
+    dfl = np.zeros(4)
+    for r, vv in enumerate(FIN_CFD_V):
+        for c, aa in enumerate(FIN_CFD_AOA):
+            dfl[0] = aa
+            ar_ = math.radians(aa)
+            fx_, fy_, fz_, _a, _b, _c = fin_forces(
+                0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, -vv, 0.0, 0.0, 0.0, dfl, 1, FIN_CFD_AREA, FIN_ARM,
+                0.08, FIN_CFD_CL_ALPHA, 1.5, 1.0)
+            # n = b x r = (0,0,1) x (1,0,0) = (0,1,0); the flow is along -z
+            ref_l = 0.0 if c == 0 else (FIN_CFD_FX[r, c] * math.cos(ar_)
+                                        + FIN_CFD_FZ[r, c] * math.sin(ar_))
+            scale = FIN_CFD_FX[r, -1]
+            worst_cfd = max(worst_cfd, abs(fy_ - ref_l) / scale,
+                            abs(fz_ - FIN_CFD_D[r, c]) / scale, abs(fx_) / scale)
+    cfd_ok = worst_cfd < 0.01
+    print(f"  fin vs CFD table, 8 cases          : worst force error "
+          f"{worst_cfd * 100:.2f} % of full scale: {'ok' if cfd_ok else 'WRONG'}")
+
     # ---- the planner's model of the flight must match the flight ----
     # This is the check that caught the terminal-law mismatch: if the projection
     # believes a different vehicle, every ignition altitude it picks is wrong.
@@ -2843,7 +2987,7 @@ def verify():
     print(f"  planner vs plant, no dispersions   : worst touchdown-speed gap "
           f"{max(gaps):.2f} m/s: {'ok' if plan_ok else 'MODELS DISAGREE'}")
 
-    ok = ok and sign_ok and fin_ok and plan_ok
+    ok = ok and sign_ok and fin_ok and plan_ok and step_ok and cfd_ok
     print(f"  -> {'OK' if ok else 'FAILED'}")
     return ok
 
@@ -2931,6 +3075,9 @@ def main():
                     help="deg, +/-")
     ap.add_argument("--fin-travel", type=float, default=FIN_TRAVEL_TIME,
                     help="s, end stop to end stop")
+    ap.add_argument("--fin-aero", choices=("cfd", "analytic"), default="cfd",
+                    help="fin lift/drag: the CFD table (default) or the old analytic "
+                         "Helmbold + NACA 0012 model")
     ap.add_argument("--fin-brake", choices=("auto", "always", "off"), default="auto",
                     help="when the fins are splayed as airbrakes")
     ap.add_argument("--fin-drift-null", action="store_true",
@@ -3021,6 +3168,7 @@ def main():
                     fin_span=args.fin_span / 1000.0, fin_arm=args.fin_arm,
                     fin_max_deflect=args.fin_deflect,
                     fin_travel_time=args.fin_travel, fin_brake=args.fin_brake,
+                    fin_aero=args.fin_aero,
                     fin_drift_null=args.fin_drift_null,
                     booster_cant=args.booster_cant,
                     booster_azimuth=args.booster_azimuth,
