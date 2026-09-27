@@ -1,5 +1,26 @@
 # LandSim Light
 
+## Quick start (Windows cmd)
+
+```bat
+:: install (once)
+git clone https://github.com/Tomasraketak/LandSim_Light.git
+cd LandSim_Light
+python -m pip install -r requirements.txt
+
+:: run
+python gui.py
+python tvc_sim.py --runs 120
+
+:: update (from inside the LandSim_Light folder)
+git pull
+python -m pip install -r requirements.txt
+```
+
+`gui.py` is the graphical front end; `tvc_sim.py` runs the 3-D Monte Carlo
+campaign from the command line (`--help` lists every option, `--verify` runs the
+self-checks).
+
 1D (vertical axis only) simulation of a propulsive landing of a small rocket with
 a solid motor that can only be throttled by thrust-spoiler flaps.
 
