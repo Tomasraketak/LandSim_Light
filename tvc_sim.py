@@ -142,6 +142,9 @@ FIN_ROLL_GAIN = 1.5       # rad/s, roll-rate damping bandwidth. Deliberately slo
                           # sized by "authority" rather than by inertia demands
                           # deflections the 333 deg/s actuator cannot track and the
                           # roll axis limit-cycles at hundreds of deg/s.
+FIN_BRAKE_ALPHA_MAX = FIN_ALPHA_STALL - 1.5   # deg, the brake keeps every fin's
+                          # angle of attack below this, so the roll channel keeps
+                          # a lift curve that slopes the RIGHT way (see the mixer)
 FIN_ROLL_MAX = 2.0        # deg of the travel the roll channel may spend
 FIN_MIN_AIRSPEED = 8.0    # m/s below which the fins are not used for control
 DRIFT_TILT_GAIN = 1.5     # deg of commanded tilt per m/s of drift
@@ -382,7 +385,7 @@ class Fins:
                 f"CL_alpha {self.cl_alpha:.2f} /rad, +/-{self.max_deflect:.0f} deg in "
                 f"{self.travel_time * 1000:.0f} ms ({self.rate:.0f} deg/s), arm "
                 f"{self.arm:.2f} m, roll arm {self.roll_arm * 1000:.0f} mm; "
-                f"airbrake adds dCd {self.cd_extra(self.max_deflect):.3f}")
+                f"airbrake adds dCd {self.cd_extra(min(self.max_deflect, FIN_BRAKE_ALPHA_MAX)):.3f}")
 
 
 @njit(cache=True, inline='always')
@@ -1569,6 +1572,17 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                     r_i = fin_max - abs(ctrl_i)
                     if r_i < room:
                         room = r_i
+                    # ... and the brake may not push any fin's ANGLE OF ATTACK
+                    # (deflection minus crossflow) past the stall. Past it the lift
+                    # curve slopes backwards, so every roll-damper command turns into
+                    # its opposite and the damper spins the airframe up instead of
+                    # stopping it: a +/-15 deg brake on a 14 deg stall held the
+                    # vehicle at 110-170 deg/s of roll through the ignition.
+                    r_i = FIN_BRAKE_ALPHA_MAX - abs(ctrl_i - xflow[_i])
+                    if r_i < room:
+                        room = r_i
+                if room < 0.0:
+                    room = 0.0
                 brake = fin_brake_now
                 if brake > room:
                     brake = room
@@ -1988,7 +2002,7 @@ class TvcConfig:
         mode = {"off": 0.0, "auto": 1.0, "always": 2.0}.get(self.fin_brake, 1.0)
         if not f.enabled:
             mode = 0.0
-        cd_free = self.cd + (f.cd_extra(f.max_deflect)
+        cd_free = self.cd + (f.cd_extra(min(f.max_deflect, FIN_BRAKE_ALPHA_MAX))
                              if (f.enabled and mode > 0.5) else
                              (f.cd_extra(0.0) if f.enabled else 0.0))
         drift = 1.0 if (f.enabled and self.fin_drift_null) else 0.0

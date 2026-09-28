@@ -179,8 +179,8 @@ delta_i = roll + A*cos(phi_i) + B*sin(phi_i)   +   brake * (+1,-1,+1,-1)
   is worth ~800 deg/s^2 and a loop sized by authority instead of by inertia demands
   more than a 333 deg/s actuator can track.
 * **Airbrakes.** Splayed +,-,+,- the set cancels its own lift and roll torque and
-  leaves pure drag: **free-fall Cd 0.808 against 0.350 bare, 2.31x** (with the CFD
-  fin; the analytic model said 0.581). Control is allocated first and the brake takes
+  leaves pure drag: **free-fall Cd 0.704 against 0.350 bare, 2.01x** (CFD fin, splay
+  held below the stall - see below). Control is allocated first and the brake takes
   what travel is left.
 
 ### Fin lift and drag come from CFD
@@ -283,6 +283,44 @@ The residual is real, not numerical: at large sideslip the correction needs more
 That is why the attitude loop also stays asleep for most of the free fall - it wakes
 40 m above the commanded ignition altitude, far enough to settle, late enough that the
 long descent is flown at trim instead of at a fought-for attitude.
+
+### ... and why it still spun at 110-170 deg/s: the brake sat past the stall
+
+Even with the equalised brake, most flights arrived at ignition rolling at 110-170
+deg/s (p90 300+), with the peak about a second before the motor lit - it looked like
+an ignition transient, but it was there with the airframe dead vertical and no
+sideslip at all. The cause was the brake angle: **15 deg of splay on a fin that stalls
+at 14 deg**. Past the stall the lift curve slopes backwards, and the roll damper works
+by adding the same small deflection to all four fins - so every roll command produced
+the opposite torque:
+
+| brake splay | roll torque for +1 deg of roll command (42 m/s) |
+|---|---|
+| 10-13 deg | **+0.072 N m** (right way) |
+| 14 deg | +0.023 N m (at the peak, little authority) |
+| 15 deg | **-0.025 N m** (backwards) |
+
+The damper was therefore a roll *exciter*, held at a limit cycle only by its own 2 deg
+travel cap. The fix is in the mixer: the brake may not push any fin's **angle of
+attack** (deflection minus crossflow) past `stall - 1.5 deg`, the same way it already
+may not push the deflection past the end stop. Peak roll rate after the entry spin
+has decayed, 60 flights each from 160 m:
+
+| entry vx | before | after |
+|---|---|---|
+| 0 m/s | 147 deg/s (p90 172) | **7** (p90 13) |
+| 3 m/s | 13 (p90 19) | 9 (p90 15) |
+| 7 m/s | 172 (p90 313) | **11** (p90 21) |
+
+The brake costs a little drag for it (free-fall Cd 0.704 against 0.808) and
+nothing measurable in success: **97.4 % [97.2-97.7]** against 97.6 % [97.4-97.8] on
+the same 16200 flights. The roll gate at touchdown was never the problem - the damper
+wins once the brake stows at ignition - but a vehicle cartwheeling its roll axis at
+170 deg/s into the burn is not one to fly.
+
+The 14 deg stall is still an assumption - the CFD stops at 10 deg. If a 15 and a
+20 deg case show the real fin stalling later (likely for an aspect ratio this low),
+`FIN_ALPHA_STALL` moves up and the brake gets its full travel back automatically.
 
 ### Everything about the vehicle is an input
 
@@ -840,17 +878,17 @@ go sideways. Both `--booster-cant` and `--booster-azimuth` are settable.
 
 | | |
 |---|---|
-| success, all five gates | **97.6 %**  [95 % interval 97.4 - 97.8] |
-| \|vz\| < 4 m/s | 98.1 % (p95 2.9 m/s) |
-| \|vh\| < 0.5 m/s | 99.1 % (p95 0.33 m/s) |
+| success, all five gates | **97.4 %**  [95 % interval 97.2 - 97.7] |
+| \|vz\| < 4 m/s | 98.0 % (p95 3.0 m/s) |
+| \|vh\| < 0.5 m/s | 99.0 % (p95 0.31 m/s) |
 | tilt < 4 deg | 99.4 % (p95 2.9 deg) |
 | transverse rate < 30 deg/s | 100.0 % (p95 7.4 deg/s) |
 | D9 lit | 100 % of flights |
 | burnout before touchdown | 1.1 % |
-| dV spent on steering | 0.13 m/s (clamp waste 22.7 m/s) |
+| dV spent on steering | 0.13 m/s (clamp waste 22.9 m/s) |
 
-Over the 15889 flights that survived the vertical gate, \|vh\| passes **99.6 %**
-(p95 0.30 m/s), tilt 99.8 % and rate 100 % - see *Why isn't the \|vh\| gate 100 %* below.
+Over the 15871 flights that survived the vertical gate, \|vh\| passes **99.6 %**
+(p95 0.29 m/s), tilt 99.8 % and rate 100 % - see *Why isn't the \|vh\| gate 100 %* below.
 
 This is **with** the altitude bias modelled: the flight computer does not know its own
 altitude to better than a metre until 7 m. It is higher than the 85.9 % measured
@@ -863,12 +901,12 @@ it should be, and the trend is only two intervals wide across the whole range:
 
 | release [m] | 140 | 150 | 160 | 170 | 180 |
 |---|---|---|---|---|---|
-| success [%] | 97.3 | **98.5** | 97.8 | 97.1 | **96.8** |
-| 95 % interval | 96-98 | 98-99 | 97-98 | 96-98 | 96-98 |
+| success [%] | 97.0 | **98.2** | 98.1 | 97.1 | **96.6** |
+| 95 % interval | 96-98 | 98-99 | 97-99 | 96-98 | 96-97 |
 
 Success by horizontal entry speed is symmetric to within a point, which it has to be
-for a vehicle that is mirror-symmetric about its own axis: 95.1 % at -7 m/s against
-94.4 % at +7 m/s, rising to ~98-99 % inside +/-3 m/s.
+for a vehicle that is mirror-symmetric about its own axis: 93.9 % at -7 m/s against
+94.9 % at +7 m/s, rising to ~98-99 % inside +/-3 m/s.
 
 > **Mass.** These are for the current default vehicle, **2.85 kg gross**. The tables
 > further down that compare configurations (fins on/off, brake modes, the D9 cant, the
@@ -1207,7 +1245,7 @@ Without it the fins fight their own weathercock moment through the loop and end 
 limit cycle with the gimbal.
 
 **d) Airbrake.** Splayed alternately (+,-,+,-) the four fins cancel each other's lift
-and roll torque and leave pure drag - **2.31x the vehicle's bare drag** (1.66x on the old analytic fin), deployed for
+and roll torque and leave pure drag - **2.01x the vehicle's bare drag** (splay held 1.5 deg below the stall), deployed for
 the whole free fall, stowed at ignition. Two rules matter:
 
 * **control first, brake with what is left**, and
