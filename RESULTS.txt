@@ -7,65 +7,69 @@ LandSim Light - 3-D / TVC Monte Carlo
   mass / Cd         : 2.850 kg + boosters / 0.35
   diameter / area   : 105 mm / 86.6 cm2
   MMOI at gross     : 0.4655 kg m2 transverse, 0.00393 roll  (scaled with mass through the burn)
-  arms              : gimbal 0.70 m, CP 0.35 m, CN_alpha 2.00
+  arms              : gimbal 0.70 m, body lift -0.60 m (+ aft), body CN_alpha 2.00, viscous crossflow 0.80, fin interference 1.43
   TVC servo         : +/-10.0 deg at 2.0:1 (5.0 deg of nozzle), 500 deg/s, 2000 deg/s2, step 0.15 deg
   clamp             : 0.10-1.00 at 12.8 /s
-  fins              : 4 fins (CFD table aero), 64.0 cm2 each, AR 1.53, CL_alpha 1.80 /rad, +/-15 deg in 50 ms (600 deg/s), arm 0.50 m, roll arm 80 mm; airbrake adds dCd 0.354
-  airbrake mode     : auto  (free-fall Cd 0.704 against 0.350 bare)
+  fins              : 4 fins (CFD table aero), 64.0 cm2 each, AR 1.53, CL_alpha 1.80 /rad, +/-15 deg in 50 ms (600 deg/s), arm 0.50 m, roll arm 80 mm; stall 22 deg; airbrake adds dCd 0.447
+  airbrake mode     : auto  (free-fall Cd 0.797 against 0.350 bare)
   entry grid        : 140-180 m step 5, vx 0 +/-7 m/s step 1
   gains             : wn 5.93 / zeta 0.72 (TVC, schedule +0.33), wn 6.54 / zeta 1.59 (fins, schedule +0.02), roll 1.86
   dispersions       : igniter U(0, 300) ms (guidance pads 400 ms), thrust +/-15 % over 700 ms, roll U(0, 90) deg/s, roll phase U(0, 360) deg
   altitude knowledge: bias U(+/-1.00) m until the lidar acquires at 7.0 m, then corrected as a step
+  wind              : mean U(0, 2.0) m/s at 10 m, profile exp 0.14, turbulence 0.30 m/s over 1.5 s; air density +/-3 % (1 sigma)
+  sensors           : attitude 0.30 deg (3 s), gyro bias 0.10 + noise 0.05 deg/s, velocity 0.10 m/s (1.0 s), accel 0.05 m/s2, lag 10 ms
+  hardware          : thrust misalignment 0.25 deg (1 sigma)
+  controller extras : attitude integral 2.0 /s, planner margin 3 %, fins in free fall: vertical
   flights           : 135 cells x 120 = 16200
 
-  SUCCESS (all five gates)   :  97.4 %   [95 % interval 97.2 - 97.7 on 16200 flights]
-    |v_z| < 4 m/s              :  98.0 %   p95   2.97 m/s
-    |v_h| < 0.5 m/s           :  99.0 %   p95   0.31 m/s
-    tilt  < 4 deg             :  99.4 %   p95   2.95 deg
-    rate  < 30 deg/s           : 100.0 %   p95   7.37 deg/s
+  SUCCESS (all five gates)   :  96.3 %   [95 % interval 96.0 - 96.6 on 16200 flights]
+    |v_z| < 4 m/s              :  98.8 %   p95   3.12 m/s
+    |v_h| < 0.5 m/s           :  97.0 %   p95   0.45 m/s
+    tilt  < 4 deg             :  99.7 %   p95   3.19 deg
+    rate  < 30 deg/s           : 100.0 %   p95  11.97 deg/s
 
-  ... and over the 15871 flights that survived the VERTICAL gate, i.e. where
+  ... and over the 16002 flights that survived the VERTICAL gate, i.e. where
       the horizontal and attitude corrections actually ran to touchdown:
-    |v_h| < 0.5 m/s           :  99.6 %   p95   0.29 m/s
+    |v_h| < 0.5 m/s           :  97.7 %   p95   0.44 m/s
     tilt  < 4 deg             :  99.8 %
     rate  < 30 deg/s           : 100.0 %
 
   D9 lit in                  : 100.0 % of flights
-  burnout before touchdown   :   1.1 %
-  mean commanded ignition    :  56.9 m, mean clamp 0.70
-  dV spent on steering       :  0.13 m/s (clamp waste  22.9 m/s)
+  burnout before touchdown   :   5.4 %
+  mean commanded ignition    :  56.2 m, mean clamp 0.70
+  dV spent on steering       :  0.16 m/s (clamp waste  24.0 m/s)
 
   success [%] by release altitude   (95 % interval, 1800 flights each)
      - a wiggle inside these brackets is sampling, not physics:
-     140.0 m :  97.0   [ 96.1 -  97.7]
-     145.0 m :  97.7   [ 96.9 -  98.3]
-     150.0 m :  98.2   [ 97.5 -  98.7]
-     155.0 m :  98.1   [ 97.4 -  98.6]
-     160.0 m :  98.1   [ 97.4 -  98.6]
-     165.0 m :  97.7   [ 96.9 -  98.3]
-     170.0 m :  97.1   [ 96.2 -  97.8]
-     175.0 m :  96.4   [ 95.4 -  97.2]
-     180.0 m :  96.6   [ 95.7 -  97.4]
+     140.0 m :  96.4   [ 95.5 -  97.2]
+     145.0 m :  97.4   [ 96.5 -  98.0]
+     150.0 m :  97.8   [ 97.1 -  98.4]
+     155.0 m :  96.7   [ 95.8 -  97.5]
+     160.0 m :  96.3   [ 95.4 -  97.1]
+     165.0 m :  96.4   [ 95.5 -  97.2]
+     170.0 m :  95.6   [ 94.5 -  96.4]
+     175.0 m :  94.8   [ 93.7 -  95.7]
+     180.0 m :  95.3   [ 94.2 -  96.2]
   success [%] by horizontal entry speed   (1080 flights each)
-     -7.0 m/s :  93.9   [ 92.3 -  95.2]
-     -6.0 m/s :  97.7   [ 96.6 -  98.4]
-     -5.0 m/s :  97.1   [ 96.0 -  98.0]
-     -4.0 m/s :  97.2   [ 96.1 -  98.0]
-     -3.0 m/s :  98.1   [ 97.0 -  98.7]
-     -2.0 m/s :  98.4   [ 97.5 -  99.0]
-     -1.0 m/s :  98.4   [ 97.5 -  99.0]
-     +0.0 m/s :  98.4   [ 97.5 -  99.0]
-     +1.0 m/s :  97.4   [ 96.3 -  98.2]
-     +2.0 m/s :  98.7   [ 97.8 -  99.2]
-     +3.0 m/s :  98.0   [ 96.9 -  98.7]
-     +4.0 m/s :  98.1   [ 97.2 -  98.8]
-     +5.0 m/s :  98.0   [ 96.9 -  98.7]
-     +6.0 m/s :  97.2   [ 96.1 -  98.0]
-     +7.0 m/s :  94.9   [ 93.4 -  96.1]
+     -7.0 m/s :  92.7   [ 91.0 -  94.1]
+     -6.0 m/s :  94.3   [ 92.7 -  95.5]
+     -5.0 m/s :  96.9   [ 95.7 -  97.8]
+     -4.0 m/s :  95.5   [ 94.1 -  96.6]
+     -3.0 m/s :  97.1   [ 96.0 -  98.0]
+     -2.0 m/s :  98.2   [ 97.3 -  98.9]
+     -1.0 m/s :  98.0   [ 96.9 -  98.7]
+     +0.0 m/s :  98.2   [ 97.3 -  98.9]
+     +1.0 m/s :  98.4   [ 97.5 -  99.0]
+     +2.0 m/s :  97.9   [ 96.8 -  98.6]
+     +3.0 m/s :  97.6   [ 96.5 -  98.4]
+     +4.0 m/s :  96.4   [ 95.1 -  97.3]
+     +5.0 m/s :  95.7   [ 94.4 -  96.8]
+     +6.0 m/s :  94.2   [ 92.6 -  95.4]
+     +7.0 m/s :  93.5   [ 91.9 -  94.8]
 
   figures written:
-    figures/run_20260928_125146_long_16200flights/fig1_success_envelope.png
-    figures/run_20260928_125146_long_16200flights/fig2_touchdown_dispersion.png
-    figures/run_20260928_125146_long_16200flights/fig3_single_flight.png
-    figures/run_20260928_125146_long_16200flights/fig4_ignition_and_booster.png
-    figures/run_20260928_125146_long_16200flights/fig5_gates.png
+    figures/run_20261015_075011_long_16200flights/fig1_success_envelope.png
+    figures/run_20261015_075011_long_16200flights/fig2_touchdown_dispersion.png
+    figures/run_20261015_075011_long_16200flights/fig3_single_flight.png
+    figures/run_20261015_075011_long_16200flights/fig4_ignition_and_booster.png
+    figures/run_20261015_075011_long_16200flights/fig5_gates.png

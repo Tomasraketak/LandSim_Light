@@ -111,9 +111,11 @@ the motor, the throttle clamp and the D9 booster are this project's.
   section below.
 * **Two TVC channels**: +/-10 deg servo through a 2:1 linkage -> +/-5 deg of nozzle,
   500 deg/s, 2000 deg/s^2, 0.15 deg quantisation, on a 0.70 m arm.
-* **Aerodynamics**: axial force plus a slender-body normal force with the CP 0.35 m aft
-  of the CG, so the airframe weathercocks nose-first - that is the disturbance the TVC
-  fights - plus transverse (never roll) aero damping.
+* **Aerodynamics**: axial force; the BODY's slender-body normal force acting at the
+  leading (motor) end, 0.60 m ahead of the CG, where it destabilises; the viscous
+  crossflow (Jorgensen) that dominates broadside; transverse aero damping; and the fins
+  on top, with Barrowman's fin-body interference. The fins are what make the vehicle
+  stable - about 1.2 calibres. See *The audit* below for why this changed.
 * **The throttle clamp** of the 1-D modes (10-100 %, diverted impulse wasted, burn
   duration fixed) and **one Klima D9** lit by an on-board rule.
 * **Dispersions**: igniter delay U(0, 300 ms) - the guidance pads for 400 ms, see the
@@ -122,8 +124,13 @@ the motor, the throttle clamp and the D9 booster are this project's.
   ANGLE U(0, 360 deg) - which matters because the D9 is canted, see below - a 0.25 deg
   attitude alignment error at an arbitrary azimuth, an **altitude bias of U(+/-1 m)
   that the lidar only corrects at 7 m**, and the entry grid
-  (release 140-180 m in 5 m steps, vx 0 to +/-7 m/s in 1 m/s steps). Avionics sensor
-  noise is deliberately **not** modelled - the controller sees the true state.
+  (release 140-180 m in 5 m steps, vx 0 to +/-7 m/s in 1 m/s steps).
+* **An imperfect world** (all inputs, all switchable, `--perfect` turns them off):
+  wind up to 2 m/s at 10 m with a 1/7 power-law profile and 0.3 m/s turbulence; a
+  flight computer that sees its state through a 0.3 deg attitude-estimate error, a
+  0.1 deg/s gyro bias and noise, a 0.1 m/s velocity-estimate error, accelerometer
+  noise and a 10 ms transport delay; a 0.25 deg thrust misalignment; and air density
+  scattered 3 %.
 
 Touchdown must pass all five gates - and they are **inputs**, because they describe the
 landing gear rather than the controller: **|vz| < 4 m/s, |vh| < 0.5 m/s, tilt < 4 deg,
@@ -872,41 +879,187 @@ It costs about 4-5 points, and it costs them in the vertical channel: 3.4 % of t
 booster's impulse never points up, and the main motor has to lean to cancel what does
 go sideways. Both `--booster-cant` and `--booster-azimuth` are settable.
 
+## The audit (October 2026): physics, control theory, algorithm
+
+Everything was re-read line by line - plant, aerodynamics, actuators, guidance,
+attitude loops, fin mixer, planner, estimator - and every suspicion was MEASURED
+before anything was changed (5000 paired flights per variant on a 25-cell grid,
+140-180 m x vx -7..+7; the full 16200-flight grid for the final numbers). Several
+things that looked like improvements were measured and thrown out; they are listed
+too, because a negative result is still a result.
+
+### The one-line summary
+
+| same imperfect world (wind <= 2 m/s, sensors, misalignment, lag) | success |
+|---|---|
+| controller and aerodynamics **before** the audit | **49.4 %** [48.0-50.8] |
+| controller and aerodynamics **after** the audit | **95.9 %** [95.3-96.4] |
+| after the audit, in a perfect world (`--perfect`) | 99.2 % [98.9-99.4] |
+
+The old number - 97.4 % - was real, but it was the success rate in still air with a
+flight computer that read the true state and a nozzle that pointed exactly where it
+was told. Put the same controller into a world with any one of those imperfections
+and it fell apart; the audit is mostly the story of why, and of the fixes.
+
+### What was wrong
+
+**1. The fins were counted twice.** The body's normal force sat 0.35 m aft of the CG,
+described in the code as "the body-plus-fins average" - and the fins were then
+modelled again, explicitly, on top. The two numbers cannot even be a whole-vehicle
+pair: with this fin set, a body that made the WHOLE vehicle come out at CN_alpha 2.0
+and 0.35 m would need a negative normal-force slope of its own. The modelled vehicle
+had **4.1 calibres** of static margin; the geometry gives about **1.2** (the body's
+lift belongs at the leading end, 0.60 m AHEAD of the CG, where slender-body theory
+puts it; the fins at 0.50 m aft with Barrowman's interference factor 1.43). An
+over-stable model is not a safe error here: it made the airframe weathercock three
+times harder into any crosswind, and it hid everything below.
+
+**2. Fin stall at 14 deg is a 2-D number.** NACA 0012 stalls there in a wind tunnel;
+a fin of aspect ratio 0.8 (1.5 mirrored in the body) stalls far later - the
+low-aspect-ratio data put it at 20-30 deg. The CFD stops at 10 deg, so this is still
+an assumption; the default is now **22 deg** (`--fin-stall`). It matters: at 14 deg the
+realistic vehicle loses 4 points (91.7 % against 95.9 %), because a marginally stable
+airframe released into a crosswind starts at a large angle of attack and needs its
+fins NOT to be stalled to recover.
+
+**3. The mixer could command a fin past the stall.** The deflection was limited to
++/-15 deg of TRAVEL, but with a crossflow 15 deg of travel can be 25 deg of angle of
+attack, where more command makes LESS force and the loop asking for it runs away.
+Every fin command is now clipped to `stall - 1.5 deg` of angle of attack, as the brake
+already was.
+
+**4. During the free fall the fins could not stabilise anything.** The attitude loop
+slept until 40 m above ignition, and the mixer cancelled each fin's crossflow angle of
+attack (for the brake's roll neutrality). Cancelling the crossflow turns a fin into a
+weathervane - it removes exactly the restoring force fins exist for. On the
+over-stable model nobody noticed, because the body term carried the stability. On the
+real geometry the vehicle tumbled: **3.6 %** success with the fins left asleep. They
+now hold the body axis vertical for the whole free fall (`--fin-freefall vertical`;
+`trim` - along the flight path - and `passive` were measured and are a little worse).
+
+**5. The attitude loop had no integral.** A proportional loop answers a CONSTANT
+torque - a 0.25 deg misaligned thrust line, wind on the body - with a constant
+attitude error, `tau / (I wn^2)`, about a degree for 0.3 N m here; a degree of tilt is
+0.5 m/s of drift over the burn, which is the whole horizontal gate. One misaligned
+nozzle took the old controller from 96 % to 75 %. The nozzle loop now has an integral
+(2 /s, clamped, perpendicular to the body axis, reset at ignition): **worth 26
+points** in the realistic world (69.6 % without it).
+
+**6. The thrust estimator subtracted the TRUE aerodynamic force** from the
+accelerometer reading - something no sensor can measure separately - and ignored the
+D9's 15 deg cant. It now subtracts the computer's own drag model, at its own density
+and velocity estimate, and only the booster's axial share.
+
+**7. The clamp planner counted on all of the thrust it estimated.** Nearly every
+remaining vertical failure was a vehicle still burning when it arrived too fast. The
+planner now holds back 3 % of the estimated thrust (`--plan-margin`): +1.3 points.
+6 % and 10 % were measured and are worse - they stop the vehicle high and burn out.
+
+### What was missing - each imperfection on its own, on the OLD controller
+
+| added to the perfect world | success | what fails |
+|---|---|---|
+| nothing | 96.3 % | |
+| wind <= 4 m/s + 0.5 m/s turbulence | **32.2 %** | horizontal gate |
+| thrust misalignment 0.25 deg | **74.8 %** | horizontal gate |
+| attitude-estimate error 0.5 deg | 94.0 % | horizontal |
+| velocity-estimate error 0.15 m/s | 95.6 % | horizontal |
+| 10 ms control lag | 95.9 % | |
+| gyro bias 0.1 + noise 0.05 deg/s | 96.3 % | nothing |
+| air density +/-3 % | 96.2 % | nothing |
+
+The attitude and velocity errors are cheap alone and expensive together: their
+error budgets add up against a 0.5 m/s gate. That part is NOT a controller problem -
+the tilt error is unobservable from the IMU and the velocity error is what the
+velocity is known to - it is the avionics spec, and it is an input.
+
+### Tried, measured, and thrown out
+
+* **A horizontal disturbance observer** (IMU specific force minus the modelled
+  thrust, fed to the guidance): 69.2 % against 84.4 % without. An attitude-estimate
+  error is invisible to it, and the nozzle-angle model adds noise of its own.
+* **A higher navigation gain** (`a = -N v / t_go`, N = 2, 3) and a cap on N/t_go: worse
+  or no better. The outer loop's bandwidth already runs into the attitude loop's in
+  the last metre; asking for more makes the cascade ring.
+* **A horizontal-velocity integral** in the guidance: much worse (36 %), it winds up
+  on the large drift at ignition and overshoots.
+* **A stronger attitude integral** (3-4 /s) destabilises the loop; 2 /s is the knee.
+* **Tilt-aware planning** (the planner discounting the thrust by cos(tilt)): no effect.
+* **Retro-propulsion drag loss** (`--plume-ct`): the jet leaves the leading end into
+  the oncoming air and should kill most of the forebody drag at C_T = T/(qA) ~ 10.
+  Modelled, it RAISES success by ~1.5 points - but only because the estimator then
+  under-reads the thrust and the planner brakes harder, the same thing the 3 %
+  margin does honestly. Off by default until there is data for its size.
+* **Re-fitting the gains** on the new model: 96.5 % [96.2-96.7] against 96.3 % with
+  the old set, inside the noise and with one gain on the edge of its box - kept the
+  old ones.
+
+### Wind is now the limit
+
+| mean wind at 10 m (turbulence) | success |
+|---|---|
+| none | 98.0 % |
+| <= 2 m/s (0.3) - the default | 95.9 % |
+| <= 3 m/s (0.4) | 80.4 % |
+| <= 4 m/s (0.5) | 61.9 % |
+| <= 4 m/s, mean wind known before the flight | 61.1 % |
+
+Above about 2.5 m/s the vehicle released with no airspeed starts BROADSIDE to the
+relative wind, and a 1.2-calibre airframe with 64 cm^2 fins does not have the fin
+authority to get its nose out of a high-angle-of-attack trim: it glides sideways at
+up to 14 m/s and arrives at ignition with more drift than the burn can remove.
+Knowing the wind does not help - it is an authority problem, not an information
+problem. That is a vehicle-design finding: **bigger fins, more static margin, or a
+release with some airspeed**, not a gain.
+
+### What would make these numbers real
+
+The three inputs everything above leans on, in order:
+1. **The CP and CN_alpha of the real vehicle** - from OpenRocket or Barrowman by hand -
+   so the body term (`--cn-alpha`, `--l-cp`) is the body and not a guess.
+2. **CFD of the fin at 15, 20 and 25 deg** - where it really stalls (`--fin-stall`)
+   decides both the airbrake and the crosswind recovery.
+3. **The avionics' real attitude and velocity accuracy** during powered flight
+   (`--att-sig`, `--vel-sig`) - the horizontal gate is spent almost entirely on them.
+
 ## Results (16200 flights, 135 entry states x 120)
 
 ![Landing success across the entry envelope](figures/fig1_success_envelope.png)
 
 | | |
 |---|---|
-| success, all five gates | **97.4 %**  [95 % interval 97.2 - 97.7] |
-| \|vz\| < 4 m/s | 98.0 % (p95 3.0 m/s) |
-| \|vh\| < 0.5 m/s | 99.0 % (p95 0.31 m/s) |
-| tilt < 4 deg | 99.4 % (p95 2.9 deg) |
-| transverse rate < 30 deg/s | 100.0 % (p95 7.4 deg/s) |
+| success, all five gates | **96.3 %**  [95 % interval 96.0 - 96.6] |
+| \|vz\| < 4 m/s | 98.8 % (p95 3.1 m/s) |
+| \|vh\| < 0.5 m/s | 97.0 % (p95 0.45 m/s) |
+| tilt < 4 deg | 99.7 % (p95 3.2 deg) |
+| transverse rate < 30 deg/s | 100.0 % (p95 12 deg/s) |
 | D9 lit | 100 % of flights |
-| burnout before touchdown | 1.1 % |
-| dV spent on steering | 0.13 m/s (clamp waste 22.9 m/s) |
+| burnout before touchdown | 5.4 % (mostly in the last decimetres, after a soft arrival) |
+| dV spent on steering | 0.16 m/s (clamp waste 24.0 m/s) |
 
-Over the 15871 flights that survived the vertical gate, \|vh\| passes **99.6 %**
-(p95 0.29 m/s), tilt 99.8 % and rate 100 % - see *Why isn't the \|vh\| gate 100 %* below.
+**This is in an imperfect world** - wind up to 2 m/s, a flight computer that only
+has estimates of its attitude and velocity, a 10 ms delay, a misaligned nozzle - see
+*The audit* above. The previous 97.4 % was in still air with perfect knowledge; the
+same vehicle and controller in a perfect world (`--perfect`) now make 99.2 % on the
+25-cell comparison grid. The horizontal gate is where the imperfect world is paid
+for: 97.7 % of the flights that survive the vertical gate pass it, against 99.6 %
+before - most of the difference is the attitude- and velocity-estimate error budget.
 
-This is **with** the altitude bias modelled: the flight computer does not know its own
-altitude to better than a metre until 7 m. It is higher than the 85.9 % measured
-*without* that dispersion (and than the 96.4 % measured before the fins got their
-CFD aerodynamics), because the margin the bias forced on the guidance turned
-out to be worth more than the bias costs - see *The lidar only sees the ground at 7 m*.
+The altitude bias is still modelled: the flight computer does not know its own
+altitude to better than a metre until 7 m - see *The lidar only sees the ground at
+7 m*.
 
 Success by release altitude, with its 95 % interval on 1800 flights each - monotone, as
 it should be, and the trend is only two intervals wide across the whole range:
 
 | release [m] | 140 | 150 | 160 | 170 | 180 |
 |---|---|---|---|---|---|
-| success [%] | 97.0 | **98.2** | 98.1 | 97.1 | **96.6** |
-| 95 % interval | 96-98 | 98-99 | 97-99 | 96-98 | 96-97 |
+| success [%] | 96.4 | **97.8** | 96.3 | 95.6 | **95.3** |
+| 95 % interval | 96-97 | 97-98 | 95-97 | 95-96 | 94-96 |
 
 Success by horizontal entry speed is symmetric to within a point, which it has to be
-for a vehicle that is mirror-symmetric about its own axis: 93.9 % at -7 m/s against
-94.9 % at +7 m/s, rising to ~98-99 % inside +/-3 m/s.
+for a vehicle that is mirror-symmetric about its own axis: 92.7 % at -7 m/s against
+93.5 % at +7 m/s, rising to ~98 % inside +/-3 m/s.
 
 > **Mass.** These are for the current default vehicle, **2.85 kg gross**. The tables
 > further down that compare configurations (fins on/off, brake modes, the D9 cant, the
@@ -1035,20 +1188,24 @@ No angle in the whole controller ever wraps, and there is no gimbal lock anywher
 
 ```
    RELEASE  ──►  FREE FALL  ──►  APPROACH  ──►  IGNITION  ──►  BURN  ──►  TERMINAL  ──► DOWN
-                 fins = airbrake   + attitude   command sent   clamp planner  h < 3 m
-                 + roll damper     loop wakes   (thrust comes  runs at 10 Hz  and slow
-                 only              at h_cmd+40m  0-300 ms later)
+                 fins = airbrake   (nothing     command sent   clamp planner  h < 3 m
+                 + roll damper     changes -    (thrust comes  runs at 10 Hz  and slow
+                 + hold vertical   kept as a    0-300 ms later)
+                                   label)
 ```
 
-**FREE FALL** - the airframe is stable and points itself into the airflow. The
-controller does **not** fight that: holding it dead vertical costs large fin
-deflections, and four fins deflected hard and unequally make a roll torque (measured:
-340 deg/s of spin before the motor was even lit). So in this phase the fins only
-(a) splay as airbrakes and (b) damp roll. The nozzle is parked at zero - with no
+**FREE FALL** - the fins (a) splay as airbrakes with what travel is left, (b) damp
+roll, and (c) **hold the body axis vertical**. This used to be left to the airframe's
+own static margin, with the attitude loop asleep - fine on a model that was counted
+4 calibres stable, a tumble (3.6 % success) on the real ~1.2-calibre geometry, see *The
+audit*. Holding vertical used to spin the vehicle up (340 deg/s) because hard,
+unequal fin deflections roll it; with every fin kept below its stall angle of attack
+it no longer does. The nozzle is parked at zero - with no
 thrust behind it, it makes no torque anyway.
 
-**APPROACH** - 40 m above the commanded ignition altitude the attitude loop wakes up,
-which gives it a couple of seconds to settle before it matters.
+**APPROACH** - formerly where the attitude loop woke up, 40 m above the commanded
+ignition altitude; with the fins flying the whole free fall it is no longer a separate
+phase (`--fin-freefall asleep` brings the old behaviour back for comparison).
 
 **IGNITION** - at `h <= h_cmd` the igniter fires. Thrust arrives 0-300 ms later; that
 uncertainty is the single biggest thing this vehicle has to live with. The airbrake
@@ -1164,9 +1321,14 @@ with the two numbers that mean something physically - bandwidth and damping:
 wn_eff = wn * clamp( (T / 100 N) ^ sched_tvc , 0.35, 2.0 )    // see "scheduling"
 k_th   = wn_eff / (2 * zeta)               // outer: angle -> rate command
 k_rate = 2 * zeta * wn_eff                 // inner: rate error -> angular acceleration
-alpha_req = k_rate * (k_th * e - w_t)
+i_e      += e * dt   (motor lit only; keep it perpendicular to b, |i_e| <= 0.05 rad s)
+alpha_req = k_rate * (k_th * (e + ki * i_e) - w_t)        // ki = 2 /s
 tau_req   = I_t * alpha_req
 ```
+
+The integral is not optional. A misaligned nozzle or a CG off the axis is a constant
+torque, and without it the loop holds a constant attitude error - about a degree here,
+which is the whole horizontal gate. In the audit it was worth 26 points.
 
 **Step 4 - cancel what the air is already doing.** The fins and body make a
 weathercock torque; the controller knows it, so it subtracts it instead of discovering
@@ -1257,12 +1419,24 @@ have left makes their angles unequal again, and unequal angles on a splayed brak
 roll torque: measured, 0.02 N m at 2 degrees of sideslip and 0.65 N m at 30. Equalised,
 the residual is 0.005 N m.
 
-**e) Two authority gates.** Below **8 m/s** of airspeed the fins do nothing for control
-(the `1/q` in `k_t` runs away and every channel saturates on a demand it cannot meet),
-and above `h_cmd + 40 m` the attitude channels stay off entirely (phase FREE FALL).
-The roll damper and the airbrake run the whole way down.
+**e) Never command a fin past the stall.** After a), b) and c), clip every fin's
+*angle of attack* - not just its deflection - to `stall - 1.5 deg`:
 
-**f) Actuator.** +/-15 deg, 50 ms end stop to end stop = **600 deg/s**, rate-limited.
+```
+a_i = delta_i - crossflow_i
+delta_i = crossflow_i + clamp(a_i, -(stall - 1.5), +(stall - 1.5))
+```
+With a crossflow, 15 deg of travel can be 25 deg of angle of attack, where more
+command gives LESS force and the loop that asked for it runs away.
+
+**f) Authority gate and the free fall.** Below **8 m/s** of airspeed the fins do
+nothing for control (the `1/q` in `k_t` runs away). During the free fall the fin
+attitude loop holds the body axis **vertical** (its own gains, `wn_fin`, `zeta_fin`)
+the whole way down - the fins, not the body, are what make this airframe stable, and
+with the crossflow cancelled in c) they only stabilise anything if the loop is
+flying them. The roll damper and the airbrake run the whole way down.
+
+**g) Actuator.** +/-15 deg, 50 ms end stop to end stop = **600 deg/s**, rate-limited.
 
 ### 7. Scheduling: aggressiveness follows authority
 
@@ -1401,7 +1575,10 @@ the guidance law as a known input rather than discovered later as a drift.
 | nozzle | +/-5 deg (+/-10 deg servo, 2:1), 500 deg/s, 0.15 deg step | actuator |
 | fins | +/-15 deg, 50 ms end-to-end (600 deg/s) | actuator |
 | fin control cut-off | below 8 m/s airspeed | authority gate |
-| attitude loop wakes | 40 m above `h_cmd` | phase logic |
+| fins in free fall | hold vertical from release | phase logic |
+| attitude integral | 2 /s, clamp 0.05 rad s, nozzle only | attitude loop |
+| fin angle of attack | never past stall - 1.5 deg (22 deg stall assumed) | fin mixer |
+| planner thrust margin | plans on 97 % of the estimated thrust | clamp planner |
 | clamp | 0.10-1.00, 12.84 /s slew | actuator |
 
 The fitted gains live in `tvc_gains.json` and are re-fitted by `--tune`; if you change
@@ -1424,9 +1601,11 @@ the vehicle, re-fit them before you trust them.
   the real onset.
 * **Sanity-clamp everything** that divides: `t_go`, `1/T`, `1/q`, the axial airspeed in
   the crossflow term. Every one of them blows up somewhere in a real flight.
-* **What this simulation does NOT model**, and your firmware will meet: sensor noise and
-  fusion lag, wind and gusts, thrust axis misalignment, ground effect, and any failure
-  of the motor to follow its curve beyond the +/-15 % scatter. The reference project's
+* **What this simulation models only as simple error processes**: sensor errors (an
+  attitude and a velocity error that wander, gyro bias and noise, accelerometer noise,
+  a fixed transport delay) rather than a real estimator; wind as a power-law mean plus
+  turbulence. **Not modelled at all**: ground effect, the exhaust plume's effect on the
+  fins, and any failure of the motor to follow its curve beyond the +/-15 % scatter. The reference project's
   measurements say the derivative term is where noise hurts first - take rates from the
   gyro, never by differentiating an attitude estimate.
 

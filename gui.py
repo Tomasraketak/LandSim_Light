@@ -61,7 +61,7 @@ INERTIA_FIELDS = [
     ("MMOI transverse",   "mmoi",         "0.466", "kg m2", "pitch/yaw, at the gross mass"),
     ("MMOI roll",         "mmoi_r",       "0.0039", "kg m2", "about the long axis"),
     ("Gimbal arm",        "lgimb",        "0.50",  "m",     "CG -> nozzle pivot"),
-    ("CP arm (aft)",      "lcp",          "0.35",  "m",     "CG -> centre of pressure"),
+    ("Body lift arm",     "lcp",          "-0.60", "m",     "CG -> body normal-force centre, + aft (- = towards the leading end)"),
     ("Body CN_alpha",     "cna",          "2.0",   "1/rad", "normal-force slope"),
 ]
 
@@ -159,9 +159,14 @@ GAIN_FIELDS = [
     ("Tune workers",      "tune_workers", "0",     "-",     "0 = one per core"),
 ]
 
+# Environment, sensors and hardware imperfections - generated from the simulation's
+# own list, so the two can never disagree about names or defaults.
+ENV_FIELDS = [(lab, attr, f"{getattr(tvc_sim.TvcConfig, attr):g}", unit, note)
+              for lab, attr, unit, note in tvc_sim.ENV_FIELDS]
+
 ALL_FIELDS = (AIRFRAME_FIELDS + INERTIA_FIELDS + ACTUATOR_FIELDS + MOTOR_FIELDS
               + FIN_FIELDS + SCENARIO_1D_FIELDS + CAMPAIGN_FIELDS + GATE_FIELDS
-              + GAIN_FIELDS)
+              + GAIN_FIELDS + ENV_FIELDS)
 
 
 MPL_HINT = ("  A 'No module named matplotlib.backends.registry' error means a HALF-"
@@ -271,6 +276,8 @@ class App:
         self.fin_brake = tk.StringVar(value="auto")
         self.fin_drift = tk.BooleanVar(value=False)
         self.fin_aero = tk.StringVar(value="cfd")
+        self.fin_ff = tk.StringVar(value="vertical")
+        self.wind_known = tk.BooleanVar(value=False)
         self.fin_info = tk.StringVar(value="")
 
         nb = ttk.Notebook(root)
@@ -426,6 +433,10 @@ class App:
                             state="readonly", values=("cfd", "analytic"))
         aero.pack(side="left", padx=(4, 16))
         aero.bind("<<ComboboxSelected>>", lambda _e: self.show_fins())
+        ttk.Label(head, text="free fall:").pack(side="left")
+        ttk.Combobox(head, textvariable=self.fin_ff, width=9, state="readonly",
+                     values=("vertical", "trim", "passive", "asleep")).pack(
+            side="left", padx=(4, 16))
         ttk.Checkbutton(head, text="aerodynamic drift nulling",
                         variable=self.fin_drift).pack(side="left")
         ttk.Label(fin, textvariable=self.fin_info, foreground="#777",
@@ -546,6 +557,12 @@ class App:
                                padding=8)
         gates.pack(side="left", fill="both", padx=(8, 0))
         self._fields(gates, GATE_FIELDS, columns=1)
+        envf = ttk.LabelFrame(tab, text="Environment, sensors and hardware "
+                              "imperfections (0 = off)", padding=8)
+        envf.pack(fill="x", pady=(8, 0))
+        self._fields(envf, ENV_FIELDS, columns=4)
+        ttk.Checkbutton(envf, text="computer knows the mean wind before the flight",
+                        variable=self.wind_known).pack(anchor="w", padx=8)
         gains = ttk.LabelFrame(cols, text="Controller gains", padding=8)
         gains.pack(side="left", fill="both", expand=True, padx=(8, 0))
         self._fields(gains, GAIN_FIELDS, columns=2)
@@ -603,6 +620,8 @@ class App:
         self.fin_brake.set("auto")
         self.fin_drift.set(False)
         self.fin_aero.set("cfd")
+        self.fin_ff.set("vertical")
+        self.wind_known.set(False)
         self.show_motor()
         self.show_fins()
 
@@ -777,7 +796,9 @@ class App:
             fin_span=n("fin_span") / 1000.0, fin_arm=n("fin_arm"),
             fin_max_deflect=n("fin_deflect"), fin_travel_time=n("fin_travel"),
             fin_brake=self.fin_brake.get(), fin_aero=self.fin_aero.get(),
-            fin_drift_null=bool(self.fin_drift.get()))
+            fin_drift_null=bool(self.fin_drift.get()),
+            fin_freefall=self.fin_ff.get(), wind_known=bool(self.wind_known.get()),
+            **{attr: n(attr) for _l, attr, _d, _u, _n in ENV_FIELDS})
 
     # ------------------------------------------------------------------ #
     #  Page 5: the campaign's charts, live

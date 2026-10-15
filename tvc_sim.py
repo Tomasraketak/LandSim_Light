@@ -21,8 +21,12 @@ What is modelled
   on-board rule when the main motor alone cannot close the landing.
 * **Dispersions**: ignition delay U(0, 300 ms), instantaneous thrust scatter of up
   to +/-15 % correlated over a 700 ms window, roll rate U(0, 90) deg/s either way,
-  and a grid of entry states. Avionics sensor noise is deliberately NOT modelled -
-  the controller sees the true state.
+  and a grid of entry states.
+* **The world is not perfect**: wind with a power-law profile and turbulence, a
+  flight computer that sees its state through attitude, gyro, velocity and
+  accelerometer errors and a transport delay, a misaligned thrust line, air density
+  that is not 1.225, and a body whose aerodynamics include the viscous crossflow.
+  Each is an input and each can be switched off (`--perfect` does all of them).
 
 Guidance (structure and gains follow Landing-Rocket-Sim)
 -------------------------------------------------------
@@ -45,7 +49,7 @@ import argparse
 import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -77,7 +81,15 @@ RHO = 1.225
 
 L_BODY = 1.40             # airframe length [m]
 L_GIMBAL = 0.70           # CG -> nozzle pivot [m]
-L_CP = 0.35               # CG -> centre of pressure (aft) [m]
+L_CP = -0.60              # CG -> centre of the BODY's normal force [m], + aft.
+                          # Body ALONE: slender-body theory puts its lift where
+                          # the cross-section changes, i.e. at the leading end -
+                          # here the motor end, 0.70 m below the CG - so it sits
+                          # ahead of the CG and destabilises. The fins, modelled
+                          # separately, are what make the vehicle stable. (This
+                          # used to be +0.35 m "body-plus-fins average" WITH the
+                          # fins added again on top: counted twice, 4.1 calibres
+                          # of margin instead of ~1.2.)
 DIAMETER = landsim.DIAMETER
 AREA = math.pi * (DIAMETER / 2.0) ** 2
 I_AXIAL_COEF = 0.5 * (DIAMETER / 2.0) ** 2       # I_roll = mass * this
@@ -134,7 +146,10 @@ FIN_MAX_DEFLECT = 15.0    # deg
 # linkage slop and the fact that the quoted figure is measured unloaded.
 FIN_TRAVEL_TIME = 0.05    # s to go from one end stop to the other (2 x max)
 FIN_CD0 = 0.012           # NACA 0012 profile drag at this Reynolds number
-FIN_ALPHA_STALL = 14.0    # deg
+FIN_ALPHA_STALL = 22.0    # deg. NOT measured - the CFD stops at 10 deg. 14 deg is
+                          # the 2-D stall of a NACA 0012; a fin of aspect ratio
+                          # ~0.8 (1.5 mirrored in the body) stalls far later, in
+                          # the 20-30 deg range on the low-aspect-ratio data.
 FIN_CL_MAX = 0.95
 FIN_ROLL_GAIN = 1.5       # rad/s, roll-rate damping bandwidth. Deliberately slow:
                           # the roll inertia is m*R^2/2 = 0.004 kg m^2, so a single
@@ -142,7 +157,8 @@ FIN_ROLL_GAIN = 1.5       # rad/s, roll-rate damping bandwidth. Deliberately slo
                           # sized by "authority" rather than by inertia demands
                           # deflections the 333 deg/s actuator cannot track and the
                           # roll axis limit-cycles at hundreds of deg/s.
-FIN_BRAKE_ALPHA_MAX = FIN_ALPHA_STALL - 1.5   # deg, the brake keeps every fin's
+FIN_STALL_MARGIN = 1.5    # deg below the stall that the mixer keeps every fin
+FIN_BRAKE_ALPHA_MAX = FIN_ALPHA_STALL - FIN_STALL_MARGIN   # deg, the brake keeps every fin's
                           # angle of attack below this, so the roll channel keeps
                           # a lift curve that slopes the RIGHT way (see the mixer)
 FIN_ROLL_MAX = 2.0        # deg of the travel the roll channel may spend
@@ -307,6 +323,91 @@ ALT_PAD = 1.0             # m the guidance assumes it may be LOWER than it reads
                           # the igniter pad uses - and it turns out to be worth far
                           # more than that; see the README.
 
+# --- ENVIRONMENT, SENSORS AND HARDWARE IMPERFECTIONS -------------------------
+# Everything the first versions left perfect: still air, a flight computer that
+# reads the true state, a nozzle that points exactly where the servo says, air at
+# exactly 1.225 kg/m3, and a body whose aerodynamics stop at the linear term. Each
+# is handed to the plant in one array (like the vehicle), each can be switched off
+# (0), and each draws from its OWN random stream - so switching one on does not
+# reshuffle the igniter, thrust and roll draws of every flight, and an A/B between
+# two settings stays a paired comparison.
+(E_WIND, E_GUST, E_GUST_TAU, E_SHEAR, E_RHO_SIG, E_MISALIGN,
+ E_ATT_SIG, E_ATT_TAU, E_GYRO_BIAS, E_GYRO_NOISE, E_VEL_SIG, E_VEL_TAU,
+ E_ACC_NOISE, E_LAG, E_PLUME_CT, E_XFLOW, E_BODY_LEN, E_XFLOW_ARM, E_FIN_K,
+ E_ATT_KI, E_TILT_PLAN, E_WIND_KNOWN, E_GUID_N, E_FIN_FF, E_FIN_STALL,
+ E_GUID_KMAX, E_PLAN_MARGIN) = range(27)
+N_ENV = 27
+
+WIND_MAX = 2.0            # m/s, mean wind at 10 m is U(0, this), random direction
+GUST_SIG = 0.3            # m/s, turbulence per horizontal axis (half that vertical)
+GUST_TAU = 1.5            # s, turbulence correlation time
+WIND_SHEAR = 1.0 / 7.0    # power-law exponent of the wind profile
+RHO_SIG = 0.03            # 1-sigma fractional air-density error (temperature, site)
+MISALIGN_SIG = 0.25       # deg, 1-sigma thrust misalignment (nozzle + CG offset)
+ATT_SIG = 0.3             # deg, 1-sigma attitude-estimate error, per axis
+ATT_TAU = 3.0             # s, how slowly that error wanders
+GYRO_BIAS_SIG = 0.1       # deg/s, 1-sigma gyro bias, per axis
+GYRO_NOISE = 0.05         # deg/s, 1-sigma gyro white noise per 200 Hz sample
+VEL_SIG = 0.10            # m/s, 1-sigma velocity-estimate error, per axis
+VEL_TAU = 1.0             # s, its correlation time
+ACC_NOISE = 0.05          # m/s2, 1-sigma accelerometer noise per sample
+CTRL_LAG = 0.010          # s, sensor-to-actuator transport delay
+PLUME_CT_REF = 0.0        # retro-propulsion: body drag x 1/(1 + C_T/this); 0 = off
+XFLOW_CD = 0.8            # eta*Cd_c of the viscous crossflow term; 0 = off
+XFLOW_ARM = 0.0           # m, planform centroid aft of the CG
+ATT_KI = 2.0              # 1/s, attitude-loop integral gain (0 = none)
+ATT_I_LIM = 0.05          # rad*s, clamp on that integral
+GUID_N = 1.0              # horizontal navigation gain: a = -N v / t_go
+GUID_KMAX = 0.0           # 1/s, cap on N / t_go (0 = none) - see guidance_dir
+PLAN_MARGIN = 0.03        # fraction of the estimated thrust the clamp planner
+                          # does NOT count on (0 = plan on the estimate itself)
+
+
+@njit(cache=True, inline='always')
+def _rng_u01(st):
+    """splitmix64 - a private stream, separate from np.random (see above)."""
+    st[0] += np.uint64(0x9E3779B97F4A7C15)
+    z = st[0]
+    z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    z = z ^ (z >> np.uint64(31))
+    return float(z >> np.uint64(11)) * (1.0 / 9007199254740992.0)
+
+
+@njit(cache=True, inline='always')
+def _rng_normal(st):
+    u1 = _rng_u01(st)
+    u2 = _rng_u01(st)
+    return math.sqrt(-2.0 * math.log(1.0 - u1)) * math.cos(2.0 * math.pi * u2)
+
+
+# The environment / sensor / imperfection inputs, in one list that both the command
+# line and the GUI are generated from: (label, TvcConfig field, unit, note).
+ENV_FIELDS = [
+    ("Wind at 10 m, max",  "wind_max",    "m/s",   "mean drawn U(0, x), random direction"),
+    ("Turbulence",         "gust",        "m/s",   "1-sigma per horizontal axis"),
+    ("Turbulence time",    "gust_tau",    "s",     "correlation time"),
+    ("Wind shear exp.",    "wind_shear",  "-",     "power-law profile, 1/7 open terrain"),
+    ("Air density",        "rho_sig",     "1-sig frac", "temperature / site altitude"),
+    ("Thrust misalign.",   "misalign",    "deg",   "1-sigma, nozzle + CG offset"),
+    ("Attitude estimate",  "att_sig",     "deg",   "1-sigma error per axis"),
+    ("Att. error time",    "att_tau",     "s",     "how slowly it wanders"),
+    ("Gyro bias",          "gyro_bias",   "deg/s", "1-sigma per axis"),
+    ("Gyro noise",         "gyro_noise",  "deg/s", "1-sigma per 200 Hz sample"),
+    ("Velocity estimate",  "vel_sig",     "m/s",   "1-sigma error per axis"),
+    ("Vel. error time",    "vel_tau",     "s",     "correlation time"),
+    ("Accel. noise",       "acc_noise",   "m/s2",  "1-sigma per sample"),
+    ("Control lag",        "ctrl_lag",    "s",     "sensor -> actuator"),
+    ("Plume C_T ref",      "plume_ct",    "-",     "forebody drag x 1/(1+C_T/x); 0 = off"),
+    ("Crossflow eta*Cdc",  "xflow_cd",    "-",     "viscous crossflow; 0 = off"),
+    ("Crossflow arm",      "xflow_arm",   "m",     "planform centroid aft of CG"),
+    ("Body length",        "body_length", "m",     "for the crossflow planform"),
+    ("Fin interference",   "fin_interference", "-", "fin-on-body lift; 0 = Barrowman"),
+    ("Fin stall",          "fin_stall",   "deg",   "no CFD past 10 deg - an assumption"),
+    ("Attitude integral",  "att_ki",      "1/s",   "nozzle loop; 0 = none"),
+    ("Planner margin",     "plan_margin", "frac",  "thrust the planner does not count on"),
+]
+
 
 def default_delay_pad(spread):
     """How much igniter delay the guidance should plan for, given its spread.
@@ -324,10 +425,13 @@ def default_delay_pad(spread):
     return min(max(spread + 0.10, 0.20), 0.70)
 
 N_OUT = 19                # length of the per-flight result vector
-N_TEL = 20                # telemetry columns:
+N_TEL = 26                # telemetry columns:
 #  0 t   1 h   2 vz   3 x   4 vx   5 tilt   6 thrust   7 clamp   8 servo1  9 servo2
 # 10 |w| 11 D9 thrust  12 fin1  13 fin2  14 roll rate  15 y   16-18 thrust axis b
 # 19 the altitude the flight computer believes it is at
+# 20 vy   21 attitude tracking error, commanded vs believed [deg]
+# 22 attitude-ESTIMATE error, believed vs true [deg]
+# 23 commanded tilt [deg]   24-25 wind at the vehicle (x, y) [m/s]
 
 
 # ======================================================================
@@ -346,8 +450,9 @@ class Fins:
     def __init__(self, count=FIN_COUNT, root=FIN_ROOT, tip=FIN_TIP, span=FIN_SPAN,
                  arm=FIN_ARM, max_deflect=FIN_MAX_DEFLECT,
                  travel_time=FIN_TRAVEL_TIME, body_diameter=DIAMETER,
-                 body_area=AREA, enabled=True, aero="cfd"):
+                 body_area=AREA, enabled=True, aero="cfd", stall=FIN_ALPHA_STALL):
         self.count = int(count)
+        self.stall = stall
         self.cfd = (aero == "cfd")
         self.enabled = bool(enabled) and self.count > 0
         self.area = 0.5 * (root + tip) * span              # m2, one fin
@@ -372,9 +477,10 @@ class Fins:
         it is read at 30 m/s, the middle of the free fall - the Reynolds dependence
         is a few per cent either way."""
         if self.cfd:
-            _, cd = fin_cfd_coeffs(math.radians(abs(deflect_deg)), FIN_CFD_REF_V)
+            _, cd = fin_cfd_coeffs(math.radians(abs(deflect_deg)), FIN_CFD_REF_V,
+                                   self.stall)
             return self.count * self.area * cd / self.body_area
-        a = math.radians(min(abs(deflect_deg), FIN_ALPHA_STALL))
+        a = math.radians(min(abs(deflect_deg), self.stall))
         cl = min(self.cl_alpha * a, FIN_CL_MAX)  # same cap as fin_cl
         cd = FIN_CD0 + cl * cl / (math.pi * self.aspect * 0.85)
         return self.count * self.area * cd / self.body_area
@@ -385,14 +491,19 @@ class Fins:
                 f"CL_alpha {self.cl_alpha:.2f} /rad, +/-{self.max_deflect:.0f} deg in "
                 f"{self.travel_time * 1000:.0f} ms ({self.rate:.0f} deg/s), arm "
                 f"{self.arm:.2f} m, roll arm {self.roll_arm * 1000:.0f} mm; "
-                f"airbrake adds dCd {self.cd_extra(min(self.max_deflect, FIN_BRAKE_ALPHA_MAX)):.3f}")
+                f"stall {self.stall:.0f} deg; airbrake adds dCd "
+                f"{self.cd_extra(self.brake_max()):.3f}")
+
+    def brake_max(self):
+        """Largest splay the brake may use: the travel, or the stall less margin."""
+        return min(self.max_deflect, self.stall - FIN_STALL_MARGIN)
 
 
 @njit(cache=True, inline='always')
-def fin_cl(alpha, cl_alpha):
+def fin_cl(alpha, cl_alpha, stall_deg=FIN_ALPHA_STALL):
     """NACA 0012 lift curve, linear then stalled - and it does stall: 15 deg of
     deflection on top of a few degrees of crossflow is right at the edge."""
-    a_st = math.radians(FIN_ALPHA_STALL)
+    a_st = math.radians(stall_deg)
     cl_st = cl_alpha * a_st
     if cl_st > FIN_CL_MAX:
         cl_st = FIN_CL_MAX
@@ -409,7 +520,7 @@ def fin_cl(alpha, cl_alpha):
 
 
 @njit(cache=True, inline='always')
-def fin_cfd_coeffs(alpha, v):
+def fin_cfd_coeffs(alpha, v, stall_deg=FIN_ALPHA_STALL):
     """(CL, CD) of one fin from the CFD table, bilinear in |alpha| and airspeed,
     airspeed clamped to the 20-40 m/s the table covers. Odd in alpha for lift."""
     sgn = 1.0 if alpha >= 0.0 else -1.0
@@ -421,7 +532,7 @@ def fin_cfd_coeffs(alpha, v):
     elif w > 1.0:
         w = 1.0
     a_last = FIN_CFD_AOA[FIN_CFD_AOA.shape[0] - 1]
-    a_st = FIN_ALPHA_STALL
+    a_st = stall_deg
     cl = 0.0
     cd = 0.0
     for r in range(2):
@@ -451,8 +562,13 @@ def fin_cfd_coeffs(alpha, v):
 @njit(cache=True)
 def fin_forces(bx, by, bz, u1x, u1y, u1z, u2x, u2y, u2z,
                vx, vy, vz, wx, wy, wz, defl, n_fin, fin_area, fin_arm, roll_arm,
-               cl_alpha, aspect, use_cfd):
+               cl_alpha, aspect, use_cfd, rho=RHO, k_int=1.0,
+               stall_deg=FIN_ALPHA_STALL):
     """Total force and moment of the fin set, in world axes.
+
+    `vx, vy, vz` is the velocity THROUGH THE AIR (wind already removed), `rho` the
+    air density of this flight, and `k_int` the fin-body interference factor that
+    multiplies the lift of a fin mounted on a body over the same fin alone.
 
     Each fin is a flat surface whose hinge is the spanwise direction r_i; positive
     deflection pushes along n_i = b x r_i. The fin sees the vehicle's airspeed plus
@@ -491,13 +607,13 @@ def fin_forces(bx, by, bz, u1x, u1y, u1z, u2x, u2y, u2z,
             va = 2.0
         cross = lx * nx + ly * ny + lz * nz      # crossflow along +n
         alpha = math.radians(defl[i]) - cross / va
-        q = 0.5 * RHO * v2
+        q = 0.5 * rho * v2
         if use_cfd > 0.5:
-            cl, cd = fin_cfd_coeffs(alpha, v)
+            cl, cd = fin_cfd_coeffs(alpha, v, stall_deg)
         else:
-            cl = fin_cl(alpha, cl_alpha)
+            cl = fin_cl(alpha, cl_alpha, stall_deg)
             cd = FIN_CD0 + cl * cl / (math.pi * aspect * 0.85)
-        lift = q * fin_area * cl
+        lift = q * fin_area * cl * k_int
         drag = q * fin_area * cd
         # drag OPPOSING the fin's motion through the air, lift perpendicular to it
         # in the plane of n and the local flow (with no crossflow, that is n itself)
@@ -580,7 +696,8 @@ def clampf(v, lo, hi):
 
 @njit(cache=True, inline='always')
 def guidance_dir(h, vx, vy, vz, mass, cd, ax_bias, ay_bias, area,
-                 tilt_min=TILT_MIN, tilt_slope=TILT_SLOPE, tilt_cap=TILT_CAP):
+                 tilt_min=TILT_MIN, tilt_slope=TILT_SLOPE, tilt_cap=TILT_CAP,
+                 nav_n=1.0, k_max=0.0):
     """Commanded thrust direction as a unit vector, plus t_go.
 
     A direction rather than a pair of angles: the two horizontal channels enter
@@ -595,8 +712,20 @@ def guidance_dir(h, vx, vy, vz, mass, cd, ax_bias, ay_bias, area,
     if t_go < 0.25:
         t_go = 0.25
 
-    req_ax = -vx / t_go + ax_bias
-    req_ay = -vy / t_go + ay_bias
+    # N = 1 brings the velocity down LINEARLY and reaches zero exactly at t_go,
+    # so any disturbance on the way is still in the touchdown velocity. N > 1
+    # front-loads the correction - the residual decays as (t/t_go)^N.
+    #
+    # And the gain N/t_go is the BANDWIDTH of this outer loop: it runs to
+    # infinity as t_go -> 0, while the attitude loop it commands has a fixed
+    # few rad/s. Once the outer loop is faster than the inner one the cascade
+    # rings, and it does so in the last metre, right where the gates are read.
+    # `k_max` caps it at a fraction of the attitude bandwidth.
+    k_h = nav_n / t_go
+    if k_max > 0.0 and k_h > k_max:
+        k_h = k_max
+    req_ax = -k_h * vx + ax_bias
+    req_ay = -k_h * vy + ay_bias
     req_az = abs(vz) / t_go + G
 
     v = math.sqrt(vx * vx + vy * vy + vz * vz)
@@ -1057,7 +1186,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
         tilt_min, tilt_slope, tilt_cap,
         n_fin, fin_area, fin_arm, fin_roll_arm, fin_cl_alpha, fin_aspect,
         fin_max, fin_rate, fin_brake_mode, fin_drift, fin_cfd, cd_free, b_cant, b_azim,
-        veh, mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop, b_total,
+        veh, env, mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop, b_total,
         tel, n_tel, h_cmd_in):
     np.random.seed(seed)
     out = np.zeros(N_OUT, dtype=np.float64)
@@ -1102,6 +1231,48 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
     alt_bias = np.random.uniform(-1.0, 1.0) * alt_bias_max
     bias_now = alt_bias          # what the error is RIGHT NOW (see the loop)
     acquired = False
+
+    # ---- environment, sensor and hardware draws: their own stream -------------
+    rst = np.zeros(1, dtype=np.uint64)
+    rst[0] = np.uint64(seed) * np.uint64(6364136223846793005) + np.uint64(1442695040888963407)
+    w_mean = env[E_WIND] * _rng_u01(rst)                 # at 10 m
+    w_dir = 2.0 * math.pi * _rng_u01(rst)
+    w_cx, w_cy = math.cos(w_dir), math.sin(w_dir)
+    gust_sig = env[E_GUST]
+    gust_x = gust_sig * _rng_normal(rst)                 # start stationary
+    gust_y = gust_sig * _rng_normal(rst)
+    gust_z = 0.5 * gust_sig * _rng_normal(rst)
+    rho_f = RHO * clampf(1.0 + env[E_RHO_SIG] * _rng_normal(rst), 0.8, 1.2)
+    mis = math.radians(abs(env[E_MISALIGN] * _rng_normal(rst)))
+    mis_az = 2.0 * math.pi * _rng_u01(rst)
+    att_sig = math.radians(env[E_ATT_SIG])
+    att_e1 = att_sig * _rng_normal(rst)                  # body-fixed, rad
+    att_e2 = att_sig * _rng_normal(rst)
+    gb_sig = math.radians(env[E_GYRO_BIAS])
+    gb1 = gb_sig * _rng_normal(rst)                      # body-fixed, rad/s
+    gb2 = gb_sig * _rng_normal(rst)
+    gb3 = gb_sig * _rng_normal(rst)
+    g_noise = math.radians(env[E_GYRO_NOISE])
+    vel_sig = env[E_VEL_SIG]
+    ev_x = vel_sig * _rng_normal(rst)
+    ev_y = vel_sig * _rng_normal(rst)
+    ev_z = vel_sig * _rng_normal(rst)
+    acc_noise = env[E_ACC_NOISE]
+    plume_ct = env[E_PLUME_CT]
+    xflow_cd = env[E_XFLOW]
+    planform = env[E_BODY_LEN] * 2.0 * math.sqrt(veh[V_AREA] / math.pi)
+    xflow_arm = env[E_XFLOW_ARM]
+    fin_k = env[E_FIN_K] if env[E_FIN_K] > 0.0 else 1.0
+    att_ki = env[E_ATT_KI]
+    tilt_plan = env[E_TILT_PLAN] > 0.5
+    guid_n = env[E_GUID_N] if env[E_GUID_N] > 0.0 else 1.0
+    guid_kmax = env[E_GUID_KMAX]
+    fin_ff = env[E_FIN_FF]       # free-fall fin mode: 0 asleep, 1 passive, 2 trim
+    fin_stall = env[E_FIN_STALL] if env[E_FIN_STALL] > 0.0 else FIN_ALPHA_STALL
+    fin_amax = fin_stall - FIN_STALL_MARGIN
+    att_err_deg = 0.0
+    cmd_uz = 1.0
+    wind_known = env[E_WIND_KNOWN] > 0.5
     s_thr = 0.0                                  # instantaneous thrust deviation
     # What the FLIGHT COMPUTER believes the motor is doing, as a multiple of the
     # tabulated curve. It starts at 1.0 (it has only the table) and is corrected from
@@ -1174,6 +1345,20 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
     # angular rate: the inherited spin about the body axis
     wx, wy, wz = roll_rate * bx, roll_rate * by, roll_rate * bz
 
+    # What the FLIGHT COMPUTER thinks the state is (sample-and-hold at 200 Hz).
+    evx, evy, evz = vx0, 0.0, vz0
+    ebx, eby, ebz = bx, by, bz
+    ewx = ewy = ewz = 0.0
+    a_meas = 0.0
+    iex = iey = iez = 0.0          # attitude-error integral
+    n_lag = int(env[E_LAG] / (DT_PHYS * CTRL_DIV) + 0.5)
+    if n_lag > 15:
+        n_lag = 15
+    lag_buf = np.zeros((16, 6))
+    lag_pos = 0
+    act1 = act2 = 0.0
+    act_f = np.zeros(4)
+    wind_x = wind_y = wind_z = 0.0
     defl = np.zeros(4)           # fin deflections [deg]
     defl_cmd = np.zeros(4)
     ctrl_arr = np.zeros(4)
@@ -1274,10 +1459,16 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
         # ---------------- planner, 10 Hz ----------------
         if step % PLAN_DIV == 0 and t_ign_cmd >= 0.0 and h_est > 0.05:
             tb_p = tb if tb >= 0.0 else 0.0
-            k_level, resid = solve_plan(h_est, vz, tb_p, dry,
+            # With tilt-aware planning the projection is told how much of the
+            # thrust actually points up right now; the 1-D model otherwise assumes
+            # all of it does, and is optimistic by 1 - cos(tilt) for the whole burn.
+            ts_p = t_scale * (1.0 - env[E_PLAN_MARGIN])
+            if tilt_plan:
+                ts_p *= clampf(ebz, 0.5, 1.0)
+            k_level, resid = solve_plan(h_est, evz, tb_p, dry,
                                         mt, mf, mc, prop_mass, i_total, cd_burn, area,
                                         k_min, k_max, bt, bf_ax, bb, b_prop,
-                                        b_t_ign, 0.02, plan_target, t_scale)
+                                        b_t_ign, 0.02, plan_target, ts_p)
             # ---- the booster rule ----
             # A D9 is a one-way door: it cannot be throttled, stopped or relit. So it
             # is lit only once the plan says the main motor CANNOT close the landing
@@ -1291,7 +1482,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             # The plant flies the SAME clamp law the projection assumed, terminal
             # phase included. Anything else and the planner is solving for a vehicle
             # that does not exist.
-            k_cmd = k_from_plan(k_level, 0.0, h_est, vz, mass, t_nom, k_min, k_max)
+            k_cmd = k_from_plan(k_level, 0.0, h_est, evz, mass, t_nom, k_min, k_max)
             if gate_open:
                 # Ignition transient: full open, whatever the planner wants. The
                 # planner's projection assumes its own clamp level from t = 0, so
@@ -1303,8 +1494,48 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
         # ---------------- controller, 200 Hz ----------------
         if step % CTRL_DIV == 0:
             dt_c = DT_PHYS * CTRL_DIV
+            # ---- sensors: what the flight computer gets this tick ----
+            # Every error process is an Ornstein-Uhlenbeck wander (exact
+            # discretisation), so it has the stated 1-sigma at any instant and
+            # changes on its own time scale - an attitude estimate drifts, it does
+            # not jitter. Gyro noise is white on top of a fixed bias.
+            t1x, t1y, t1z, t2x, t2y, t2z = gimbal_basis(bx, by, bz, gx, gy, gz)
+            if att_sig > 0.0:
+                fa_ = math.exp(-dt_c / env[E_ATT_TAU])
+                fb_ = att_sig * math.sqrt(1.0 - fa_ * fa_)
+                att_e1 = att_e1 * fa_ + fb_ * _rng_normal(rst)
+                att_e2 = att_e2 * fa_ + fb_ * _rng_normal(rst)
+            ebx = bx + att_e1 * t1x + att_e2 * t2x
+            eby = by + att_e1 * t1y + att_e2 * t2y
+            ebz = bz + att_e1 * t1z + att_e2 * t2z
+            ebn = math.sqrt(ebx * ebx + eby * eby + ebz * ebz)
+            ebx, eby, ebz = ebx / ebn, eby / ebn, ebz / ebn
+            if vel_sig > 0.0:
+                fa_ = math.exp(-dt_c / env[E_VEL_TAU])
+                fb_ = vel_sig * math.sqrt(1.0 - fa_ * fa_)
+                ev_x = ev_x * fa_ + fb_ * _rng_normal(rst)
+                ev_y = ev_y * fa_ + fb_ * _rng_normal(rst)
+                ev_z = ev_z * fa_ + fb_ * _rng_normal(rst)
+            evx, evy, evz = vx + ev_x, vy + ev_y, vz + ev_z
+            ewx = wx + gb1 * t1x + gb2 * t2x + gb3 * bx
+            ewy = wy + gb1 * t1y + gb2 * t2y + gb3 * by
+            ewz = wz + gb1 * t1z + gb2 * t2z + gb3 * bz
+            if g_noise > 0.0:
+                ewx += g_noise * _rng_normal(rst)
+                ewy += g_noise * _rng_normal(rst)
+                ewz += g_noise * _rng_normal(rst)
+            a_meas = a_axial_meas
+            if acc_noise > 0.0:
+                a_meas += acc_noise * _rng_normal(rst)
+            # turbulence, advanced at the same rate
+            if gust_sig > 0.0:
+                fa_ = math.exp(-dt_c / env[E_GUST_TAU])
+                fb_ = gust_sig * math.sqrt(1.0 - fa_ * fa_)
+                gust_x = gust_x * fa_ + fb_ * _rng_normal(rst)
+                gust_y = gust_y * fa_ + fb_ * _rng_normal(rst)
+                gust_z = gust_z * fa_ + 0.5 * fb_ * _rng_normal(rst)
             # body-fixed gimbal / fin axes, needed by everything below
-            c1x, c1y, c1z, c2x, c2y, c2z = gimbal_basis(bx, by, bz, gx, gy, gz)
+            c1x, c1y, c1z, c2x, c2y, c2z = gimbal_basis(ebx, eby, ebz, gx, gy, gz)
             # Feed the canted booster's side force forward. The flight computer
             # knows it lit the D9 and knows which way the airframe is pointing, so
             # the 15 deg cant is a KNOWN horizontal input, not a disturbance to be
@@ -1318,9 +1549,10 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                 sb = math.sin(b_cant)
                 bxf = -thr_boost * (-sb * mfx) / mass
                 byf = -thr_boost * (-sb * mfy) / mass
-            ux, uy, uz, t_go = guidance_dir(h_est, vx, vy, vz, mass, cd,
+            ux, uy, uz, t_go = guidance_dir(h_est, evx, evy, evz, mass, cd,
                                             ax_bias + bxf, ay_bias + byf, area,
-                                            tilt_min, tilt_slope, tilt_cap)
+                                            tilt_min, tilt_slope, tilt_cap, guid_n,
+                                            guid_kmax)
             # ---- aerodynamic drift nulling, before the motor is lit ----
             # The body's own normal force is a free horizontal actuator while the
             # vehicle is still falling: tilting the thrust axis TOWARDS the drift
@@ -1333,33 +1565,52 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             # attitude loop wakes up for the ignition.
             if (fin_drift > 0.5 and t_ign_cmd < 0.0
                     and h_est > h_cmd + FIN_CTRL_LEAD and n_fin > 0.5):
-                vh_m = math.sqrt(vx * vx + vy * vy)
+                vh_m = math.sqrt(evx * evx + evy * evy)
                 if vh_m > 0.2:
                     tl = math.tan(math.radians(clampf(vh_m * DRIFT_TILT_GAIN, 0.0,
                                                       DRIFT_TILT_MAX)))
-                    ux = tl * vx / vh_m
-                    uy = tl * vy / vh_m
+                    ux = tl * evx / vh_m
+                    uy = tl * evy / vh_m
                     uz = 1.0
                     nrm = math.sqrt(ux * ux + uy * uy + 1.0)
                     ux, uy, uz = ux / nrm, uy / nrm, uz / nrm
                 else:
                     ux, uy, uz = 0.0, 0.0, 1.0
+            # ---- free-fall fin mode ----
+            # "trim": the fin loop flies the whole free fall, holding the body
+            # axis on the flight path (where a stable airframe would sit by
+            # itself) instead of leaving the attitude to the airframe's own
+            # static margin - which the vehicle may not have much of.
+            asleep = t_ign_cmd < 0.0 and h_est > h_cmd + FIN_CTRL_LEAD
+            # Right after release the velocity is still mostly sideways, and
+            # "align with it" would mean lying the vehicle down - so until the
+            # descent is established (8 m/s) the target is plain vertical.
+            # "vertical" holds vertical all the way.
+            if fin_ff > 1.5 and asleep and fin_drift < 0.5:
+                evn_ = math.sqrt(evx * evx + evy * evy + evz * evz)
+                if fin_ff < 2.5 and evz < -8.0 and evn_ > 1.0:
+                    ux, uy, uz = -evx / evn_, -evy / evn_, -evz / evn_
+                else:
+                    ux, uy, uz = 0.0, 0.0, 1.0
+            cmd_uz = uz
+            att_err_deg = math.degrees(math.acos(clampf(
+                ux * ebx + uy * eby + uz * ebz, -1.0, 1.0)))
             # attitude error as a rotation vector: e = asin|b x u| * unit(b x u).
             # No atan2, no wrap, no gimbal lock - and perpendicular to b by
             # construction, so the loop can never ask for a roll it cannot make.
-            cx = by * uz - bz * uy
-            cy = bz * ux - bx * uz
-            cz = bx * uy - by * ux
+            cx = eby * uz - ebz * uy
+            cy = ebz * ux - ebx * uz
+            cz = ebx * uy - eby * ux
             cn = math.sqrt(cx * cx + cy * cy + cz * cz)
             if cn > 1e-9:
                 ang = math.asin(clampf(cn, -1.0, 1.0))
-                if bx * ux + by * uy + bz * uz < 0.0:
+                if ebx * ux + eby * uy + ebz * uz < 0.0:
                     ang = math.pi - ang
                 sc = ang / cn
                 eax, eay, eaz = cx * sc, cy * sc, cz * sc
             else:
                 eax = eay = eaz = 0.0
-            tilt = math.degrees(math.acos(clampf(bz, -1.0, 1.0)))
+            tilt = math.degrees(math.acos(clampf(ebz, -1.0, 1.0)))
             if tilt > max_tilt and engine_on:
                 max_tilt = tilt
 
@@ -1367,25 +1618,33 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             # about b, so feeding the roll rate into the rate loop asks for the
             # impossible and the inversion answers with a deflection that does
             # something else instead
-            w_roll = wx * bx + wy * by + wz * bz
-            gtx, gty, gtz = wx - w_roll * bx, wy - w_roll * by, wz - w_roll * bz
+            w_roll = ewx * ebx + ewy * eby + ewz * ebz
+            gtx, gty, gtz = ewx - w_roll * ebx, ewy - w_roll * eby, ewz - w_roll * ebz
 
             I_t = mass * it_coef
             I_a = mass * ia_coef
 
-            # aero feedforward: tau = L_CP * (b x F_normal)
-            rvx, rvy, rvz = vx, vy, vz
+            # aero feedforward: tau = L_CP * (b x F_normal). It needs the velocity
+            # through the AIR; with no wind knowledge the computer can only use its
+            # ground velocity, with a pre-flight wind estimate it subtracts the
+            # mean wind at its believed altitude.
+            ev2 = evx * evx + evy * evy + evz * evz
+            rvx, rvy, rvz = evx, evy, evz
+            if wind_known and w_mean > 0.0:
+                wk = w_mean * (max(h_est, 0.3) / 10.0) ** env[E_SHEAR]
+                rvx -= wk * w_cx
+                rvy -= wk * w_cy
             v2 = rvx * rvx + rvy * rvy + rvz * rvz
             q = 0.5 * RHO * v2
             tafx = tafy = tafz = 0.0
             if v2 > 0.0025:
                 vr = math.sqrt(v2)
                 ahx, ahy, ahz = -rvx / vr, -rvy / vr, -rvz / vr
-                ca = ahx * bx + ahy * by + ahz * bz
+                ca = ahx * ebx + ahy * eby + ahz * ebz
                 ffk = q * area * cna * l_cp
-                tafx = ffk * (by * ahz - bz * ahy)
-                tafy = ffk * (bz * ahx - bx * ahz)
-                tafz = ffk * (bx * ahy - by * ahx)
+                tafx = ffk * (eby * ahz - ebz * ahy)
+                tafy = ffk * (ebz * ahx - ebx * ahz)
+                tafz = ffk * (ebx * ahy - eby * ahx)
 
             # ---- thrust-scale estimator ----
             # A strapdown accelerometer along the body axis measures the specific
@@ -1397,8 +1656,16 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             if use_t_est > 0.5 and engine_on and tb > 0.05:
                 t_table = main_thrust(tb, mt, mf)
                 if b_t_ign < 1.0e5:
-                    t_table += boost_thrust(tb - b_t_ign, bt, bf) / max(k_act, 1e-3)
-                t_meas = a_axial_meas * mass - f_ax_aero
+                    # only the booster's AXIAL share reaches a body-axis accelerometer
+                    t_table += (boost_thrust(tb - b_t_ign, bt, bf) * math.cos(b_cant)
+                                / max(k_act, 1e-3))
+                # The aerodynamic share is the computer's MODEL of it (its own Cd,
+                # 1.225 kg/m3, its own velocity estimate, no wind) - not the true
+                # force, which nothing on board can measure separately.
+                f_aero_m = 0.5 * RHO * area * cd_burn * ev2 * clampf(
+                    -(evx * ebx + evy * eby + evz * ebz) / math.sqrt(ev2 + 1e-9),
+                    -1.0, 1.0)
+                t_meas = a_meas * mass - f_aero_m
                 denom = t_table * k_act
                 if denom > 15.0 and t_meas > 0.0:
                     raw = clampf(t_meas / denom, 0.6, 1.4)
@@ -1428,6 +1695,28 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             k_rate = 2.0 * zeta_a * wn_a
             k_th = wn_a / (2.0 * zeta_a)
             ocx, ocy, ocz = k_th * eax, k_th * eay, k_th * eaz
+            # Integral action, nozzle only. A misaligned nozzle or a CG a millimetre
+            # off the axis is a CONSTANT torque, and a proportional loop answers a
+            # constant torque with a constant attitude error, tau/(I*wn^2) - about a
+            # degree per 0.3 N m here. The integral is kept perpendicular to the
+            # body axis (there is no roll channel on the nozzle to integrate into)
+            # and clamped, and it starts from zero at every ignition.
+            if att_ki > 0.0 and engine_on:
+                iex += eax * dt_c
+                iey += eay * dt_c
+                iez += eaz * dt_c
+                dpi = iex * ebx + iey * eby + iez * ebz
+                iex -= dpi * ebx
+                iey -= dpi * eby
+                iez -= dpi * ebz
+                inn = math.sqrt(iex * iex + iey * iey + iez * iez)
+                if inn > ATT_I_LIM:
+                    iex *= ATT_I_LIM / inn
+                    iey *= ATT_I_LIM / inn
+                    iez *= ATT_I_LIM / inn
+                ocx += k_th * att_ki * iex
+                ocy += k_th * att_ki * iey
+                ocz += k_th * att_ki * iez
             arx = k_rate * (ocx - gtx)
             ary = k_rate * (ocy - gty)
             arz = k_rate * (ocz - gtz)
@@ -1437,17 +1726,17 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             # gyroscopic decoupling: for an axisymmetric body
             #   I_t dw_t/dt = tau_t - (I_t - I_a) w_roll (b x w_t)
             gyk = gyro_ff * (I_t - I_a) * w_roll
-            trx += gyk * (by * gtz - bz * gty)
-            try_ += gyk * (bz * gtx - bx * gtz)
-            trz += gyk * (bx * gty - by * gtx)
+            trx += gyk * (eby * gtz - ebz * gty)
+            try_ += gyk * (ebz * gtx - ebx * gtz)
+            trz += gyk * (ebx * gty - eby * gtx)
 
             # dynamic inversion. tau = -L*T*(b x s) inverts EXACTLY to
             # s = (b x tau)/(L*T) because s is perpendicular to b. Without it the
             # loop gain would sweep by 100x as the thrust runs down the curve.
             inv = 1.0 / (t_est * l_gimb)
-            sqx = (by * trz - bz * try_) * inv
-            sqy = (bz * trx - bx * trz) * inv
-            sqz = (bx * try_ - by * trx) * inv
+            sqx = (eby * trz - ebz * try_) * inv
+            sqy = (ebz * trx - ebx * trz) * inv
+            sqz = (ebx * try_ - eby * trx) * inv
             sd1 = clampf(sqx * c1x + sqy * c1y + sqz * c1z, -0.999, 0.999)
             sd2 = clampf(sqx * c2x + sqy * c2y + sqz * c2z, -0.999, 0.999)
             cmd1 = math.degrees(math.asin(sd1)) * srv_ratio
@@ -1476,9 +1765,9 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                 gsx = s1c * c1x + s2c * c2x
                 gsy = s1c * c1y + s2c * c2y
                 gsz = s1c * c1z + s2c * c2z
-                tgx = -l_gimb * t_est * (by * gsz - bz * gsy)
-                tgy = -l_gimb * t_est * (bz * gsx - bx * gsz)
-                tgz = -l_gimb * t_est * (bx * gsy - by * gsx)
+                tgx = -l_gimb * t_est * (eby * gsz - ebz * gsy)
+                tgy = -l_gimb * t_est * (ebz * gsx - ebx * gsz)
+                tgz = -l_gimb * t_est * (ebx * gsy - eby * gsx)
                 if not engine_on:
                     tgx = tgy = tgz = 0.0
                 rfx = trx - tgx
@@ -1492,8 +1781,8 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
 
                 v_f = math.sqrt(v2)
                 qf = 0.5 * RHO * v2
-                k_t = 2.0 * fin_arm * qf * fin_area * fin_cl_alpha
-                k_r = n_fin * fin_roll_arm * qf * fin_area * fin_cl_alpha
+                k_t = 2.0 * fin_arm * qf * fin_area * fin_cl_alpha * fin_k
+                k_r = n_fin * fin_roll_arm * qf * fin_area * fin_cl_alpha * fin_k
                 # Fins do nothing at low airspeed, and the inversion knows it: 1/q
                 # runs away as the vehicle leaves the release point at walking pace,
                 # so every channel saturates on a demand it cannot meet, the four
@@ -1511,8 +1800,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                 # it spun the airframe to 340 deg/s before the motor was even lit.
                 # Attitude control starts with the ignition command; the airbrake and
                 # the roll damper run the whole way down.
-                if (t_ign_cmd < 0.0 and h_est > h_cmd + FIN_CTRL_LEAD
-                        and fin_drift < 0.5):
+                if asleep and fin_drift < 0.5 and fin_ff < 1.5:
                     k_t = 0.0
                 if k_t < 1e-6:
                     a_cmd_f = b_cmd_f = 0.0
@@ -1552,7 +1840,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                 # 0.65 N m at 30 deg. Against a roll inertia of 0.004 kg m^2 that is
                 # already hundreds of deg/s. Equalised, the residual is 0.005 N m.
                 # axial airspeed, for the crossflow correction
-                va_f = -(vx * bx + vy * by + vz * bz)
+                va_f = -(evx * ebx + evy * eby + evz * ebz)
                 if va_f < 3.0:
                     va_f = 3.0
                 room = fin_max
@@ -1561,12 +1849,30 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                     rix = math.cos(ang_i) * c1x + math.sin(ang_i) * c2x
                     riy = math.cos(ang_i) * c1y + math.sin(ang_i) * c2y
                     riz = math.cos(ang_i) * c1z + math.sin(ang_i) * c2z
-                    nix = by * riz - bz * riy
-                    niy = bz * rix - bx * riz
-                    niz = bx * riy - by * rix
-                    xflow[_i] = math.degrees((vx * nix + vy * niy + vz * niz) / va_f)
+                    nix = eby * riz - ebz * riy
+                    niy = ebz * rix - ebx * riz
+                    niz = ebx * riy - eby * rix
+                    xflow[_i] = math.degrees((evx * nix + evy * niy + evz * niz) / va_f)
+                    # "passive": while the attitude loop sleeps the fins are left to
+                    # see the crossflow, i.e. to do what fins are for - restore
+                    # the airframe to the flight path. Cancelling it there turns
+                    # them into weathervanes and leaves only the body's margin.
+                    xf_c = xflow[_i]
+                    if fin_ff > 0.5 and fin_ff < 1.5 and k_t < 1e-6:
+                        xf_c = 0.0
                     ctrl_i = (d_roll + a_cmd_f * math.cos(ang_i)
-                              + b_cmd_f * math.sin(ang_i) + xflow[_i])
+                              + b_cmd_f * math.sin(ang_i) + xf_c)
+                    # Angle-of-attack limiter: no control command may take a fin
+                    # past the stall. The travel limit alone does not do it - with
+                    # a crossflow, 15 deg of deflection can be 25 deg of angle of
+                    # attack, where more command means LESS force and the loop
+                    # that asked for it runs away. Clipped here, a saturated fin
+                    # at least delivers the most force it has, the right way round.
+                    a_i = ctrl_i - xflow[_i]
+                    if a_i > fin_amax:
+                        ctrl_i = xflow[_i] + fin_amax
+                    elif a_i < -fin_amax:
+                        ctrl_i = xflow[_i] - fin_amax
                     ctrl_i = clampf(ctrl_i, -fin_max, fin_max)
                     ctrl_arr[_i] = ctrl_i
                     r_i = fin_max - abs(ctrl_i)
@@ -1578,7 +1884,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                     # its opposite and the damper spins the airframe up instead of
                     # stopping it: a +/-15 deg brake on a 14 deg stall held the
                     # vehicle at 110-170 deg/s of roll through the ignition.
-                    r_i = FIN_BRAKE_ALPHA_MAX - abs(ctrl_i - xflow[_i])
+                    r_i = fin_amax - abs(ctrl_i - xflow[_i])
                     if r_i < room:
                         room = r_i
                 if room < 0.0:
@@ -1591,19 +1897,33 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                     defl_cmd[_i] = clampf(ctrl_arr[_i] + brake * alt,
                                           -fin_max, fin_max)
 
+            # ---- transport delay: sensor sample -> actuator ----
+            # The commands computed from THIS tick's measurements reach the servos
+            # n_lag ticks later (estimation, computation, the servo's PWM frame).
+            lag_buf[lag_pos, 0] = cmd1
+            lag_buf[lag_pos, 1] = cmd2
+            for _i in range(4):
+                lag_buf[lag_pos, 2 + _i] = defl_cmd[_i]
+            rd = (lag_pos - n_lag) % 16
+            act1 = lag_buf[rd, 0]
+            act2 = lag_buf[rd, 1]
+            for _i in range(4):
+                act_f[_i] = lag_buf[rd, 2 + _i]
+            lag_pos = (lag_pos + 1) % 16
+
         # ---------------- servo actuators (one per gimbal axis) ----------------
         # Rate-limited with a DECELERATION-AWARE target rate: the servo may only run
         # as fast as it can still stop in the travel that is left,
         # v = sqrt(2*a*|e|). A plain "slew at max speed until you arrive" model
         # overshoots by tens of degrees at 500 deg/s and turns the actuator itself
         # into the dominant instability.
-        e_s = cmd1 - srv1
+        e_s = act1 - srv1
         d_s = 1.0 if e_s > 0.0 else (-1.0 if e_s < 0.0 else 0.0)
         v_t = d_s * min(srv_speed, math.sqrt(2.0 * srv_accel * abs(e_s)))
         dv_max = srv_accel * DT_PHYS
         sr1 += clampf(v_t - sr1, -dv_max, dv_max)
         srv1 += sr1 * DT_PHYS
-        e_s = cmd2 - srv2
+        e_s = act2 - srv2
         d_s = 1.0 if e_s > 0.0 else (-1.0 if e_s < 0.0 else 0.0)
         v_t = d_s * min(srv_speed, math.sqrt(2.0 * srv_accel * abs(e_s)))
         sr2 += clampf(v_t - sr2, -dv_max, dv_max)
@@ -1616,13 +1936,13 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
         # is end stop to end stop, so the rate is 2*max/90 ms.
         if n_fin > 0.5:
             for _i in range(int(n_fin)):
-                e_f = defl_cmd[_i] - defl[_i]
+                e_f = act_f[_i] - defl[_i]
                 if e_f > fin_rate * DT_PHYS:
                     defl[_i] += fin_rate * DT_PHYS
                 elif e_f < -fin_rate * DT_PHYS:
                     defl[_i] -= fin_rate * DT_PHYS
                 else:
-                    defl[_i] = defl_cmd[_i]
+                    defl[_i] = act_f[_i]
 
         # ---------------- throttle actuator ----------------
         kd_des = clampf((k_cmd - k_act) / DT_PHYS, -thr_speed, thr_speed)
@@ -1643,6 +1963,20 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
         sx = s1 * c1x + s2 * c2x
         sy = s1 * c1y + s2 * c2y
         sz = s1 * c1z + s2 * c2z
+        if mis > 0.0:
+            # thrust misalignment: a fixed, body-fixed offset of the thrust line
+            # from the nozzle's commanded direction (nozzle tolerance plus a CG
+            # off the axis) - it adds to the deflection, force and torque alike
+            sm = math.sin(mis)
+            sx += sm * (math.cos(mis_az) * c1x + math.sin(mis_az) * c2x)
+            sy += sm * (math.cos(mis_az) * c1y + math.sin(mis_az) * c2y)
+            sz += sm * (math.cos(mis_az) * c1z + math.sin(mis_az) * c2z)
+            s_perp = math.sqrt(sx * sx + sy * sy + sz * sz)
+            if s_perp > 0.999:
+                sx *= 0.999 / s_perp
+                sy *= 0.999 / s_perp
+                sz *= 0.999 / s_perp
+                s_perp = 0.999
         ca_n = math.sqrt(1.0 - s_perp * s_perp)
         # thrust direction: the body axis tilted by the nozzle deflection
         tdx = ca_n * bx + sx
@@ -1662,34 +1996,71 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             s_thr_sum += s_thr
             s_thr_n += 1.0
 
-        rvx, rvy, rvz = vx, vy, vz
+        # ---- wind: the air moves, and every aerodynamic force sees the vehicle's
+        # velocity THROUGH it. Power-law profile (calm at the ground) plus
+        # turbulence. The landing gates stay on the GROUND velocity.
+        if w_mean > 0.0 or gust_sig > 0.0:
+            w_h = w_mean * (max(h, 0.3) / 10.0) ** env[E_SHEAR]
+            wind_x = w_h * w_cx + gust_x
+            wind_y = w_h * w_cy + gust_y
+            wind_z = gust_z
+        rvx, rvy, rvz = vx - wind_x, vy - wind_y, vz - wind_z
         v2 = rvx * rvx + rvy * rvy + rvz * rvz
         v_rel = math.sqrt(v2)
-        q = 0.5 * RHO * v2
+        q = 0.5 * rho_f * v2
         f_ax = f_ay = f_az = 0.0
         tax = tay = taz = 0.0
         if v_rel > 0.05:
             ahx, ahy, ahz = -rvx / v_rel, -rvy / v_rel, -rvz / v_rel
             ca = ahx * bx + ahy * by + ahz * bz
-            f_axial = q * area * cd * ca
+            cd_eff = cd
+            if plume_ct > 0.0 and thrust_main > 0.0:
+                # Retro-propulsion: the jet leaves the LEADING end straight into the
+                # oncoming air and pushes the stagnation region off the body, so the
+                # forebody drag collapses once the thrust dwarfs the dynamic
+                # pressure (C_T = T/(q A) is 5-15 through this burn).
+                cd_eff = cd / (1.0 + thrust_main / (q * area + 1e-9) / plume_ct)
+            f_axial = q * area * cd_eff * ca
             fnk = q * area * cna
-            f_ax = f_axial * bx + fnk * (ahx - ca * bx)
-            f_ay = f_axial * by + fnk * (ahy - ca * by)
-            f_az = f_axial * bz + fnk * (ahz - ca * bz)
+            pot = 1.0
+            if xflow_cd > 0.0:
+                # with the crossflow model on, the potential term is the proper
+                # sin(a)cos(a) of slender-body theory instead of plain sin(a)
+                pot = abs(ca)
+            f_ax = f_axial * bx + fnk * pot * (ahx - ca * bx)
+            f_ay = f_axial * by + fnk * pot * (ahy - ca * by)
+            f_az = f_axial * bz + fnk * pot * (ahz - ca * bz)
             # aero damping acts on the TRANSVERSE rate only: an uncanted airframe
             # has almost no roll damping, and applying this coefficient to the spin
             # would quietly brake it and flatter the controller
-            c_damp = 0.5 * RHO * v_rel * area * cna * l_cp * l_cp
+            c_damp = 0.5 * rho_f * v_rel * area * cna * l_cp * l_cp
             wr_t = wx * bx + wy * by + wz * bz
-            tax = l_cp * fnk * (by * ahz - bz * ahy) - c_damp * (wx - wr_t * bx)
-            tay = l_cp * fnk * (bz * ahx - bx * ahz) - c_damp * (wy - wr_t * by)
-            taz = l_cp * fnk * (bx * ahy - by * ahx) - c_damp * (wz - wr_t * bz)
+            tax = l_cp * fnk * pot * (by * ahz - bz * ahy) - c_damp * (wx - wr_t * bx)
+            tay = l_cp * fnk * pot * (bz * ahx - bx * ahz) - c_damp * (wy - wr_t * by)
+            taz = l_cp * fnk * pot * (bx * ahy - by * ahx) - c_damp * (wz - wr_t * bz)
+            if xflow_cd > 0.0:
+                # Viscous crossflow (Jorgensen): the body is a cylinder in the
+                # crosswind as well, eta*Cdc*(planform)*sin^2(a). Zero at small
+                # angles, dominant broadside - which is exactly how the vehicle
+                # is released with a sideways speed and no vertical one.
+                sa = math.sqrt(max(0.0, 1.0 - ca * ca))
+                fvk = q * xflow_cd * planform * sa      # x (ah - ca b), |.| = sa
+                fvx = fvk * (ahx - ca * bx)
+                fvy = fvk * (ahy - ca * by)
+                fvz = fvk * (ahz - ca * bz)
+                f_ax += fvx
+                f_ay += fvy
+                f_az += fvz
+                tax += xflow_arm * (by * fvz - bz * fvy)
+                tay += xflow_arm * (bz * fvx - bx * fvz)
+                taz += xflow_arm * (bx * fvy - by * fvx)
 
         if n_fin > 0.5:
             ffx, ffy, ffz, ftx, fty, ftz = fin_forces(
                 bx, by, bz, c1x, c1y, c1z, c2x, c2y, c2z,
-                vx, vy, vz, wx, wy, wz, defl, int(n_fin), fin_area, fin_arm,
-                fin_roll_arm, fin_cl_alpha, fin_aspect, fin_cfd)
+                rvx, rvy, rvz, wx, wy, wz, defl, int(n_fin), fin_area, fin_arm,
+                fin_roll_arm, fin_cl_alpha, fin_aspect, fin_cfd, rho_f, fin_k,
+                fin_stall)
             f_ax += ffx
             f_ay += ffy
             f_az += ffz
@@ -1725,6 +2096,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
         # numbers and nothing else - no knowledge of the dispersion.
         a_axial_meas = ((f_tx + f_ax) * bx + (f_ty + f_ay) * by
                         + (f_tz + f_az) * bz) / mass
+
         f_ax_aero = f_ax * bx + f_ay * by + f_az * bz
 
         I_t = mass * it_coef
@@ -1766,6 +2138,13 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             tel[tel_i, 17] = by
             tel[tel_i, 18] = bz
             tel[tel_i, 19] = h_est
+            tel[tel_i, 20] = vy
+            tel[tel_i, 21] = att_err_deg
+            tel[tel_i, 22] = math.degrees(math.acos(clampf(
+                bx * ebx + by * eby + bz * ebz, -1.0, 1.0)))
+            tel[tel_i, 23] = math.degrees(math.acos(clampf(cmd_uz, -1.0, 1.0)))
+            tel[tel_i, 24] = wind_x
+            tel[tel_i, 25] = wind_y
             tel_i += 1
 
         # ---------------- integrate ----------------
@@ -1938,6 +2317,85 @@ class TvcConfig:
     sched_fin: float = 0.0                 # bandwidth ~ (q / 700 Pa) ** this
     gyro_ff: bool = True
     seed0: int = 20260830
+    # environment, sensors and hardware imperfections (see E_* above); 0 = off
+    wind_max: float = WIND_MAX            # m/s at 10 m, mean drawn U(0, this)
+    gust: float = GUST_SIG                # m/s turbulence, per horizontal axis
+    gust_tau: float = GUST_TAU
+    wind_shear: float = WIND_SHEAR
+    wind_known: bool = False              # computer gets the mean wind pre-flight
+    rho_sig: float = RHO_SIG
+    misalign: float = MISALIGN_SIG        # deg, 1-sigma
+    att_sig: float = ATT_SIG              # deg, 1-sigma attitude-estimate error
+    att_tau: float = ATT_TAU
+    gyro_bias: float = GYRO_BIAS_SIG      # deg/s, 1-sigma
+    gyro_noise: float = GYRO_NOISE        # deg/s per sample
+    vel_sig: float = VEL_SIG              # m/s, 1-sigma velocity-estimate error
+    vel_tau: float = VEL_TAU
+    acc_noise: float = ACC_NOISE          # m/s2 per sample
+    ctrl_lag: float = CTRL_LAG            # s
+    plume_ct: float = PLUME_CT_REF        # 0 = forebody drag unaffected by the jet
+    xflow_cd: float = XFLOW_CD            # 0 = no viscous crossflow term
+    xflow_arm: float = XFLOW_ARM
+    body_length: float = L_BODY
+    fin_interference: float = 0.0         # fin-on-body lift factor; 0 = Barrowman's
+                                          # K_T(B) = 1 + R/(s + R) from the geometry
+    att_ki: float = ATT_KI
+    tilt_plan: bool = False               # planner discounts the thrust for tilt
+    guid_n: float = GUID_N                # horizontal navigation gain
+    guid_kmax: float = GUID_KMAX          # 1/s cap on that gain (0 = none)
+    plan_margin: float = PLAN_MARGIN      # thrust fraction the planner holds back
+    fin_freefall: str = "vertical"        # "asleep" | "passive" | "trim" | "vertical"
+    fin_stall: float = FIN_ALPHA_STALL    # deg, fin stall angle (no CFD past 10 deg)
+
+    def perfect(self) -> "TvcConfig":
+        """The same vehicle and controller in a perfect world: still air, exact
+        density, a flight computer that reads the true state, a nozzle that
+        points where it is told. (The aerodynamic MODEL is not an imperfection
+        and stays as it is.)"""
+        from dataclasses import replace
+        return replace(self, wind_max=0.0, gust=0.0, rho_sig=0.0, misalign=0.0,
+                       att_sig=0.0, gyro_bias=0.0, gyro_noise=0.0, vel_sig=0.0,
+                       acc_noise=0.0, ctrl_lag=0.0)
+
+    def fin_k(self) -> float:
+        """Fin-body interference factor actually used (Barrowman when 0)."""
+        if self.fin_interference > 0.0:
+            return self.fin_interference
+        r = 0.5 * self.diameter
+        return 1.0 + r / (self.fin_span + r)
+
+    def environment(self) -> np.ndarray:
+        """The environment/sensor/imperfection array the compiled plant reads."""
+        e = np.zeros(N_ENV)
+        e[E_WIND] = self.wind_max
+        e[E_GUST] = self.gust
+        e[E_GUST_TAU] = max(self.gust_tau, 1e-3)
+        e[E_SHEAR] = self.wind_shear
+        e[E_RHO_SIG] = self.rho_sig
+        e[E_MISALIGN] = self.misalign
+        e[E_ATT_SIG] = self.att_sig
+        e[E_ATT_TAU] = max(self.att_tau, 1e-3)
+        e[E_GYRO_BIAS] = self.gyro_bias
+        e[E_GYRO_NOISE] = self.gyro_noise
+        e[E_VEL_SIG] = self.vel_sig
+        e[E_VEL_TAU] = max(self.vel_tau, 1e-3)
+        e[E_ACC_NOISE] = self.acc_noise
+        e[E_LAG] = self.ctrl_lag
+        e[E_PLUME_CT] = self.plume_ct
+        e[E_XFLOW] = self.xflow_cd
+        e[E_BODY_LEN] = self.body_length
+        e[E_XFLOW_ARM] = self.xflow_arm
+        e[E_FIN_K] = self.fin_k()
+        e[E_ATT_KI] = self.att_ki
+        e[E_TILT_PLAN] = 1.0 if self.tilt_plan else 0.0
+        e[E_WIND_KNOWN] = 1.0 if self.wind_known else 0.0
+        e[E_GUID_N] = self.guid_n
+        e[E_GUID_KMAX] = self.guid_kmax
+        e[E_PLAN_MARGIN] = self.plan_margin
+        e[E_FIN_FF] = {"asleep": 0.0, "passive": 1.0, "trim": 2.0,
+                       "vertical": 3.0}[self.fin_freefall]
+        e[E_FIN_STALL] = self.fin_stall
+        return e
 
     def entry_grid(self):
         h = np.arange(self.h_lo, self.h_hi + 1e-9, self.h_step)
@@ -1992,7 +2450,7 @@ class TvcConfig:
                     arm=self.fin_arm, max_deflect=self.fin_max_deflect,
                     travel_time=self.fin_travel_time,
                     body_diameter=self.diameter, body_area=self.area,
-                    enabled=self.fins, aero=self.fin_aero)
+                    enabled=self.fins, aero=self.fin_aero, stall=self.fin_stall)
 
     def fin_args(self):
         """(n, area, arm, roll arm, CL_alpha, AR, max, rate, brake mode, drift, cfd)
@@ -2002,7 +2460,7 @@ class TvcConfig:
         mode = {"off": 0.0, "auto": 1.0, "always": 2.0}.get(self.fin_brake, 1.0)
         if not f.enabled:
             mode = 0.0
-        cd_free = self.cd + (f.cd_extra(min(f.max_deflect, FIN_BRAKE_ALPHA_MAX))
+        cd_free = self.cd + (f.cd_extra(f.brake_max())
                              if (f.enabled and mode > 0.5) else
                              (f.cd_extra(0.0) if f.enabled else 0.0))
         drift = 1.0 if (f.enabled and self.fin_drift_null) else 0.0
@@ -2072,7 +2530,7 @@ def fly_one(cfg: TvcConfig, seed: int, h0: float, vx0: float, n_tel: int = 0,
                  cfg.tilt_min, cfg.tilt_slope, cfg.tilt_cap,
                  fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6], fa[7], fa[8],
                  fa[9], fa[10], cd_free, math.radians(cfg.booster_cant),
-                 math.radians(cfg.booster_azimuth), cfg.vehicle(),
+                 math.radians(cfg.booster_azimuth), cfg.vehicle(), cfg.environment(),
                  mt, mf, mc, m.propellant_mass, m.total_impulse,
                  bt, bf, bb, b.propellant_mass, b.total_mass, tel, n_tel,
                  float(h_cmd))
@@ -2101,6 +2559,7 @@ def _campaign_cell(job):
     bt, bf, bb = booster_arrays(b)
     fa, cd_free = cfg.fin_args()
     veh = cfg.vehicle()
+    env = cfg.environment()
     tel = np.zeros((1, N_TEL))
     if h_cmd is None:
         h_cmd = plan_ignition(cfg, h0, vx0)
@@ -2120,7 +2579,7 @@ def _campaign_cell(job):
                      cfg.tilt_min, cfg.tilt_slope, cfg.tilt_cap,
                      fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6], fa[7], fa[8],
                      fa[9], fa[10], cd_free, math.radians(cfg.booster_cant),
-                     math.radians(cfg.booster_azimuth), veh,
+                     math.radians(cfg.booster_azimuth), veh, env,
                      mt, mf, mc, m.propellant_mass, m.total_impulse,
                      bt, bf, bb, b.propellant_mass, b.total_mass, tel, 0, h_cmd)
         res[r] = score_flight(cfg, out)
@@ -2772,8 +3231,9 @@ def print_report(camp):
           f"{cfg.area * 1e4:.1f} cm2")
     print(f"  MMOI at gross     : {cfg.mmoi_transverse:.4f} kg m2 transverse, "
           f"{cfg.mmoi_roll:.5f} roll  (scaled with mass through the burn)")
-    print(f"  arms              : gimbal {cfg.l_gimbal:.2f} m, CP {cfg.l_cp:.2f} m, "
-          f"CN_alpha {cfg.cn_alpha:.2f}")
+    print(f"  arms              : gimbal {cfg.l_gimbal:.2f} m, body lift {cfg.l_cp:+.2f} m "
+          f"(+ aft), body CN_alpha {cfg.cn_alpha:.2f}, viscous crossflow "
+          f"{cfg.xflow_cd:.2f}, fin interference {cfg.fin_k():.2f}")
     print(f"  TVC servo         : +/-{cfg.servo_max:.1f} deg at {cfg.servo_ratio:.1f}:1"
           f" ({cfg.servo_max / cfg.servo_ratio:.1f} deg of nozzle), "
           f"{cfg.servo_speed:.0f} deg/s, {cfg.servo_accel:.0f} deg/s2, "
@@ -2805,6 +3265,18 @@ def print_report(camp):
               if cfg.lidar_acq > 0.0 else ", never corrected")
     else:
         print("  altitude knowledge: exact")
+    print(f"  wind              : mean U(0, {cfg.wind_max:.1f}) m/s at 10 m, "
+          f"profile exp {cfg.wind_shear:.2f}, turbulence {cfg.gust:.2f} m/s over "
+          f"{cfg.gust_tau:.1f} s{', mean known pre-flight' if cfg.wind_known else ''}"
+          f"; air density +/-{cfg.rho_sig * 100:.0f} % (1 sigma)")
+    print(f"  sensors           : attitude {cfg.att_sig:.2f} deg ({cfg.att_tau:.0f} s), "
+          f"gyro bias {cfg.gyro_bias:.2f} + noise {cfg.gyro_noise:.2f} deg/s, "
+          f"velocity {cfg.vel_sig:.2f} m/s ({cfg.vel_tau:.1f} s), accel "
+          f"{cfg.acc_noise:.2f} m/s2, lag {cfg.ctrl_lag * 1000:.0f} ms")
+    print(f"  hardware          : thrust misalignment {cfg.misalign:.2f} deg (1 sigma)"
+          + (f", plume drag loss C_T ref {cfg.plume_ct:.1f}" if cfg.plume_ct > 0 else ""))
+    print(f"  controller extras : attitude integral {cfg.att_ki:.1f} /s, planner "
+          f"margin {cfg.plan_margin * 100:.0f} %, fins in free fall: {cfg.fin_freefall}")
     print(f"  flights           : {camp['out'].shape[0] * camp['out'].shape[1]} cells"
           f" x {cfg.runs} = {camp['out'][:, :, :, 0].size}")
     print()
@@ -2975,11 +3447,54 @@ def verify():
     print(f"  fin vs CFD table, 8 cases          : worst force error "
           f"{worst_cfd * 100:.2f} % of full scale: {'ok' if cfd_ok else 'WRONG'}")
 
+    # ---- the environment stream must not disturb the dispersion stream ----
+    # Every imperfection draws from its own generator, so switching them on must
+    # leave the igniter delay and the altitude bias of every flight untouched -
+    # otherwise an A/B between two environments is not a paired comparison.
+    cfg_p = TvcConfig().perfect()
+    cfg_e = replace(TvcConfig(), wind_max=4.0, gust=0.5, misalign=0.5)
+    same = True
+    for sd in range(5):
+        o1, _t1 = fly_one(cfg_p, sd, 150.0, 2.0)
+        o2, _t2 = fly_one(cfg_e, sd, 150.0, 2.0)
+        same = same and o1[7] == o2[7] and o1[18] == o2[18]
+    print(f"  dispersion draws with/without env  : "
+          f"{'identical' if same else 'DIFFER'}")
+
+    # ---- wind: a power-law profile, and the free fall drifts WITH it ----
+    cfg_w = replace(TvcConfig().perfect(), wind_max=4.0, gust=0.0)
+    worst_prof, downwind = 0.0, 0
+    for sd in range(4):
+        ow, tw = fly_one(cfg_w, sd, 160.0, 0.0, n_tel=4000)
+        tw = tw[(tw[:, 0] > 0.0) & (tw[:, 1] > 1.0)]
+        wm = np.hypot(tw[:, 24], tw[:, 25])
+        ref = wm / (tw[:, 1] / 10.0) ** cfg_w.wind_shear
+        if ref.mean() > 0.1:
+            worst_prof = max(worst_prof, float(np.ptp(ref) / ref.mean()))
+            k = np.argmin(np.abs(tw[:, 1] - ow[5]))           # at the ignition command
+            if tw[k, 4] * tw[k, 24] + tw[k, 20] * tw[k, 25] > 0.0:
+                downwind += 1
+    wind_ok = worst_prof < 1e-6 and downwind >= 3
+    print(f"  wind profile / free-fall drift     : profile error {worst_prof:.1e}, "
+          f"{downwind}/4 drifting downwind: {'ok' if wind_ok else 'WRONG'}")
+
+    # ---- the attitude estimate wanders with the stated sigma ----
+    cfg_a = replace(TvcConfig().perfect(), att_sig=0.5)
+    errs = []
+    for sd in range(6):
+        _oa, ta = fly_one(cfg_a, sd, 160.0, 0.0, n_tel=4000)
+        errs.append(ta[ta[:, 0] > 0.0, 22])
+    e_mean = float(np.concatenate(errs).mean())
+    e_ref = 0.5 * math.sqrt(math.pi / 2.0)        # Rayleigh mean, two axes
+    att_ok = 0.6 * e_ref < e_mean < 1.4 * e_ref
+    print(f"  attitude-estimate error            : mean {e_mean:.2f} deg against "
+          f"{e_ref:.2f} for 0.5 deg per axis: {'ok' if att_ok else 'WRONG'}")
+
     # ---- the planner's model of the flight must match the flight ----
     # This is the check that caught the terminal-law mismatch: if the projection
     # believes a different vehicle, every ignition altitude it picks is wrong.
     cfgp = TvcConfig(thrust_scatter=0.0, ign_delay_max=0.0, roll_max=0.0,
-                     alt_bias_max=0.0, alt_pad=0.0)
+                     alt_bias_max=0.0, alt_pad=0.0).perfect()
     m2, b2 = cfgp.tables()
     mt2, mf2, mc2 = motor_arrays(m2)
     bt2, bf2, bb2 = booster_arrays(b2)
@@ -3001,7 +3516,8 @@ def verify():
     print(f"  planner vs plant, no dispersions   : worst touchdown-speed gap "
           f"{max(gaps):.2f} m/s: {'ok' if plan_ok else 'MODELS DISAGREE'}")
 
-    ok = ok and sign_ok and fin_ok and plan_ok and step_ok and cfd_ok
+    ok = (ok and sign_ok and fin_ok and plan_ok and step_ok and cfd_ok and same
+          and wind_ok and att_ok)
     print(f"  -> {'OK' if ok else 'FAILED'}")
     return ok
 
@@ -3027,7 +3543,8 @@ def main():
     ap.add_argument("--l-gimbal", type=float, default=L_GIMBAL,
                     help="CG -> nozzle pivot [m]")
     ap.add_argument("--l-cp", type=float, default=L_CP,
-                    help="CG -> centre of pressure, aft [m]")
+                    help="CG -> centre of the BODY normal force, + aft, - towards the "
+                         "leading (motor) end [m]; the fins are modelled separately")
     ap.add_argument("--cn-alpha", type=float, default=C_N_ALPHA,
                     help="body normal-force slope [1/rad]")
     ap.add_argument("--servo-max", type=float, default=TVC_SERVO_MAX, help="deg")
@@ -3065,6 +3582,17 @@ def main():
     ap.add_argument("--lidar-blend", type=float, default=LIDAR_BLEND,
                     help="time constant for easing the lidar correction in [s], "
                          "0 = apply it as a step")
+    for _lab, _attr, _unit, _note in ENV_FIELDS:
+        ap.add_argument("--" + _attr.replace("_", "-"), type=float,
+                        default=getattr(TvcConfig, _attr), dest="env_" + _attr,
+                        help=f"{_lab} [{_unit}] - {_note}")
+    ap.add_argument("--wind-known", action="store_true",
+                    help="the computer gets the mean wind before the flight")
+    ap.add_argument("--fin-freefall", choices=("vertical", "trim", "passive", "asleep"),
+                    default="vertical", help="what the fins do during the free fall")
+    ap.add_argument("--perfect", action="store_true",
+                    help="switch every environment / sensor / hardware imperfection "
+                         "off (still air, true state, perfect nozzle)")
     ap.add_argument("--gate-vz", type=float, default=GATE_VZ,
                     help="vertical touchdown limit [m/s]")
     ap.add_argument("--gate-vh", type=float, default=GATE_VH,
@@ -3187,6 +3715,11 @@ def main():
                     booster_cant=args.booster_cant,
                     booster_azimuth=args.booster_azimuth,
                     gyro_ff=not args.no_gyro_ff)
+    from dataclasses import replace as _replace
+    cfg = _replace(cfg, wind_known=args.wind_known, fin_freefall=args.fin_freefall,
+                   **{a: getattr(args, "env_" + a) for _l, a, _u, _n in ENV_FIELDS})
+    if args.perfect:
+        cfg = cfg.perfect()
     if args.tune:
         g, rep = tune_gains(cfg, budget=args.tune_budget, runs=args.tune_runs,
                             workers=args.tune_workers or None,
