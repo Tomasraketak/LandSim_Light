@@ -1069,7 +1069,8 @@ of free-fall attitude losses.
 with 9 N of D9 thrust arriving on top, so the vehicle sank ~1.1 m/s slower than the
 reference. Planner and plant agreed with each other, so nothing failed - the 2.5 m/s
 cap was simply not what flew. The law now subtracts the booster's axial thrust and
-the cap is the 1.4 m/s that was actually being flown (median touchdown 2.0 -> 1.8 m/s).
+the cap with a D9 burning is the 1.4 m/s that was actually being flown (median touchdown
+2.0 -> 1.8 m/s); with the main motor alone it stays 2.5 m/s.
 
 **5. Small ones.** The guidance's drag credit used the bare-body Cd where the planner
 uses body + fins; the thrust estimator overwrote the variable the ignition gate reads;
@@ -1124,6 +1125,28 @@ schedule: p95 |vh| 0.35 -> 0.30 m/s, p95 tilt 2.3 -> 1.95 deg on seeds it never 
   vertical all the way down is what kills the drift.
 * **More planner margin** (6, 9, 12 %): 97.7 / 92.7 / 82.1 % - it stops high and burns out.
 * **N = 1.2 - 3 and a cap on N/t_go**, with the new law as well: still worse than N = 1.
+
+### Main motor alone (no D9)
+
+The vehicle is now expected to fly WITHOUT the booster, so this is the number that
+matters: `python3 tvc_sim.py --boosters 0 --delay-pad 0.3`
+
+| 16200 flights, no booster | success |
+|---|---|
+| before this audit (3240-flight grid) | 95.3 % |
+| after | **98.2 %** [98.0 - 98.4] |
+
+|vz| < 4 m/s 98.3 % (p95 2.9 m/s), |vh| < 0.5 m/s 99.8 % (p95 0.31 m/s), tilt and rate
+100 %. Full listing in `RESULTS_no_booster.txt`. Two settings are specific to it:
+
+* **Terminal descent cap 2.5 m/s**, not the 1.4 m/s flown with a D9 burning. Without
+  the booster's impulse a slow final approach burns out high: 2.0 m/s gives 94.1 %,
+  1.4 m/s 93.6 %, 2.5 m/s 97.4 %. The code picks the cap by whether a D9 is lit.
+* **Igniter pad 0.30 s** instead of the default 0.40 s: 98.2 % against 97.4 %
+  (0.25 s: 95.6 %, 0.35 s: 98.0 %, 0.5 s: 96.0 %). The default rule was fitted with
+  the booster on board.
+
+Every remaining failure is vertical - there is no spare impulse without the D9.
 
 ### What is left
 
