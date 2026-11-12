@@ -250,6 +250,10 @@ PLAN_DIV = 100            # -> 10 Hz planner
 H_TERM = 3.00             # terminal law engages below this altitude [m]
 A_TERM = 8.00             # deceleration setting the terminal descent-rate profile
 A_TERM_MAX = 70.0         # cap on commanded specific force [m/s^2]
+V_TERM_MAX = 2.5          # m/s, cap on the terminal descent rate, main motor alone
+V_TERM_BOOST = 1.4        # ... and with a D9 burning. The booster's extra impulse
+                          # affords a slower final approach; without it 2.0 m/s
+                          # already burns out high (94 % against 97 % at 2.5).
 KP_VZ = 3.00              # descent-rate tracking gain
 TILT_SLOPE = 1.5          # tilt cone opens with altitude [deg/m]
 TILT_MIN = 1.5            # ... from this floor at the pad [deg]. It must sit WELL
@@ -777,7 +781,8 @@ def gimbal_basis(bx, by, bz, gx, gy, gz):
 
 
 @njit(cache=True, inline='always')
-def terminal_throttle(h, vz, mass, thrust_avail, k_min, k_max, thrust_other=0.0):
+def terminal_throttle(h, vz, mass, thrust_avail, k_min, k_max, thrust_other=0.0,
+                      v_term=V_TERM_MAX):
     """Track vz_ref = -sqrt(2*a*h) for the last few metres.
 
     The caller only ever takes max(plan, terminal): a terminal law that REPLACES
@@ -785,7 +790,7 @@ def terminal_throttle(h, vz, mass, thrust_avail, k_min, k_max, thrust_other=0.0)
     ground with propellant left in the grain.
     """
     hh = h if h > 0.05 else 0.05
-    vz_ref = -clampf(math.sqrt(2.0 * A_TERM * hh), 0.8, V_TERM_MAX)
+    vz_ref = -clampf(math.sqrt(2.0 * A_TERM * hh), 0.8, v_term)
     a_cmd = G + KP_VZ * (vz_ref - vz)
     if a_cmd > A_TERM_MAX:
         a_cmd = A_TERM_MAX
@@ -813,17 +818,13 @@ def terminal_active(h, vz, thrust_avail, mass):
     return h < H_TERM and vz > -3.0 and thrust_avail > 1.6 * mass * G
 
 
-V_TERM_MAX = 1.4          # m/s, cap on the terminal descent rate. Was 2.5 - but the
-                          # law then ignored the booster's 9 N, which made the
-                          # vehicle sink ~1.1 m/s slower than it was told to, so
-                          # what actually flew was about this.
 PLAN_HOLD = 0.30          # s the planned level is held before the projection
                           # assumes full clamp again - see k_from_plan
 
 
 @njit(cache=True, inline='always')
 def k_from_plan(k_level, t_since_plan, h, vz, mass, thrust_avail, k_min, k_max,
-                thrust_other=0.0):
+                thrust_other=0.0, v_term=V_TERM_MAX):
     """The commanded clamp level.
 
     THE PLAN IS ONE NUMBER. The reference vehicle carries a four-segment throttle
@@ -850,7 +851,7 @@ def k_from_plan(k_level, t_since_plan, h, vz, mass, thrust_avail, k_min, k_max,
     """
     if terminal_active(h, vz, thrust_avail, mass):
         return terminal_throttle(h, vz, mass, thrust_avail, k_min, k_max,
-                                 thrust_other)
+                                 thrust_other, v_term)
     if t_since_plan > PLAN_HOLD:
         return k_max
     return k_level
@@ -903,7 +904,7 @@ def project_vz(h0, vz0, t0, mass_extra, k_level,
         if b_t_ign < 1.0e5:
             t_b = boost_thrust(t - b_t_ign, bt, bf) * ts
         k = k_from_plan(k_level, t - t0, h, vz, mass, tn, k_min, k_max,
-                        t_b)
+                        t_b, V_TERM_BOOST if b_t_ign < 1.0e5 else V_TERM_MAX)
         thrust = tn * k + t_b
         a = (thrust - kd * vz * abs(vz)) / mass - G
         vz_new = vz + a * dt
@@ -1038,7 +1039,7 @@ def project_rh(h0, vz0, t0, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area
         if b_t_ign < 1.0e5:
             t_b = boost_thrust(t - b_t_ign, bt, bf) * t_scale
         k = k_from_plan(k_level, since, h, vz, mass, tn, k_min, k_max,
-                        t_b)
+                        t_b, V_TERM_BOOST if b_t_ign < 1.0e5 else V_TERM_MAX)
         thrust = tn * k + t_b
         a = (thrust - kd * vz * abs(vz)) / mass - G
         vz_new = vz + a * dt
@@ -1537,7 +1538,8 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             if b_t_ign < 1.0e5 and tb >= 0.0:
                 t_b_e = boost_thrust(tb - b_t_ign, bt, bf_ax) * t_scale
             k_cmd = k_from_plan(k_level, 0.0, h_est, evz, mass, t_table * t_scale,
-                                k_min, k_max, t_b_e)
+                                k_min, k_max, t_b_e,
+                                V_TERM_BOOST if b_t_ign < 1.0e5 else V_TERM_MAX)
             if gate_open:
                 # Ignition transient: full open, whatever the planner wants. The
                 # planner's projection assumes its own clamp level from t = 0, so
@@ -2030,11 +2032,11 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                     wpx -= dpo * ebx
                     wpy -= dpo * eby
                     wpz -= dpo * ebz
-                    k_n = (qf / v_f) * (l_cp * area * cna + 0.5 * n_fin * fin_arm
+                    k_wo = (qf / v_f) * (l_cp * area * cna + 0.5 * n_fin * fin_arm
                                         * fin_area * fin_cl_alpha * fin_k)
-                    if k_n > 1e-3:
+                    if k_wo > 1e-3:
                         # (unexplained torque) x b = (q/V) * K * d_wind
-                        g_o = WIND_OBS_G * dt_c * I_t * WIND_OBS_L / k_n
+                        g_o = WIND_OBS_G * dt_c * I_t * WIND_OBS_L / k_wo
                         wex += g_o * (zoy * ebz - zoz * eby)
                         wey += g_o * (zoz * ebx - zox * ebz)
                         wen = math.sqrt(wex * wex + wey * wey)
