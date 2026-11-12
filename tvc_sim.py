@@ -250,6 +250,10 @@ PLAN_DIV = 100            # -> 10 Hz planner
 H_TERM = 3.00             # terminal law engages below this altitude [m]
 A_TERM = 8.00             # deceleration setting the terminal descent-rate profile
 A_TERM_MAX = 70.0         # cap on commanded specific force [m/s^2]
+V_TERM_MAX = 2.5          # m/s, cap on the terminal descent rate, main motor alone
+V_TERM_BOOST = 1.4        # ... and with a D9 burning. The booster's extra impulse
+                          # affords a slower final approach; without it 2.0 m/s
+                          # already burns out high (94 % against 97 % at 2.5).
 KP_VZ = 3.00              # descent-rate tracking gain
 TILT_SLOPE = 1.5          # tilt cone opens with altitude [deg/m]
 TILT_MIN = 1.5            # ... from this floor at the pad [deg]. It must sit WELL
@@ -335,8 +339,8 @@ ALT_PAD = 1.0             # m the guidance assumes it may be LOWER than it reads
  E_ATT_SIG, E_ATT_TAU, E_GYRO_BIAS, E_GYRO_NOISE, E_VEL_SIG, E_VEL_TAU,
  E_ACC_NOISE, E_LAG, E_PLUME_CT, E_XFLOW, E_BODY_LEN, E_XFLOW_ARM, E_FIN_K,
  E_ATT_KI, E_TILT_PLAN, E_WIND_KNOWN, E_GUID_N, E_FIN_FF, E_FIN_STALL,
- E_GUID_KMAX, E_PLAN_MARGIN) = range(27)
-N_ENV = 27
+ E_GUID_KMAX, E_PLAN_MARGIN, E_GUID_ZEV, E_WIND_OBS, E_PLAN_TAU) = range(30)
+N_ENV = 30
 
 WIND_MAX = 2.0            # m/s, mean wind at 10 m is U(0, this), random direction
 GUST_SIG = 0.3            # m/s, turbulence per horizontal axis (half that vertical)
@@ -359,6 +363,9 @@ ATT_KI = 2.0              # 1/s, attitude-loop integral gain (0 = none)
 ATT_I_LIM = 0.05          # rad*s, clamp on that integral
 GUID_N = 1.0              # horizontal navigation gain: a = -N v / t_go
 GUID_KMAX = 0.0           # 1/s, cap on N / t_go (0 = none) - see guidance_dir
+WIND_OBS_L = 20.0         # 1/s, rate-observer gain of the on-board wind observer
+WIND_OBS_G = 5.0           # 1/s, how fast its wind estimate follows the residual
+WIND_OBS_MAX = 8.0        # m/s, clamp on the estimate
 PLAN_MARGIN = 0.03        # fraction of the estimated thrust the clamp planner
                           # does NOT count on (0 = plan on the estimate itself)
 
@@ -406,6 +413,7 @@ ENV_FIELDS = [
     ("Fin stall",          "fin_stall",   "deg",   "no CFD past 10 deg - an assumption"),
     ("Attitude integral",  "att_ki",      "1/s",   "nozzle loop; 0 = none"),
     ("Planner margin",     "plan_margin", "frac",  "thrust the planner does not count on"),
+    ("Thrust forecast",    "plan_thrust_tau", "s", "planner: scatter decays to the table; 0 = lasts"),
 ]
 
 
@@ -425,13 +433,14 @@ def default_delay_pad(spread):
     return min(max(spread + 0.10, 0.20), 0.70)
 
 N_OUT = 19                # length of the per-flight result vector
-N_TEL = 26                # telemetry columns:
+N_TEL = 28                # telemetry columns:
 #  0 t   1 h   2 vz   3 x   4 vx   5 tilt   6 thrust   7 clamp   8 servo1  9 servo2
 # 10 |w| 11 D9 thrust  12 fin1  13 fin2  14 roll rate  15 y   16-18 thrust axis b
 # 19 the altitude the flight computer believes it is at
 # 20 vy   21 attitude tracking error, commanded vs believed [deg]
 # 22 attitude-ESTIMATE error, believed vs true [deg]
 # 23 commanded tilt [deg]   24-25 wind at the vehicle (x, y) [m/s]
+# 26-27 the wind the flight computer believes in (x, y) [m/s]
 
 
 # ======================================================================
@@ -697,7 +706,7 @@ def clampf(v, lo, hi):
 @njit(cache=True, inline='always')
 def guidance_dir(h, vx, vy, vz, mass, cd, ax_bias, ay_bias, area,
                  tilt_min=TILT_MIN, tilt_slope=TILT_SLOPE, tilt_cap=TILT_CAP,
-                 nav_n=1.0, k_max=0.0):
+                 nav_n=1.0, k_max=0.0, zx=0.0, zy=0.0):
     """Commanded thrust direction as a unit vector, plus t_go.
 
     A direction rather than a pair of angles: the two horizontal channels enter
@@ -724,8 +733,11 @@ def guidance_dir(h, vx, vy, vz, mass, cd, ax_bias, ay_bias, area,
     k_h = nav_n / t_go
     if k_max > 0.0 and k_h > k_max:
         k_h = k_max
-    req_ax = -k_h * vx + ax_bias
-    req_ay = -k_h * vy + ay_bias
+    # (zx, zy): velocity the vehicle is still going to be GIVEN by inputs the
+    # computer already knows about - see the booster handling in the caller. The
+    # law steers the zero-effort velocity, not the current one.
+    req_ax = -k_h * (vx + zx) + ax_bias
+    req_ay = -k_h * (vy + zy) + ay_bias
     req_az = abs(vz) / t_go + G
 
     v = math.sqrt(vx * vx + vy * vy + vz * vz)
@@ -769,7 +781,8 @@ def gimbal_basis(bx, by, bz, gx, gy, gz):
 
 
 @njit(cache=True, inline='always')
-def terminal_throttle(h, vz, mass, thrust_avail, k_min, k_max):
+def terminal_throttle(h, vz, mass, thrust_avail, k_min, k_max, thrust_other=0.0,
+                      v_term=V_TERM_MAX):
     """Track vz_ref = -sqrt(2*a*h) for the last few metres.
 
     The caller only ever takes max(plan, terminal): a terminal law that REPLACES
@@ -777,13 +790,16 @@ def terminal_throttle(h, vz, mass, thrust_avail, k_min, k_max):
     ground with propellant left in the grain.
     """
     hh = h if h > 0.05 else 0.05
-    vz_ref = -clampf(math.sqrt(2.0 * A_TERM * hh), 0.8, 2.5)
+    vz_ref = -clampf(math.sqrt(2.0 * A_TERM * hh), 0.8, v_term)
     a_cmd = G + KP_VZ * (vz_ref - vz)
     if a_cmd > A_TERM_MAX:
         a_cmd = A_TERM_MAX
     if thrust_avail < 1.0:
         return k_min
-    return clampf(mass * a_cmd / thrust_avail, k_min, k_max)
+    # `thrust_other` is axial thrust the clamp does not control - the booster. The
+    # commanded specific force is for the whole vehicle, so the main motor only
+    # owes what the booster is not already supplying.
+    return clampf((mass * a_cmd - thrust_other) / thrust_avail, k_min, k_max)
 
 
 @njit(cache=True, inline='always')
@@ -807,7 +823,8 @@ PLAN_HOLD = 0.30          # s the planned level is held before the projection
 
 
 @njit(cache=True, inline='always')
-def k_from_plan(k_level, t_since_plan, h, vz, mass, thrust_avail, k_min, k_max):
+def k_from_plan(k_level, t_since_plan, h, vz, mass, thrust_avail, k_min, k_max,
+                thrust_other=0.0, v_term=V_TERM_MAX):
     """The commanded clamp level.
 
     THE PLAN IS ONE NUMBER. The reference vehicle carries a four-segment throttle
@@ -833,7 +850,8 @@ def k_from_plan(k_level, t_since_plan, h, vz, mass, thrust_avail, k_min, k_max):
     problem is too much thrust, not too little.
     """
     if terminal_active(h, vz, thrust_avail, mass):
-        return terminal_throttle(h, vz, mass, thrust_avail, k_min, k_max)
+        return terminal_throttle(h, vz, mass, thrust_avail, k_min, k_max,
+                                 thrust_other, v_term)
     if t_since_plan > PLAN_HOLD:
         return k_max
     return k_level
@@ -844,7 +862,7 @@ def k_from_plan(k_level, t_since_plan, h, vz, mass, thrust_avail, k_min, k_max):
 @njit(cache=True)
 def project_vz(h0, vz0, t0, mass_extra, k_level,
                mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
-               bt, bf, bb, b_prop, b_t_ign, dt, t_scale):
+               bt, bf, bb, b_prop, b_t_ign, dt, t_scale, ts_inf=-1.0, ts_tau=0.0):
     """Forward-integrate the vertical channel under a candidate plan.
 
     Returns the vertical speed at ground contact (negative = descending).
@@ -867,14 +885,27 @@ def project_vz(h0, vz0, t0, mass_extra, k_level,
         # invisible to the plan without it. (It used to be: the argument was passed
         # in and never used, which quietly made the estimator a no-op for the one
         # consumer it was written for.)
-        tn = main_thrust(t, mt, mf) * t_scale
+        #
+        # And it is the scale measured NOW. The scatter is a wander with a
+        # correlation time (`ts_tau`), not a property of the motor, so the honest
+        # forecast is that today's deviation decays back towards the table
+        # (`ts_inf`) - not that it lasts to burnout. Holding it forever is what
+        # made the planner throw away thrust on the strength of a strong first
+        # half second and then arrive at 8 m/s, motor still burning, when the
+        # scatter swung the other way.
+        ts = t_scale
+        if ts_tau > 0.0:
+            ts = ts_inf + (t_scale - ts_inf) * math.exp(-(t - t0) / ts_tau)
+        tn = main_thrust(t, mt, mf) * ts
         mass = dry + (prop_mass - main_burned(t, mt, mc, prop_mass, i_total))
         if b_t_ign < 1.0e5:
             mass -= boost_burned(t - b_t_ign, bt, bb, b_prop)
-        k = k_from_plan(k_level, t - t0, h, vz, mass, tn, k_min, k_max)
-        thrust = tn * k
+        t_b = 0.0
         if b_t_ign < 1.0e5:
-            thrust += boost_thrust(t - b_t_ign, bt, bf) * t_scale
+            t_b = boost_thrust(t - b_t_ign, bt, bf) * ts
+        k = k_from_plan(k_level, t - t0, h, vz, mass, tn, k_min, k_max,
+                        t_b, V_TERM_BOOST if b_t_ign < 1.0e5 else V_TERM_MAX)
+        thrust = tn * k + t_b
         a = (thrust - kd * vz * abs(vz)) / mass - G
         vz_new = vz + a * dt
         h += 0.5 * (vz + vz_new) * dt
@@ -886,7 +917,8 @@ def project_vz(h0, vz0, t0, mass_extra, k_level,
 
 @njit(cache=True)
 def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area,
-               k_min, k_max, bt, bf, bb, b_prop, b_t_ign, dt, target, t_scale):
+               k_min, k_max, bt, bf, bb, b_prop, b_t_ign, dt, target, t_scale,
+               ts_inf=-1.0, ts_tau=0.0):
     """Pick the clamp level whose projected touchdown speed reaches `target`.
 
     The outcome is NOT monotone in the level: too little thrust crashes, enough
@@ -912,7 +944,7 @@ def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area,
         k = k_min + (k_max - k_min) * i / (n_scan - 1)
         f = project_vz(h, vz, t, mass_extra, k,
                        mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
-                       bt, bf, bb, b_prop, b_t_ign, dt, t_scale) - target
+                       bt, bf, bb, b_prop, b_t_ign, dt, t_scale, ts_inf, ts_tau) - target
         if f > best_f:
             best_f = f
             best_k = k
@@ -938,10 +970,10 @@ def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area,
             m2 = c - (c - a) / 3.0
             f1 = project_vz(h, vz, t, mass_extra, m1,
                             mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
-                            bt, bf, bb, b_prop, b_t_ign, dt, t_scale) - target
+                            bt, bf, bb, b_prop, b_t_ign, dt, t_scale, ts_inf, ts_tau) - target
             f2 = project_vz(h, vz, t, mass_extra, m2,
                             mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
-                            bt, bf, bb, b_prop, b_t_ign, dt, t_scale) - target
+                            bt, bf, bb, b_prop, b_t_ign, dt, t_scale, ts_inf, ts_tau) - target
             if f1 > best_f:
                 best_f, best_k = f1, m1
             if f2 > best_f:
@@ -955,7 +987,7 @@ def solve_plan(h, vz, t, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area,
         mid = 0.5 * (lo + hi)
         f = project_vz(h, vz, t, mass_extra, mid,
                        mt, mf, mc, prop_mass, i_total, cd, area, k_min, k_max,
-                       bt, bf, bb, b_prop, b_t_ign, dt, t_scale) - target
+                       bt, bf, bb, b_prop, b_t_ign, dt, t_scale, ts_inf, ts_tau) - target
         if f >= 0.0:
             hi = mid
         else:
@@ -1003,10 +1035,12 @@ def project_rh(h0, vz0, t0, mass_extra, mt, mf, mc, prop_mass, i_total, cd, area
         mass = mass_extra + (prop_mass - main_burned(t, mt, mc, prop_mass, i_total))
         if b_t_ign < 1.0e5:
             mass -= boost_burned(t - b_t_ign, bt, bb, b_prop)
-        k = k_from_plan(k_level, since, h, vz, mass, tn, k_min, k_max)
-        thrust = tn * k
+        t_b = 0.0
         if b_t_ign < 1.0e5:
-            thrust += boost_thrust(t - b_t_ign, bt, bf) * t_scale
+            t_b = boost_thrust(t - b_t_ign, bt, bf) * t_scale
+        k = k_from_plan(k_level, since, h, vz, mass, tn, k_min, k_max,
+                        t_b, V_TERM_BOOST if b_t_ign < 1.0e5 else V_TERM_MAX)
+        thrust = tn * k + t_b
         a = (thrust - kd * vz * abs(vz)) / mass - G
         vz_new = vz + a * dt
         h += 0.5 * (vz + vz_new) * dt
@@ -1267,6 +1301,17 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
     tilt_plan = env[E_TILT_PLAN] > 0.5
     guid_n = env[E_GUID_N] if env[E_GUID_N] > 0.0 else 1.0
     guid_kmax = env[E_GUID_KMAX]
+    guid_zev = env[E_GUID_ZEV] > 0.5
+    wind_obs = env[E_WIND_OBS] > 0.5
+    plan_ts_tau = env[E_PLAN_TAU]
+    wex = wey = 0.0              # on-board wind estimate [m/s], world horizontal
+    wpx = wpy = wpz = 0.0        # the observer's predicted transverse rate
+    obs_run = False
+    h_obs = -1.0                 # altitude at which the estimate was last updated
+    wbx = wby = 0.0              # the wind the computer is using right now
+    b_imp = 0.0                  # booster total impulse [N s], from its table
+    for _i in range(bt.shape[0] - 1):
+        b_imp += 0.5 * (bf[_i] + bf[_i + 1]) * (bt[_i + 1] - bt[_i])
     fin_ff = env[E_FIN_FF]       # free-fall fin mode: 0 asleep, 1 passive, 2 trim
     fin_stall = env[E_FIN_STALL] if env[E_FIN_STALL] > 0.0 else FIN_ALPHA_STALL
     fin_amax = fin_stall - FIN_STALL_MARGIN
@@ -1465,10 +1510,12 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             ts_p = t_scale * (1.0 - env[E_PLAN_MARGIN])
             if tilt_plan:
                 ts_p *= clampf(ebz, 0.5, 1.0)
+            ts_i = ts_p / t_scale        # the table, with the same discounts
             k_level, resid = solve_plan(h_est, evz, tb_p, dry,
                                         mt, mf, mc, prop_mass, i_total, cd_burn, area,
                                         k_min, k_max, bt, bf_ax, bb, b_prop,
-                                        b_t_ign, 0.02, plan_target, ts_p)
+                                        b_t_ign, 0.02, plan_target, ts_p,
+                                        ts_i, plan_ts_tau)
             # ---- the booster rule ----
             # A D9 is a one-way door: it cannot be throttled, stopped or relit. So it
             # is lit only once the plan says the main motor CANNOT close the landing
@@ -1482,7 +1529,17 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             # The plant flies the SAME clamp law the projection assumed, terminal
             # phase included. Anything else and the planner is solving for a vehicle
             # that does not exist.
-            k_cmd = k_from_plan(k_level, 0.0, h_est, evz, mass, t_nom, k_min, k_max)
+            # ... and on what the COMPUTER knows: the table times its own thrust
+            # estimate. This used to be handed `t_nom`, the true dispersed thrust -
+            # the one number on the vehicle nothing on board can read - so the
+            # terminal law was dividing by a perfect measurement of the +/-15 %
+            # scatter and the campaign flattered it.
+            t_b_e = 0.0
+            if b_t_ign < 1.0e5 and tb >= 0.0:
+                t_b_e = boost_thrust(tb - b_t_ign, bt, bf_ax) * t_scale
+            k_cmd = k_from_plan(k_level, 0.0, h_est, evz, mass, t_table * t_scale,
+                                k_min, k_max, t_b_e,
+                                V_TERM_BOOST if b_t_ign < 1.0e5 else V_TERM_MAX)
             if gate_open:
                 # Ignition transient: full open, whatever the planner wants. The
                 # planner's projection assumes its own clamp level from t = 0, so
@@ -1543,16 +1600,34 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             # main motor cancel it while the vehicle stays vertical, instead of the
             # guidance chasing the drift it causes.
             bxf = byf = 0.0
-            if thr_boost > 0.0:
+            zvx = zvy = 0.0
+            if thr_boost > 0.0 and guid_zev:
+                tau_b = tb - b_t_ign
+                rem = (1.0 - boost_burned(tau_b, bt, bb, b_prop) / b_prop)
+                dv_b = rem * b_imp * t_scale * math.sin(b_cant) / mass
+                # the side force is bolted to the airframe: if the roll damper has
+                # not stopped the spin, the remaining impulse is smeared round an
+                # arc of w_roll * T_left and its resultant is the chord
+                phi = (ewx * ebx + ewy * eby + ewz * ebz) * (bt[-1] - tau_b)
+                az_b = b_azim + 0.5 * phi
+                if abs(phi) > 1e-3:
+                    dv_b *= abs(math.sin(0.5 * phi) / (0.5 * phi))
+                zvx = -dv_b * (math.cos(az_b) * c1x + math.sin(az_b) * c2x)
+                zvy = -dv_b * (math.cos(az_b) * c1y + math.sin(az_b) * c2y)
+            elif thr_boost > 0.0:
                 mfx = math.cos(b_azim) * c1x + math.sin(b_azim) * c2x
                 mfy = math.cos(b_azim) * c1y + math.sin(b_azim) * c2y
                 sb = math.sin(b_cant)
-                bxf = -thr_boost * (-sb * mfx) / mass
-                byf = -thr_boost * (-sb * mfy) / mass
-            ux, uy, uz, t_go = guidance_dir(h_est, evx, evy, evz, mass, cd,
+                # (table x the computer's own thrust-scale estimate - this read
+                # `thr_boost`, the true dispersed thrust, which nothing on board
+                # can know)
+                tb_e = boost_thrust(tb - b_t_ign, bt, bf) * t_scale
+                bxf = tb_e * sb * mfx / mass
+                byf = tb_e * sb * mfy / mass
+            ux, uy, uz, t_go = guidance_dir(h_est, evx, evy, evz, mass, cd_burn,
                                             ax_bias + bxf, ay_bias + byf, area,
                                             tilt_min, tilt_slope, tilt_cap, guid_n,
-                                            guid_kmax)
+                                            guid_kmax, zvx, zvy)
             # ---- aerodynamic drift nulling, before the motor is lit ----
             # The body's own normal force is a free horizontal actuator while the
             # vehicle is still falling: tilting the thrust axis TOWARDS the drift
@@ -1630,10 +1705,21 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             # mean wind at its believed altitude.
             ev2 = evx * evx + evy * evy + evz * evz
             rvx, rvy, rvz = evx, evy, evz
+            wbx = wby = 0.0
             if wind_known and w_mean > 0.0:
                 wk = w_mean * (max(h_est, 0.3) / 10.0) ** env[E_SHEAR]
-                rvx -= wk * w_cx
-                rvy -= wk * w_cy
+                wbx = wk * w_cx
+                wby = wk * w_cy
+            elif wind_obs and h_obs > 0.0:
+                # the observer's estimate, carried below the altitude it was last
+                # updated at on the textbook 1/7 power law
+                wk = (max(h_est, 0.3) / h_obs) ** WIND_SHEAR
+                if wk > 1.0:
+                    wk = 1.0
+                wbx = wk * wex
+                wby = wk * wey
+            rvx -= wbx
+            rvy -= wby
             v2 = rvx * rvx + rvy * rvy + rvz * rvz
             q = 0.5 * RHO * v2
             tafx = tafy = tafz = 0.0
@@ -1654,10 +1740,10 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             # turned out to be. One filtered scalar, a handful of flops, and it feeds
             # the planner a truth it otherwise has to guess.
             if use_t_est > 0.5 and engine_on and tb > 0.05:
-                t_table = main_thrust(tb, mt, mf)
+                t_tab_e = main_thrust(tb, mt, mf)
                 if b_t_ign < 1.0e5:
                     # only the booster's AXIAL share reaches a body-axis accelerometer
-                    t_table += (boost_thrust(tb - b_t_ign, bt, bf) * math.cos(b_cant)
+                    t_tab_e += (boost_thrust(tb - b_t_ign, bt, bf) * math.cos(b_cant)
                                 / max(k_act, 1e-3))
                 # The aerodynamic share is the computer's MODEL of it (its own Cd,
                 # 1.225 kg/m3, its own velocity estimate, no wind) - not the true
@@ -1666,7 +1752,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                     -(evx * ebx + evy * eby + evz * ebz) / math.sqrt(ev2 + 1e-9),
                     -1.0, 1.0)
                 t_meas = a_meas * mass - f_aero_m
-                denom = t_table * k_act
+                denom = t_tab_e * k_act
                 if denom > 15.0 and t_meas > 0.0:
                     raw = clampf(t_meas / denom, 0.6, 1.4)
                     # first-order filter, ~0.25 s: the scatter itself wanders over
@@ -1840,7 +1926,12 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                 # 0.65 N m at 30 deg. Against a roll inertia of 0.004 kg m^2 that is
                 # already hundreds of deg/s. Equalised, the residual is 0.005 N m.
                 # axial airspeed, for the crossflow correction
-                va_f = -(evx * ebx + evy * eby + evz * ebz)
+                # (the SAME air-relative velocity the body feedforward uses. This
+                # read the raw ground velocity, so a computer that was handed the
+                # wind corrected the body's moment and not the fins' - and the two
+                # errors, which largely cancel when both are wrong, stopped
+                # cancelling: "wind known" flew 4 points WORSE than "wind unknown".)
+                va_f = -(rvx * ebx + rvy * eby + rvz * ebz)
                 if va_f < 3.0:
                     va_f = 3.0
                 room = fin_max
@@ -1852,7 +1943,7 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                     nix = eby * riz - ebz * riy
                     niy = ebz * rix - ebx * riz
                     niz = ebx * riy - eby * rix
-                    xflow[_i] = math.degrees((evx * nix + evy * niy + evz * niz) / va_f)
+                    xflow[_i] = math.degrees((rvx * nix + rvy * niy + rvz * niz) / va_f)
                     # "passive": while the attitude loop sleeps the fins are left to
                     # see the crossflow, i.e. to do what fins are for - restore
                     # the airframe to the flight path. Cancelling it there turns
@@ -1897,6 +1988,65 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                     defl_cmd[_i] = clampf(ctrl_arr[_i] + brake * alt,
                                           -fin_max, fin_max)
 
+            # ---- on-board wind observer (free fall, fins flying) ----
+            # The computer has no air data, so every aerodynamic term above is
+            # computed from the GROUND velocity - and at 12 m/s of fall a 3 m/s
+            # wind is 15 deg of angle of attack it does not know about. The fins
+            # are feathered into the wrong crossflow, the body feedforward cancels
+            # the wrong moment, and the leftover is a torque the attitude loop
+            # cannot out-vote once the fin command clips: one flight in ninety
+            # diverged to 40-50 deg before the motor was even lit.
+            #
+            # But the vehicle is its own wind vane. That leftover torque is
+            #   d_tau = (q/V) * (l_cp*A*CN_a + n/2 * arm*S*CL_a*K) * (b x d_wind)
+            # and the gyros see it at once. A Luenberger observer predicts the
+            # transverse rate from the torques the computer believes in, and what
+            # the prediction cannot explain is turned back into wind.
+            if wind_obs and n_fin > 0.5 and not engine_on and not wind_known:
+                if v_f >= FIN_MIN_AIRSPEED:
+                    if not obs_run:
+                        wpx, wpy, wpz = gtx, gty, gtz
+                        obs_run = True
+                    k_fl = qf * fin_area * fin_cl_alpha * fin_k
+                    mtx, mty, mtz = tafx, tafy, tafz
+                    for _i in range(int(n_fin)):
+                        ang_i = 2.0 * math.pi * _i / n_fin
+                        al = act_f[_i] - xflow[_i]
+                        al = clampf(al, -fin_stall, fin_stall)
+                        lf = fin_arm * k_fl * math.radians(al)
+                        mtx -= lf * (math.cos(ang_i) * c1x + math.sin(ang_i) * c2x)
+                        mty -= lf * (math.cos(ang_i) * c1y + math.sin(ang_i) * c2y)
+                        mtz -= lf * (math.cos(ang_i) * c1z + math.sin(ang_i) * c2z)
+                    c_dmp = 0.5 * RHO * v_f * (area * cna * l_cp * l_cp + 0.5 * n_fin
+                                               * fin_area * fin_cl_alpha * fin_k
+                                               * fin_arm * fin_arm)
+                    gk_o = (I_t - I_a) * w_roll
+                    mtx -= c_dmp * gtx + gk_o * (eby * gtz - ebz * gty)
+                    mty -= c_dmp * gty + gk_o * (ebz * gtx - ebx * gtz)
+                    mtz -= c_dmp * gtz + gk_o * (ebx * gty - eby * gtx)
+                    zox, zoy, zoz = gtx - wpx, gty - wpy, gtz - wpz
+                    wpx += (mtx / I_t + WIND_OBS_L * zox) * dt_c
+                    wpy += (mty / I_t + WIND_OBS_L * zoy) * dt_c
+                    wpz += (mtz / I_t + WIND_OBS_L * zoz) * dt_c
+                    dpo = wpx * ebx + wpy * eby + wpz * ebz
+                    wpx -= dpo * ebx
+                    wpy -= dpo * eby
+                    wpz -= dpo * ebz
+                    k_wo = (qf / v_f) * (l_cp * area * cna + 0.5 * n_fin * fin_arm
+                                        * fin_area * fin_cl_alpha * fin_k)
+                    if k_wo > 1e-3:
+                        # (unexplained torque) x b = (q/V) * K * d_wind
+                        g_o = WIND_OBS_G * dt_c * I_t * WIND_OBS_L / k_wo
+                        wex += g_o * (zoy * ebz - zoz * eby)
+                        wey += g_o * (zoz * ebx - zox * ebz)
+                        wen = math.sqrt(wex * wex + wey * wey)
+                        if wen > WIND_OBS_MAX:
+                            wex *= WIND_OBS_MAX / wen
+                            wey *= WIND_OBS_MAX / wen
+                        h_obs = max(h_est, 0.3)
+                else:
+                    obs_run = False
+
             # ---- transport delay: sensor sample -> actuator ----
             # The commands computed from THIS tick's measurements reach the servos
             # n_lag ticks later (estimation, computation, the servo's PWM frame).
@@ -1932,8 +2082,8 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
         srv2 = clampf(srv2, -srv_max, srv_max)
 
         # ---------------- fin actuators ----------------
-        # Same deceleration-aware rate limit as the gimbal servos. The quoted 90 ms
-        # is end stop to end stop, so the rate is 2*max/90 ms.
+        # A plain rate limit (no acceleration state): the quoted travel time is end
+        # stop to end stop, so the rate is 2*max/travel_time.
         if n_fin > 0.5:
             for _i in range(int(n_fin)):
                 e_f = act_f[_i] - defl[_i]
@@ -1945,10 +2095,29 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
                     defl[_i] = act_f[_i]
 
         # ---------------- throttle actuator ----------------
-        kd_des = clampf((k_cmd - k_act) / DT_PHYS, -thr_speed, thr_speed)
+        # Deceleration-aware, exactly like the gimbal servos: the clamp may only run
+        # as fast as it can still stop in the travel that is left. The plain "slew
+        # until you arrive" law this replaces had no braking at all - at 12.8 /s
+        # against 257 /s^2 the clamp needs 0.32 of its travel to stop, so EVERY step
+        # the planner commanded overshot by 80-100 % of its own size and rang for
+        # ~200 ms, and the thrust rang with it.
+        e_k = k_cmd - k_act
+        d_k = 1.0 if e_k > 0.0 else (-1.0 if e_k < 0.0 else 0.0)
+        kd_des = d_k * min(thr_speed, math.sqrt(2.0 * thr_accel * abs(e_k)),
+                           abs(e_k) / DT_PHYS)
         dk = clampf(kd_des - k_rate_act, -thr_accel * DT_PHYS, thr_accel * DT_PHYS)
         k_rate_act += dk
-        k_act = clampf(k_act + k_rate_act * DT_PHYS, k_min, k_max)
+        k_act += k_rate_act * DT_PHYS
+        # an end stop takes the momentum out of the mechanism - without this the
+        # rate "wound up" against the stop and delayed the next reversal
+        if k_act >= k_max:
+            k_act = k_max
+            if k_rate_act > 0.0:
+                k_rate_act = 0.0
+        elif k_act <= k_min:
+            k_act = k_min
+            if k_rate_act < 0.0:
+                k_rate_act = 0.0
 
         # ---------------- forces ----------------
         n1 = math.radians(srv1 / srv_ratio)
@@ -2145,6 +2314,8 @@ def fly(seed, h_start, vx0, vz0, m_gross, cd, cd_burn, wn, zeta, wn_fin, zeta_fi
             tel[tel_i, 23] = math.degrees(math.acos(clampf(cmd_uz, -1.0, 1.0)))
             tel[tel_i, 24] = wind_x
             tel[tel_i, 25] = wind_y
+            tel[tel_i, 26] = wbx
+            tel[tel_i, 27] = wby
             tel_i += 1
 
         # ---------------- integrate ----------------
@@ -2343,6 +2514,10 @@ class TvcConfig:
     tilt_plan: bool = False               # planner discounts the thrust for tilt
     guid_n: float = GUID_N                # horizontal navigation gain
     guid_kmax: float = GUID_KMAX          # 1/s cap on that gain (0 = none)
+    guid_zev: bool = True                 # steer the zero-effort velocity (booster)
+    wind_observer: bool = True            # estimate the wind on board, in free fall
+    plan_thrust_tau: float = THRUST_TAU   # s, how long the planner expects today's
+                                          # thrust deviation to last (0 = forever)
     plan_margin: float = PLAN_MARGIN      # thrust fraction the planner holds back
     fin_freefall: str = "vertical"        # "asleep" | "passive" | "trim" | "vertical"
     fin_stall: float = FIN_ALPHA_STALL    # deg, fin stall angle (no CFD past 10 deg)
@@ -2391,6 +2566,9 @@ class TvcConfig:
         e[E_WIND_KNOWN] = 1.0 if self.wind_known else 0.0
         e[E_GUID_N] = self.guid_n
         e[E_GUID_KMAX] = self.guid_kmax
+        e[E_GUID_ZEV] = 1.0 if self.guid_zev else 0.0
+        e[E_WIND_OBS] = 1.0 if self.wind_observer else 0.0
+        e[E_PLAN_TAU] = self.plan_thrust_tau
         e[E_PLAN_MARGIN] = self.plan_margin
         e[E_FIN_FF] = {"asleep": 0.0, "passive": 1.0, "trim": 2.0,
                        "vertical": 3.0}[self.fin_freefall]
@@ -3277,6 +3455,10 @@ def print_report(camp):
           + (f", plume drag loss C_T ref {cfg.plume_ct:.1f}" if cfg.plume_ct > 0 else ""))
     print(f"  controller extras : attitude integral {cfg.att_ki:.1f} /s, planner "
           f"margin {cfg.plan_margin * 100:.0f} %, fins in free fall: {cfg.fin_freefall}")
+    print(f"                      wind observer "
+          f"{'on' if getattr(cfg, 'wind_observer', False) else 'off'}, booster side "
+          f"force by {'zero-effort velocity' if getattr(cfg, 'guid_zev', False) else 'instant tilt'}"
+          f", thrust forecast {getattr(cfg, 'plan_thrust_tau', 0.0):.2f} s")
     print(f"  flights           : {camp['out'].shape[0] * camp['out'].shape[1]} cells"
           f" x {cfg.runs} = {camp['out'][:, :, :, 0].size}")
     print()
@@ -3516,8 +3698,44 @@ def verify():
     print(f"  planner vs plant, no dispersions   : worst touchdown-speed gap "
           f"{max(gaps):.2f} m/s: {'ok' if plan_ok else 'MODELS DISAGREE'}")
 
+    # ---- the clamp actuator must arrive, not ring ----
+    # It had no braking: every commanded step overshot by 80-100 % of its own size.
+    cfg_k = TvcConfig(thrust_scatter=0.0, ign_delay_max=0.0, roll_max=0.0).perfect()
+    _ok, tk = fly_one(cfg_k, 1, 150.0, 0.0, n_tel=4000)
+    kk = tk[tk[:, 6] > 0.5, 7]
+    k_ok = len(kk) > 5 and kk.min() >= cfg_k.k_min - 1e-9 and kk.max() <= cfg_k.k_max + 1e-9
+    k_a, k_r, worst_os = 0.5, 0.0, 0.0
+    for stp in (0.02, 0.05, 0.2, 0.4):
+        k_a, k_r, k_c, pk = 0.5, 0.0, 0.5 + stp, 0.5
+        for _n in range(600):
+            e_k = k_c - k_a
+            d_k = 1.0 if e_k > 0 else (-1.0 if e_k < 0 else 0.0)
+            kd = d_k * min(THROTTLE_SPEED, math.sqrt(2 * THROTTLE_ACCEL * abs(e_k)),
+                           abs(e_k) / DT_PHYS)
+            k_r += clampf(kd - k_r, -THROTTLE_ACCEL * DT_PHYS, THROTTLE_ACCEL * DT_PHYS)
+            k_a += k_r * DT_PHYS
+            pk = max(pk, k_a)
+        worst_os = max(worst_os, (pk - k_c) / stp)
+    k_ok = k_ok and worst_os < 0.10
+    print(f"  clamp actuator, 4 step sizes       : worst overshoot "
+          f"{worst_os * 100:.1f} % of the step: {'ok' if k_ok else 'RINGS'}")
+
+    # ---- the wind observer must find the wind, with the right sign ----
+    cfg_o = replace(TvcConfig().perfect(), wind_max=3.0, gust=0.0)
+    errs_o, mags_o = [], []
+    for sd in range(6):
+        _oo, to = fly_one(cfg_o, sd, 160.0, 3.0, n_tel=4000)
+        to = to[(to[:, 0] > 2.5) & (to[:, 6] < 0.5)]
+        if len(to):
+            errs_o.append(np.hypot(to[:, 26] - to[:, 24], to[:, 27] - to[:, 25]).mean())
+            mags_o.append(np.hypot(to[:, 24], to[:, 25]).mean())
+    obs_ok = len(errs_o) > 0 and np.mean(errs_o) < 0.5 * np.mean(mags_o) + 0.3
+    print(f"  wind observer, 6 flights           : mean error "
+          f"{np.mean(errs_o):.2f} m/s on a mean wind of {np.mean(mags_o):.2f} m/s: "
+          f"{'ok' if obs_ok else 'NOT CONVERGING'}")
+
     ok = (ok and sign_ok and fin_ok and plan_ok and step_ok and cfd_ok and same
-          and wind_ok and att_ok)
+          and wind_ok and att_ok and k_ok and obs_ok)
     print(f"  -> {'OK' if ok else 'FAILED'}")
     return ok
 
@@ -3588,6 +3806,11 @@ def main():
                         help=f"{_lab} [{_unit}] - {_note}")
     ap.add_argument("--wind-known", action="store_true",
                     help="the computer gets the mean wind before the flight")
+    ap.add_argument("--no-wind-observer", action="store_true",
+                    help="switch the on-board wind observer off")
+    ap.add_argument("--no-zev", action="store_true",
+                    help="cancel the booster's side force by an instantaneous tilt "
+                         "(the old law) instead of steering the zero-effort velocity")
     ap.add_argument("--fin-freefall", choices=("vertical", "trim", "passive", "asleep"),
                     default="vertical", help="what the fins do during the free fall")
     ap.add_argument("--perfect", action="store_true",
@@ -3717,6 +3940,7 @@ def main():
                     gyro_ff=not args.no_gyro_ff)
     from dataclasses import replace as _replace
     cfg = _replace(cfg, wind_known=args.wind_known, fin_freefall=args.fin_freefall,
+                   wind_observer=not args.no_wind_observer, guid_zev=not args.no_zev,
                    **{a: getattr(args, "env_" + a) for _l, a, _u, _n in ENV_FIELDS})
     if args.perfect:
         cfg = cfg.perfect()

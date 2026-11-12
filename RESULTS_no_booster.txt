@@ -1,0 +1,40 @@
+==============================================================================
+LandSim Light - 3-D / TVC Monte Carlo
+==============================================================================
+  motor             : long, 120.4 N peak, 2.61 s, 221.8 Ns
+  boosters carried  : 0 x Klima D9 (20.0 Ns each), lit by the on-board rule
+  mass / Cd         : 2.850 kg + boosters / 0.35
+  diameter / area   : 105 mm / 86.6 cm2
+  MMOI at gross     : 0.4655 kg m2 transverse, 0.00393 roll  (scaled with mass through the burn)
+  arms              : gimbal 0.70 m, body lift -0.60 m (+ aft), body CN_alpha 2.00, viscous crossflow 0.80, fin interference 1.43
+  TVC servo         : +/-10.0 deg at 2.0:1 (5.0 deg of nozzle), 500 deg/s, 2000 deg/s2, step 0.15 deg
+  clamp             : 0.10-1.00 at 12.8 /s
+  fins              : 4 fins (CFD table aero), 64.0 cm2 each, AR 1.53, CL_alpha 1.80 /rad, +/-15 deg in 50 ms (600 deg/s), arm 0.50 m, roll arm 80 mm; stall 22 deg; airbrake adds dCd 0.447
+  airbrake mode     : auto  (free-fall Cd 0.797 against 0.350 bare)
+  entry grid        : 140-180 m step 5, vx 0 +/-7 m/s step 1
+  gains             : wn 8.23 / zeta 1.04 (TVC, schedule +0.60), wn 2.00 / zeta 0.99 (fins, schedule -0.60), roll 0.75
+  dispersions       : igniter U(0, 300) ms (guidance pads 300 ms), thrust +/-15 % over 700 ms, roll U(0, 90) deg/s, roll phase U(0, 360) deg
+  altitude knowledge: bias U(+/-1.00) m until the lidar acquires at 7.0 m, then corrected as a step
+  wind              : mean U(0, 2.0) m/s at 10 m, profile exp 0.14, turbulence 0.30 m/s over 1.5 s; air density +/-3 % (1 sigma)
+  sensors           : attitude 0.30 deg (3 s), gyro bias 0.10 + noise 0.05 deg/s, velocity 0.10 m/s (1.0 s), accel 0.05 m/s2, lag 10 ms
+  hardware          : thrust misalignment 0.25 deg (1 sigma)
+  controller extras : attitude integral 2.0 /s, planner margin 3 %, fins in free fall: vertical
+                      wind observer on, booster side force by zero-effort velocity, thrust forecast 0.70 s
+  flights           : 135 cells x 120 = 16200
+
+  SUCCESS (all five gates)   :  98.2 %   [95 % interval 98.0 - 98.4 on 16200 flights]
+    |v_z| < 4 m/s              :  98.3 %   p95   2.93 m/s
+    |v_h| < 0.5 m/s           :  99.8 %   p95   0.31 m/s
+    tilt  < 4 deg             : 100.0 %   p95   2.01 deg
+    rate  < 30 deg/s           : 100.0 %   p95   4.22 deg/s
+
+  ... and over the 15923 flights that survived the VERTICAL gate, i.e. where
+      the horizontal and attitude corrections actually ran to touchdown:
+    |v_h| < 0.5 m/s           : 100.0 %   p95   0.31 m/s
+    tilt  < 4 deg             : 100.0 %
+    rate  < 30 deg/s           : 100.0 %
+
+  D9 lit in                  :   0.0 % of flights
+  burnout before touchdown   :   2.0 %
+  mean commanded ignition    :  55.0 m, mean clamp 0.79
+  dV spent on steering       :  0.04 m/s (clamp waste  17.1 m/s)

@@ -1022,20 +1022,159 @@ The three inputs everything above leans on, in order:
 3. **The avionics' real attitude and velocity accuracy** during powered flight
    (`--att-sig`, `--vel-sig`) - the horizontal gate is spent almost entirely on them.
 
+## The second audit (November 2026): TVC, clamp, and what the computer knows
+
+A second line-by-line pass over the physics and the two control laws - the nozzle
+(TVC) and the clamp. Every change was measured on 3240 paired flights (the full grid
+x 24, common random numbers) before it was kept; the final number is the full
+16200-flight campaign.
+
+| same imperfect world, same vehicle | success |
+|---|---|
+| before this audit | 96.1 % |
+| + clamp actuator that brakes, + no truth leaks (bug fixes, neutral) | 95.6 % |
+| + booster side force steered as zero-effort velocity | 97.5 % |
+| + on-board wind observer | 98.5 % |
+| + planner forecasts the thrust scatter decaying to the table | 99.4 % |
+| + terminal law knows the booster, descent cap 1.4 m/s | 99.5 % |
+| + gains re-fitted on the corrected model | **99.7 %** |
+
+(3240 flights each, +/-0.3 points; the 16200-flight figure is in *Results*.)
+
+### What was wrong (bugs - fixed whether or not they paid)
+
+**1. The clamp actuator had no brakes.** The model slewed at 12.8 /s towards the
+command and only started decelerating (257 /s^2) once it had arrived - it needs 0.32
+of its travel to stop. Every step the planner commanded overshot by 80-100 % of its
+own size and rang for ~200 ms, and the thrust rang with it. The gimbal servos already
+had the deceleration-aware law (`v = sqrt(2 a |e|)`); the clamp now has the same one,
+and an end stop takes the rate out instead of letting it wind up. Overshoot is now
+5 %. (`--verify` checks it.)
+
+**2. The clamp law read the TRUE thrust.** `k_from_plan` in the plant was handed
+`t_nom`, the dispersed thrust - the one number on the vehicle nothing on board can
+measure. The terminal law divided by it. It now gets the table times the computer's
+own accelerometer estimate. The booster feedforward had the same leak.
+
+**3. "Wind known" corrected the body and not the fins.** With `--wind-known` the
+body-moment feedforward used the air-relative velocity, but the fin mixer's
+crossflow term still read the ground velocity. The two errors largely cancel when
+both are wrong, so handing the computer the wind made it fly 4 points WORSE (91.4 %
+against 95.6 %) - and the previous audit concluded from that that wind was "an
+authority problem, not an information problem". It is an information problem: with
+the mixer fixed, knowing the wind is worth +1.2 points and removes the whole class
+of free-fall attitude losses.
+
+**4. The terminal descent law ignored the booster.** It commanded `m a / T_main`
+with 9 N of D9 thrust arriving on top, so the vehicle sank ~1.1 m/s slower than the
+reference. Planner and plant agreed with each other, so nothing failed - the 2.5 m/s
+cap was simply not what flew. The law now subtracts the booster's axial thrust and
+the cap with a D9 burning is the 1.4 m/s that was actually being flown (median touchdown
+2.0 -> 1.8 m/s); with the main motor alone it stays 2.5 m/s.
+
+**5. Small ones.** The guidance's drag credit used the bare-body Cd where the planner
+uses body + fins; the thrust estimator overwrote the variable the ignition gate reads;
+stale comments on the fin servo.
+
+Everything else in the physics was re-derived and holds: the axisymmetric Euler
+equations and the gyroscopic decoupling, the gimbal moment and its inversion, the fin
+force directions and the mixer signs, the slender-body and crossflow terms, the OU
+processes, the mass and inertia histories, the touchdown sub-step, the 1-D model.
+
+### What was added (improvements to the algorithm)
+
+**A. The booster's side force is steered as zero-effort velocity.** The canted D9
+pushes sideways with 0.86 m/s^2 for 2.2 s. The old law cancelled it with an
+instantaneous tilt feedforward - but the guidance only sets a DIRECTION, so the
+feedforward was scaled by (real thrust)/(requested thrust), 0.3x to 1.8x through the
+burn, and it vanished in 250 ms when the D9 tailed off, a few tenths of a second
+before touchdown. The remaining side impulse is known exactly (table x thrust
+estimate x sin 15 deg, and the chord of the arc if the airframe is still rolling), so
+the law now steers `v + dv_still_to_come` instead of `v`. Median |vh| 0.22 -> 0.16 m/s,
+median touchdown tilt 1.9 -> 1.2 deg: **+2.5 points** (`--no-zev` for the old law).
+
+**B. An on-board wind observer.** One flight in ninety lost its attitude in the free
+fall: at 12 m/s of fall a 3 m/s wind is 15 deg of angle of attack the computer does
+not know about, the fins are feathered into the wrong crossflow, and the clipped
+fin command cannot out-vote the error. But the unexplained torque is
+`(q/V) (l_cp A CN_a + n/2 arm S CL_a K) (b x d_wind)` and the gyros see it at once.
+A Luenberger rate observer turns what its prediction cannot explain into a wind
+estimate, within about a second of the fins waking up; the estimate is carried down
+the burn on the 1/7 profile. **+1.0 point**, the 99th percentile of |vh| falls from
+1.6 to 0.43 m/s, and it is insensitive to its two gains (`--no-wind-observer`).
+
+**C. The planner forecasts the thrust.** The +/-15 % scatter wanders with a 0.7 s
+correlation time, and the planner projected the scale it measured NOW all the way
+to burnout. A strong first half second made it throw thrust away at the clamp
+minimum; when the scatter swung to -10 % there was nothing left, and the vehicle
+arrived at 8 m/s with the motor still burning. The projection now lets today's
+deviation decay to the table (`--plan-thrust-tau`, 0 = the old behaviour):
+**+0.9 point**, 99th-percentile |vz| 4.0 -> 3.3 m/s. 0.35, 0.7 and 1.5 s all work.
+
+**D. Gains re-fitted.** The old set was fitted to the ringing clamp. On the corrected
+model the tuner moves the nozzle loop to wn 8.2 / zeta 1.04 with the full thrust
+schedule: p95 |vh| 0.35 -> 0.30 m/s, p95 tilt 2.3 -> 1.95 deg on seeds it never saw.
+
+### Tried, measured, and thrown out
+
+* **Dynamic inversion of the horizontal channel** (tilt whose sine is a_h m / T, with
+  the body's lift subtracted): 59-93 % at every navigation gain tried. Early in the
+  burn the clamped-down motor has less sideways authority than the body's own lift
+  takes back, and the exact inversion spends the whole cone on it.
+* **Fading the fin loop in with airspeed** (passive at low speed): 92-93 %. Holding
+  vertical all the way down is what kills the drift.
+* **More planner margin** (6, 9, 12 %): 97.7 / 92.7 / 82.1 % - it stops high and burns out.
+* **N = 1.2 - 3 and a cap on N/t_go**, with the new law as well: still worse than N = 1.
+
+### Main motor alone (no D9)
+
+The vehicle is now expected to fly WITHOUT the booster, so this is the number that
+matters: `python3 tvc_sim.py --boosters 0 --delay-pad 0.3`
+
+| 16200 flights, no booster | success |
+|---|---|
+| before this audit (3240-flight grid) | 95.3 % |
+| after | **98.2 %** [98.0 - 98.4] |
+
+|vz| < 4 m/s 98.3 % (p95 2.9 m/s), |vh| < 0.5 m/s 99.8 % (p95 0.31 m/s), tilt and rate
+100 %. Full listing in `RESULTS_no_booster.txt`. Two settings are specific to it:
+
+* **Terminal descent cap 2.5 m/s**, not the 1.4 m/s flown with a D9 burning. Without
+  the booster's impulse a slow final approach burns out high: 2.0 m/s gives 94.1 %,
+  1.4 m/s 93.6 %, 2.5 m/s 97.4 %. The code picks the cap by whether a D9 is lit.
+* **Igniter pad 0.30 s** instead of the default 0.40 s: 98.2 % against 97.4 %
+  (0.25 s: 95.6 %, 0.35 s: 98.0 %, 0.5 s: 96.0 %). The default rule was fitted with
+  the booster on board.
+
+Every remaining failure is vertical - there is no spare impulse without the D9.
+
+### What is left
+
+On the 16200-flight campaign the remaining failures are almost all vertical: an
+early igniter, a motor that runs weak late, no impulse left. The single-run levers
+left are operational - a measured wind before release (`--wind-known`), a tighter
+igniter - or hardware: velocity and attitude estimates are still worth ~2 points
+each (`--vel-sig 0`, `--att-sig 0`).
+
 ## Results (16200 flights, 135 entry states x 120)
 
 ![Landing success across the entry envelope](figures/fig1_success_envelope.png)
 
 | | |
 |---|---|
-| success, all five gates | **96.3 %**  [95 % interval 96.0 - 96.6] |
-| \|vz\| < 4 m/s | 98.8 % (p95 3.1 m/s) |
-| \|vh\| < 0.5 m/s | 97.0 % (p95 0.45 m/s) |
-| tilt < 4 deg | 99.7 % (p95 3.2 deg) |
-| transverse rate < 30 deg/s | 100.0 % (p95 12 deg/s) |
+| success, all five gates | **99.8 %**  [95 % interval 99.7 - 99.8] |
+| \|vz\| < 4 m/s | 99.8 % (p95 2.7 m/s) |
+| \|vh\| < 0.5 m/s | 100.0 % (p95 0.30 m/s) |
+| tilt < 4 deg | 100.0 % (p95 2.0 deg) |
+| transverse rate < 30 deg/s | 100.0 % (p95 4.6 deg/s) |
 | D9 lit | 100 % of flights |
-| burnout before touchdown | 5.4 % (mostly in the last decimetres, after a soft arrival) |
-| dV spent on steering | 0.16 m/s (clamp waste 24.0 m/s) |
+| burnout before touchdown | 9.3 % (in the last decimetres, after a soft arrival) |
+| dV spent on steering | 0.08 m/s (clamp waste 23.6 m/s) |
+
+These are the numbers after *The second audit* (96.3 % before it; the full listing is
+in `RESULTS.txt`). The paragraphs and per-altitude / per-speed tables below were
+written for the 96.3 % campaign and describe its trends; the current breakdown is
+99.0 - 100.0 % across release altitudes and 99.4 - 100.0 % across entry speeds.
 
 **This is in an imperfect world** - wind up to 2 m/s, a flight computer that only
 has estimates of its attitude and velocity, a 10 ms delay, a misaligned nozzle - see
