@@ -12,3 +12,4 @@
 numpy>=1.24
 matplotlib>=3.7
 numba>=0.59        # optional
+pytest>=7           # tests only (python -m pytest test_landsim_export.py)

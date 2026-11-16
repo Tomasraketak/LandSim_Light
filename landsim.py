@@ -156,7 +156,9 @@ class Motor:
         # zero thrust just before the first tabulated point and just after the last
         times = [0.0] + [t - t0 for t, _ in pts] + [pts[-1][0] - t0 + 1e-6]
         thrust = [0.0] + [f for _, f in pts] + [0.0]
+        self._set_curve(times, thrust, thrust_multiplier, propellant_mass)
 
+    def _set_curve(self, times, thrust, thrust_multiplier, propellant_mass):
         self.t = np.asarray(times, dtype=float)
         # the whole lookup table is scaled by the multiplier before anything else
         self.thrust_multiplier = float(thrust_multiplier)
@@ -170,6 +172,42 @@ class Motor:
         self.cum_impulse = np.concatenate(([0.0], np.cumsum(seg_imp)))
         self.total_impulse = float(self.cum_impulse[-1])
         self.propellant_mass = propellant_mass
+
+    @classmethod
+    def from_curve(cls, curve, propellant_mass=PROPELLANT_MASS,
+                   thrust_multiplier=1.0, name="curve"):
+        """A motor from an explicit thrust curve [[t [s], F [N]], ...] - a measured
+        static-fire or a manufacturer's .eng/.rse table - instead of the
+        fraction-of-peak table.
+
+        Time is measured from thrust onset: the first sample is taken as t = 0.
+        A curve that ends above zero thrust is closed with a zero one microsecond
+        later, the same way the tabulated motors are. Two rows with the same time
+        are a step in thrust.
+        """
+        if thrust_multiplier <= 0.0:
+            raise ValueError("thrust multiplier must be > 0")
+        arr = np.asarray(curve, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] < 2:
+            raise ValueError("motor curve must be a list of at least two [t, N] rows")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("motor curve contains a non-finite value")
+        times = arr[:, 0] - arr[0, 0]
+        thrust = arr[:, 1]
+        # Equal times are allowed: they are a step in thrust, which is exactly how the
+        # tabulated motors start (and what `landsim_export --motor-table` writes).
+        if np.any(np.diff(times) < 0.0) or times[-1] <= 0.0:
+            raise ValueError("motor curve times must be increasing")
+        if np.any(thrust < 0.0) or thrust.max() <= 0.0:
+            raise ValueError("motor curve needs non-negative thrust with a positive peak")
+        times, thrust = list(times), list(thrust)
+        if thrust[-1] > 0.0:
+            times.append(times[-1] + 1e-6)
+            thrust.append(0.0)
+        obj = cls.__new__(cls)
+        obj.name = name
+        obj._set_curve(times, thrust, thrust_multiplier, propellant_mass)
+        return obj
 
     def thrust(self, t):
         """Nominal (un-throttled) thrust [N] at time t after ignition."""

@@ -1,0 +1,14 @@
+{
+  "comment": "Every key is optional; {} is the default rocket. See landsim_export.py.",
+  "mass_gross_kg": 2.85,
+  "mass_prop_kg": 0.277,
+  "cd_body": 0.35,
+  "diameter_m": 0.105,
+  "thrust_scale": 1.0,
+  "fin_enable": 1,
+  "fin_brake": 1,
+  "fin_area_m2": 0.006405,
+  "fin_arm_m": 0.5,
+  "fin_stall_deg": 22.0,
+  "inertia": {"transverse": 0.4655, "roll": 0.0039277}
+}

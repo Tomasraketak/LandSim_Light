@@ -1822,6 +1822,46 @@ python3 landsim.py --coarse-step 5 --gen 200 --pop 80 --tol 0.1   # higher quali
 
 Requires only `numpy`.
 
+## Export for the flight software (Daidalos)
+
+`landsim_export.py` turns a vehicle description into the numbers the flight computer
+needs on board, computed by the same model the campaigns fly - it holds no vehicle
+number of its own.
+
+```
+python landsim_export.py --vehicle vehicle.json --out band.json [--gains] [--motor-table]
+```
+
+`vehicle.json` takes `mass_gross_kg`, `mass_prop_kg`, `cd_body`, `diameter_m`,
+`thrust_scale`, `fin_enable` (0/1), `fin_brake` (0/1), an optional `motor_curve`
+`[[t, N], ...]`, the fin geometry (`fin_area_m2`, `fin_arm_m`, `fin_cl_alpha`,
+`fin_stall_deg`) and `inertia` `{"transverse", "roll"}` in kg m^2 at the gross mass.
+Everything is optional (`{}` is the default rocket; `vehicle.example.json` spells it
+out), any other `TvcConfig` field can be given by its own name, and a key that is
+neither is an error rather than a silent default.
+
+`band.json` is versioned (`"schema": 1`):
+
+| key | meaning |
+|---|---|
+| `vz0`, `dvz`, `n` | grid of descent speeds, \|vz\| = vz0 + i*dvz (default 4, 2, 32 -> 4 ... 66 m/s) |
+| `hmin[]`, `hmax[]` | band of altitudes [m] at which the motor may start producing thrust and still land, i.e. `project_rh(h, -\|vz\|) >= FEASIBLE_VZ`; edges bisected to 0.1 m and reported on the feasible side; `hmax <= 0` = no feasible band at that speed |
+| `delay_pad_s` | igniter delay the guidance pads for: command the ignition that much fall ahead |
+| `fin_cd_zero`, `fin_cd_brake` | whole-vehicle Cd with the fins neutral / splayed as airbrakes (equal when the brake or the fins are off) |
+| `landsim_git` | commit the numbers came from (`landsim_dirty` flags uncommitted changes) |
+| `gains` (`--gains`) | `wn_tvc`, `zeta_tvc`, `wn_fin`, `zeta_fin`, `roll_gain`, `sched_tvc`, `sched_fin`, `att_ki`, re-fitted for this mass and inertia; `gains_fit` is the fit's report |
+| `motor_table` (`--motor-table`) | `[[t, N], ...]` after `thrust_scale` |
+
+`--gains` runs the tuner of `tvc_sim.py` (`--gains-budget`, `--gains-runs`,
+`--gains-cells`; the default budget of 60 candidates is roughly a quarter of an hour on four cores - the shipped fit of 120 took 28 min) and then
+picks `att_ki` on the same campaign. The band does not depend on the gains.
+
+The stable names are `project_rh`, `find_ignition` and `FEASIBLE_VZ` in `tvc_sim.py`:
+their signatures do not change (`find_ignition_full` is the same call that also
+returns the top edge of the band). `python -m pytest test_landsim_export.py` checks
+that `band.json` for the default rocket agrees with `find_ignition` to within 1 m
+(it is within 0.1 m), and that every vehicle number reaches the model.
+
 ## Importing a rocket from OpenRocket
 
 `orkimport.py` reads an `.ork` file and fills the vehicle page in: **Import an

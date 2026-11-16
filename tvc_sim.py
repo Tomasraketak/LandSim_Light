@@ -50,6 +50,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field, replace
+from typing import NamedTuple
 
 import numpy as np
 
@@ -459,12 +460,15 @@ class Fins:
     def __init__(self, count=FIN_COUNT, root=FIN_ROOT, tip=FIN_TIP, span=FIN_SPAN,
                  arm=FIN_ARM, max_deflect=FIN_MAX_DEFLECT,
                  travel_time=FIN_TRAVEL_TIME, body_diameter=DIAMETER,
-                 body_area=AREA, enabled=True, aero="cfd", stall=FIN_ALPHA_STALL):
+                 body_area=AREA, enabled=True, aero="cfd", stall=FIN_ALPHA_STALL,
+                 area=0.0, cl_alpha=0.0):
+        """`area` [m2, one fin] and `cl_alpha` [1/rad] override what the root / tip /
+        span geometry and the lift model would give; 0 = derive them."""
         self.count = int(count)
         self.stall = stall
         self.cfd = (aero == "cfd")
         self.enabled = bool(enabled) and self.count > 0
-        self.area = 0.5 * (root + tip) * span              # m2, one fin
+        self.area = area if area > 0.0 else 0.5 * (root + tip) * span   # m2, one fin
         self.span = span
         self.arm = arm
         self.max_deflect = max_deflect
@@ -476,6 +480,8 @@ class Fins:
         self.cl_alpha = 2.0 * math.pi * ar / (2.0 + math.sqrt(ar * ar + 4.0))
         if self.cfd:
             self.cl_alpha = FIN_CFD_CL_ALPHA
+        if cl_alpha > 0.0:
+            self.cl_alpha = float(cl_alpha)
         # spanwise centre of pressure -> the roll arm
         self.roll_arm = 0.5 * body_diameter + 0.4 * span
         self.body_area = body_area
@@ -1071,11 +1077,12 @@ def freefall_to(h_start, h_target, vx0, vz0, cd, area, mass, dt):
 
 
 @njit(cache=True)
-def find_ignition(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
-                  delay_pad, boost_ready,
-                  mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop,
-                  plan_target=PLAN_TARGET_VZ):
-    """Commanded ignition altitude and the matching command time.
+def _find_ignition_impl(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
+                        delay_pad, boost_ready,
+                        mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop,
+                        plan_target):
+    """Body of `find_ignition` / `find_ignition_full`:
+    returns (h_cmd, t_cmd, h_min, h_max, no_band).
 
     Three numbers decide it:
 
@@ -1202,6 +1209,41 @@ def find_ignition(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
     if h_cmd > h_start - 1.0:
         h_cmd = h_start - 1.0
     _, _, t_cmd = freefall_to(h_start, h_cmd, vx0, vz0, cd_free, area, mass0, 0.005)
+    return h_cmd, t_cmd, h_min, h_max, 1.0 if no_band else 0.0
+
+
+@njit(cache=True)
+def find_ignition_full(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
+                       delay_pad, boost_ready,
+                       mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop,
+                       plan_target=PLAN_TARGET_VZ):
+    """`find_ignition` with the whole feasible band exposed.
+
+    Returns (h_cmd, t_cmd, h_min, h_max, no_band). `h_max` is the top edge of the
+    band and `no_band` is 1.0 when no altitude closes the landing at all (then
+    h_min is the least-bad altitude and h_max is only the cap the pad may use).
+    Arguments and everything else are as documented on `find_ignition`.
+    """
+    return _find_ignition_impl(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max,
+                               mass0, delay_pad, boost_ready, mt, mf, mc, prop_mass,
+                               i_total, bt, bf, bb, b_prop, plan_target)
+
+
+@njit(cache=True)
+def find_ignition(h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0,
+                  delay_pad, boost_ready,
+                  mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop,
+                  plan_target=PLAN_TARGET_VZ):
+    """Commanded ignition altitude and the matching command time.
+
+    PUBLIC AND STABLE: the name, the argument order and the (h_cmd, t_cmd, h_min)
+    return value are part of the flight-software export interface
+    (landsim_export.py); extend through `find_ignition_full`, never in place.
+    See `_find_ignition_impl` for the method.
+    """
+    h_cmd, t_cmd, h_min, _, _ = _find_ignition_impl(
+        h_start, vx0, vz0, cd, cd_free, area, k_min, k_max, mass0, delay_pad,
+        boost_ready, mt, mf, mc, prop_mass, i_total, bt, bf, bb, b_prop, plan_target)
     return h_cmd, t_cmd, h_min
 
 
@@ -2405,6 +2447,8 @@ class TvcConfig:
     only the scenario.
     """
     motor: str = "long"
+    motor_curve: tuple = None        # explicit ((t [s], F [N]), ...) thrust curve; when
+                                     # set it replaces the tabulated `motor`
     gross_mass: float = landsim.GROSS_MASS
     propellant: float = landsim.PROPELLANT_MASS
     diameter: float = DIAMETER
@@ -2474,6 +2518,9 @@ class TvcConfig:
     fin_tip: float = FIN_TIP
     fin_span: float = FIN_SPAN
     fin_arm: float = FIN_ARM
+    fin_area: float = 0.0            # m2 of ONE fin; 0 = from root, tip and span
+    fin_cl_alpha: float = 0.0        # 1/rad the controller inverts the fins with;
+                                     # 0 = from the aero model
     fin_max_deflect: float = FIN_MAX_DEFLECT
     fin_travel_time: float = FIN_TRAVEL_TIME
     fin_brake: str = "auto"          # "auto" (unlit only) | "always" | "off"
@@ -2583,8 +2630,13 @@ class TvcConfig:
         return h, vx
 
     def tables(self):
-        m = Motor(self.motor, propellant_mass=self.propellant,
-                  thrust_multiplier=self.thrust_mult)
+        if self.motor_curve is not None:
+            m = Motor.from_curve(self.motor_curve, propellant_mass=self.propellant,
+                                 thrust_multiplier=self.thrust_mult,
+                                 name=self.motor or "curve")
+        else:
+            m = Motor(self.motor, propellant_mass=self.propellant,
+                      thrust_multiplier=self.thrust_mult)
         b = Booster()
         return m, b
 
@@ -2628,7 +2680,8 @@ class TvcConfig:
                     arm=self.fin_arm, max_deflect=self.fin_max_deflect,
                     travel_time=self.fin_travel_time,
                     body_diameter=self.diameter, body_area=self.area,
-                    enabled=self.fins, aero=self.fin_aero, stall=self.fin_stall)
+                    enabled=self.fins, aero=self.fin_aero, stall=self.fin_stall,
+                    area=self.fin_area, cl_alpha=self.fin_cl_alpha)
 
     def fin_args(self):
         """(n, area, arm, roll arm, CL_alpha, AR, max, rate, brake mode, drift, cfd)
@@ -2658,20 +2711,59 @@ class TvcConfig:
         return self.cd + (f.cd_extra(0.0) if f.enabled else 0.0)
 
 
-def plan_ignition(cfg: TvcConfig, h0: float, vx0: float) -> float:
-    """The commanded ignition altitude for one entry state (seed independent)."""
+class PlannerInputs(NamedTuple):
+    """What the pre-flight ignition planner reads from a configuration.
+
+    ONE place builds these, so `plan_ignition`, the flights and the flight-software
+    export (landsim_export.py) cannot drift apart: the band that is exported is
+    the band the simulated vehicle plans on."""
+    mass0: float            # kg at ignition, boosters included
+    mass_extra: float       # kg that is not main-motor propellant
+    cd_burn: float          # Cd the projection flies with (fins neutral)
+    cd_free: float          # Cd of the free fall before ignition (airbrake if on)
+    area: float
+    k_min: float
+    k_max: float
+    ready: float            # 1.0 when a booster is carried and the rule may use it
+    b_ign: float            # booster ignition time inside project_rh (1e6 = never)
+    delay_pad: float
+    plan_target: float
+    mt: np.ndarray
+    mf: np.ndarray
+    mc: np.ndarray
+    prop_mass: float
+    i_total: float
+    bt: np.ndarray
+    bf: np.ndarray          # already resolved along the body axis (cant applied)
+    bb: np.ndarray
+    b_prop: float
+
+
+def planner_inputs(cfg: TvcConfig) -> PlannerInputs:
     m, b = cfg.tables()
     mt, mf, mc = motor_arrays(m)
     bt, bf, bb = booster_arrays(b)
     mass0 = cfg.gross_mass + cfg.n_boosters * b.total_mass
     ready = 1.0 if (cfg.n_boosters > 0 and cfg.use_booster_rule) else 0.0
     _, cd_free = cfg.fin_args()
-    h_cmd, _, _ = find_ignition(float(h0), float(vx0), float(cfg.vz0), cfg.cd_burn,
-                                cd_free, cfg.area, cfg.k_min, cfg.k_max, mass0,
-                                cfg.delay_pad, ready, mt, mf, mc,
-                                m.propellant_mass, m.total_impulse,
-                                bt, bf * math.cos(math.radians(cfg.booster_cant)),
-                                bb, b.propellant_mass, cfg.plan_target)
+    return PlannerInputs(
+        mass0=mass0, mass_extra=mass0 - m.propellant_mass, cd_burn=cfg.cd_burn,
+        cd_free=cd_free, area=cfg.area, k_min=cfg.k_min, k_max=cfg.k_max,
+        ready=ready, b_ign=0.0 if ready > 0.5 else 1.0e6, delay_pad=cfg.delay_pad,
+        plan_target=cfg.plan_target, mt=mt, mf=mf, mc=mc,
+        prop_mass=m.propellant_mass, i_total=m.total_impulse, bt=bt,
+        bf=bf * math.cos(math.radians(cfg.booster_cant)), bb=bb,
+        b_prop=b.propellant_mass)
+
+
+def plan_ignition(cfg: TvcConfig, h0: float, vx0: float) -> float:
+    """The commanded ignition altitude for one entry state (seed independent)."""
+    p = planner_inputs(cfg)
+    h_cmd, _, _ = find_ignition(float(h0), float(vx0), float(cfg.vz0), p.cd_burn,
+                                p.cd_free, p.area, p.k_min, p.k_max, p.mass0,
+                                p.delay_pad, p.ready, p.mt, p.mf, p.mc,
+                                p.prop_mass, p.i_total, p.bt, p.bf, p.bb, p.b_prop,
+                                p.plan_target)
     return float(h_cmd)
 
 
@@ -2958,6 +3050,16 @@ def _tune_eval(job):
     return gain_cost(camp)
 
 
+def tuning_campaign_config(cfg: TvcConfig, runs=12, cells=3) -> TvcConfig:
+    """The reduced `cells x cells` campaign the gain tuner flies."""
+    from dataclasses import replace
+    step_h = max(1.0, (cfg.h_hi - cfg.h_lo) / max(cells - 1, 1))
+    return replace(cfg, h_step=step_h,
+                   vx_step=max(cfg.vx_max / ((cells - 1) / 2.0 if cells > 1 else 1),
+                               0.5),
+                   runs=runs)
+
+
 def tune_gains(cfg: TvcConfig, budget=60, runs=12, cells=3, seed=1,
                on_progress=None, should_stop=None, workers=None):
     """Fit the seven controller gains on a reduced campaign.
@@ -2977,11 +3079,7 @@ def tune_gains(cfg: TvcConfig, budget=60, runs=12, cells=3, seed=1,
     import concurrent.futures as cf
 
     rng = np.random.default_rng(seed)
-    step_h = max(1.0, (cfg.h_hi - cfg.h_lo) / max(cells - 1, 1))
-    small = replace(cfg, h_step=step_h,
-                    vx_step=max(cfg.vx_max / ((cells - 1) / 2.0 if cells > 1 else 1),
-                                0.5),
-                    runs=runs)
+    small = tuning_campaign_config(cfg, runs, cells)
     h_cmd_grid = ignition_grid(small)
     n_cells = h_cmd_grid.size
     if workers is None:
